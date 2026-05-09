@@ -8,7 +8,7 @@ description: 分析当前分支改动并补充单测覆盖率
 - 分叉点 commit: !`git merge-base main HEAD`
 - 当前分支改动文件列表: !`git --no-pager diff --name-only main...HEAD`
 - 当前分支改动内容: !`git --no-pager diff main...HEAD`
-- 当前覆盖率基线: !`pnpm run test:coverage 2>&1`
+- 当前覆盖率基线: !`pnpm run test 2>&1 && (pnpm run test:coverage 2>&1 || true)`
 
 ## 你的任务
 
