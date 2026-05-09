@@ -7,7 +7,7 @@ const pkg = JSON.parse(readFileSync(resolve('package.json'), 'utf-8')) as {
 };
 
 export default defineConfig({
-  entry: ['src/index.ts'],
+  entry: ['src/index.ts', 'src/cli/index.ts'],
   format: ['esm'],
   dts: true,
   sourcemap: true,

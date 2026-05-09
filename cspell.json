@@ -18,7 +18,12 @@
     "dependabot",
     "shenjingnan",
     "rankdir",
-    "Qwen"
+    "Qwen",
+    "haimen",
+    "Haimen",
+    "deepseek",
+    "earendil",
+    "chatcmpl"
   ],
   "ignorePaths": [
     "node_modules",
