@@ -73,7 +73,7 @@
     "@vitest/coverage-v8": "^3.2.0",
     "cspell": "^10.0.0",
     "husky": "^9.1.7",
-    "lint-staged": "^16.4.0",
+    "lint-staged": "^17.0.7",
     "release-it": "^19.2.4",
     "tsdown": "^0.21.7",
     "typescript": "^6.0.2",
