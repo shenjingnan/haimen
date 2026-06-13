@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-const PROJECT_DIR: &str = ".ai-rust-starter";
+const PROJECT_DIR: &str = ".haimen";
 const SETTINGS_FILE: &str = "settings.toml";
 
 /// 获取用户 home 目录（跨平台：macOS/Linux 用 $HOME，Windows 用 %USERPROFILE%）
@@ -51,6 +51,75 @@ pub fn resolve_env_ref(value: &str) -> Result<String, String> {
     }
 }
 
+/// 飞书配置
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FeishuConfig {
+    /// lark-cli 可执行文件路径（默认从 PATH 查找）
+    #[serde(default = "default_lark_cli_path")]
+    pub lark_cli_path: String,
+    /// 监听配置
+    #[serde(default)]
+    pub listen: FeishuListenConfig,
+}
+
+impl Default for FeishuConfig {
+    fn default() -> Self {
+        Self {
+            lark_cli_path: default_lark_cli_path(),
+            listen: FeishuListenConfig::default(),
+        }
+    }
+}
+
+fn default_lark_cli_path() -> String {
+    "lark-cli".to_string()
+}
+
+/// 飞书监听配置
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FeishuListenConfig {
+    /// 监听模式: "event"（事件订阅）或 "poll"（轮询）
+    #[serde(default = "default_listen_mode")]
+    pub mode: String,
+    /// 轮询间隔（秒）
+    #[serde(default = "default_interval_secs")]
+    pub interval_secs: u64,
+}
+
+impl Default for FeishuListenConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_listen_mode(),
+            interval_secs: default_interval_secs(),
+        }
+    }
+}
+
+fn default_listen_mode() -> String {
+    "event".to_string()
+}
+
+fn default_interval_secs() -> u64 {
+    30
+}
+
+/// AI 网关配置
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct GatewayConfig {
+    /// 是否启用 AI 处理
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// AI 提供商
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// API 密钥
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// 模型名称
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 /// 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppConfig {
@@ -60,9 +129,15 @@ pub struct AppConfig {
     /// 日志级别
     #[serde(default = "default_log_level")]
     pub log_level: String,
-    /// 自定义配置项（示例）
+    /// 自定义配置项
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom: Option<std::collections::HashMap<String, String>>,
+    /// 飞书配置
+    #[serde(default)]
+    pub feishu: FeishuConfig,
+    /// AI 网关配置
+    #[serde(default)]
+    pub gateway: GatewayConfig,
 }
 
 fn default_log_level() -> String {
@@ -75,11 +150,13 @@ impl Default for AppConfig {
             debug: false,
             log_level: default_log_level(),
             custom: None,
+            feishu: FeishuConfig::default(),
+            gateway: GatewayConfig::default(),
         }
     }
 }
 
-/// 加载 ~/.ai-rust-starter/settings.toml
+/// 加载 ~/.haimen/settings.toml
 ///
 /// 文件不存在时返回 None，不报错。
 pub fn load_settings() -> Result<Option<AppConfig>, String> {
@@ -112,7 +189,7 @@ mod tests {
     fn test_get_settings_path() {
         run_with_temp_home(|home| {
             let path = get_settings_path();
-            assert_eq!(path, home.join(".ai-rust-starter/settings.toml"));
+            assert_eq!(path, home.join(".haimen/settings.toml"));
         });
     }
 
@@ -120,7 +197,7 @@ mod tests {
     fn test_get_settings_dir() {
         run_with_temp_home(|home| {
             let dir = get_settings_dir();
-            assert_eq!(dir, home.join(".ai-rust-starter"));
+            assert_eq!(dir, home.join(".haimen"));
         });
     }
 
@@ -191,6 +268,9 @@ mod tests {
             assert!(!result.debug);
             assert_eq!(result.log_level, "info");
             assert!(result.custom.is_none());
+            assert_eq!(result.feishu.lark_cli_path, "lark-cli");
+            assert_eq!(result.feishu.listen.mode, "event");
+            assert_eq!(result.feishu.listen.interval_secs, 30);
         });
     }
 
@@ -214,6 +294,8 @@ mod tests {
         assert!(!config.debug);
         assert_eq!(config.log_level, "info");
         assert!(config.custom.is_none());
+        assert_eq!(config.feishu.lark_cli_path, "lark-cli");
+        assert_eq!(config.feishu.listen.mode, "event");
     }
 
     #[test]
@@ -222,6 +304,8 @@ mod tests {
             debug: true,
             log_level: "warn".to_string(),
             custom: Some(std::collections::HashMap::new()),
+            feishu: FeishuConfig::default(),
+            gateway: GatewayConfig::default(),
         };
         let toml_str = toml::to_string(&config).unwrap();
         let deserialized: AppConfig = toml::from_str(&toml_str).unwrap();

@@ -1,19 +1,39 @@
-/// 集成测试示例
-use ai_rust_starter::cli::{self, Cli};
+/// 集成测试
 use clap::Parser;
-
-#[test]
-fn test_cli_greet_output() {
-    // 验证 CLI 可以正确解析 greet 命令
-    let cli = Cli::try_parse_from(&["test", "greet", "--name", "World"]).unwrap();
-    assert!(matches!(cli.command.unwrap(), cli::Commands::Greet { .. }));
-}
+use haimen::cli::{self, Cli};
 
 #[test]
 fn test_cli_config_output() {
     // 验证 CLI 可以正确解析 config 命令
     let cli = Cli::try_parse_from(&["test", "config"]).unwrap();
     assert!(matches!(cli.command.unwrap(), cli::Commands::Config));
+}
+
+#[test]
+fn test_cli_feishu_auth_status() {
+    let cli = Cli::try_parse_from(&["test", "feishu", "auth", "status"]).unwrap();
+    assert!(matches!(
+        cli.command.unwrap(),
+        cli::Commands::Feishu(cli::FeishuCommands::Auth { .. })
+    ));
+}
+
+#[test]
+fn test_cli_feishu_listen() {
+    let cli = Cli::try_parse_from(&["test", "feishu", "listen"]).unwrap();
+    assert!(matches!(
+        cli.command.unwrap(),
+        cli::Commands::Feishu(cli::FeishuCommands::Listen { .. })
+    ));
+}
+
+#[test]
+fn test_cli_gateway_status() {
+    let cli = Cli::try_parse_from(&["test", "gateway", "status"]).unwrap();
+    assert!(matches!(
+        cli.command.unwrap(),
+        cli::Commands::Gateway(cli::GatewayCommands::Status)
+    ));
 }
 
 #[tokio::test]
@@ -23,16 +43,9 @@ async fn test_run_config_returns_ok() {
     assert!(result.is_ok());
 }
 
-#[tokio::test]
-async fn test_run_greet_returns_ok() {
-    let cli = Cli::try_parse_from(&["test", "greet", "--name", "Integration"]).unwrap();
-    let result = cli::run(cli).await;
-    assert!(result.is_ok());
-}
-
 #[test]
 fn test_datetime_iso_format() {
-    let now = ai_rust_starter::datetime::iso_timestamp_now();
+    let now = haimen::datetime::iso_timestamp_now();
     assert!(
         now.contains('T'),
         "ISO 8601 timestamp should contain T separator"
@@ -42,5 +55,5 @@ fn test_datetime_iso_format() {
 #[test]
 fn test_logging_init() {
     // 初始化日志不应 panic
-    ai_rust_starter::logging::init_logging();
+    haimen::logging::init_logging();
 }
