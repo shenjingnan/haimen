@@ -1,0 +1,43 @@
+[package]
+name = "ai-rust-starter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A Rust project starter template"
+license = "MIT"
+
+[dependencies]
+# CLI 框架
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# 错误处理
+thiserror = "2"
+anyhow = "1"
+
+# 时间处理
+chrono = "0.4"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+
+# --- 可选依赖（按需取消注释） ---
+# reqwest = { version = "0.12", features = ["json"] }   # HTTP 客户端
+# url = "2"                                              # URL 解析
+# futures-util = "0.3"                                   # 异步流处理
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.dist]
+inherits = "release"
+lto = "thin"

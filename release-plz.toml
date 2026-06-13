@@ -1,0 +1,12 @@
+[workspace]
+# release-plz 负责创建 git tag 和发布到 crates.io
+# cargo-dist 接管 GitHub Release 创建、二进制构建和安装脚本生成
+git_release_enable = false
+git_tag_enable = false
+
+[[package]]
+name = "ai-rust-starter"
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+changelog_update = true
+changelog_path = "CHANGELOG.md"

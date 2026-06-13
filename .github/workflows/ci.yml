@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths: ['Cargo.toml', 'Cargo.lock', 'src/**/*.rs', 'tests/**']
+  pull_request:
+    branches: [main]
+    paths: ['Cargo.toml', 'Cargo.lock', 'src/**/*.rs', 'tests/**']
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Code Quality Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Ensure components for project toolchain
+        run: rustup component add rustfmt clippy
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Lint check
+        run: cargo clippy -- -D warnings
+
+      - name: Install typos-cli
+        uses: taiki-e/install-action@v2
+        with:
+          tool: typos-cli
+
+      - name: Spell check
+        run: typos .
+
+      - name: Tests
+        run: cargo test -- --test-threads=1
+
+      - name: Build
+        run: cargo build
+
+      - name: Install cargo-tarpaulin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
+
+      - name: Generate coverage report
+        run: cargo tarpaulin --out lcov --output-dir coverage -- --test-threads=1
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v6
+        with:
+          files: ./coverage/lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Tests
+        run: cargo test -- --test-threads=1
