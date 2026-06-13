@@ -46,6 +46,11 @@ pub async fn listen_events(bridge: &LarkCliBridge, use_json: bool) -> Result<(),
 
         match serde_json::from_str::<FeishuEvent>(&line) {
             Ok(event) => {
+                // 自动回复
+                if let Err(e) = bridge.send_text_message(&event.chat_id, "好的，收到！").await {
+                    tracing::warn!("自动回复失败: {}", e);
+                }
+
                 if use_json {
                     println!("{}", line);
                 } else {
@@ -115,6 +120,11 @@ pub async fn listen_poll(
                             {
                                 // 更新游标
                                 cursor = Some(event.create_time.clone());
+
+                                // 自动回复
+                                if let Err(e) = bridge.send_text_message(&event.chat_id, "好的，收到！").await {
+                                    tracing::warn!("自动回复失败: {}", e);
+                                }
 
                                 if use_json {
                                     println!(

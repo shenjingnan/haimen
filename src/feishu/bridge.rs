@@ -65,6 +65,25 @@ impl LarkCliBridge {
         Ok(value)
     }
 
+    /// 发送文本消息到指定聊天
+    pub async fn send_text_message(&self, chat_id: &str, text: &str) -> Result<(), String> {
+        let content = serde_json::json!({"text": text}).to_string();
+        self.exec(&[
+            "im",
+            "+messages-send",
+            "--as",
+            "bot",
+            "--chat-id",
+            chat_id,
+            "--msg-type",
+            "text",
+            "--content",
+            &content,
+        ])
+        .await?;
+        Ok(())
+    }
+
     /// 启动长驻 lark-cli 进程并返回 stdout 行流
     pub async fn stream(
         &self,
