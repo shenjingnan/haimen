@@ -2,6 +2,8 @@
 pub mod cli;
 pub mod config;
 pub mod datetime;
+pub mod feishu;
+pub mod gateway;
 pub mod logging;
 
 #[cfg(test)]

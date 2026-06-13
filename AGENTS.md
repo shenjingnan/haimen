@@ -1,10 +1,10 @@
-# CLAUDE.md - ai-rust-starter
+# CLAUDE.md - haimen
 
 本文档为 Claude Code 提供项目上下文和开发规范。
 
 ## 项目概述
 
-**ai-rust-starter** 是一个 Rust 项目快速启动模板，提供开箱即用的工程化配置和通用工具模块。
+**haimen** 是一个 AI 网关基建 CLI 工具，集成飞书（Feishu/Lark），支持在终端接收和处理飞书消息。
 
 ## 技术栈
 
@@ -15,6 +15,7 @@
 | tokio          | 1.x   | 异步运行时                   |
 | serde          | 1.x   | JSON/TOML 序列化/反序列化    |
 | tracing        | 0.1   | 日志和诊断                   |
+| futures-util   | 0.3   | 异步流处理                   |
 
 ## 快速命令参考
 
@@ -22,7 +23,9 @@
 # 开发
 cargo run                           # 直接运行（无参进入帮助）
 cargo run -- config                 # 显示配置
-cargo run -- greet --name World     # 向用户问好
+cargo run -- feishu auth status     # 查看飞书认证状态
+cargo run -- feishu chat list       # 列出飞书群聊
+cargo run -- feishu listen          # 监听飞书消息
 cargo run -- completion bash        # 生成 shell 补全
 
 # 测试
@@ -34,7 +37,6 @@ cargo fmt                           # 格式化代码
 cargo fmt --check                   # 格式检查
 cargo clippy                        # Lint 检查
 cargo clippy -- -D warnings         # 严格 Lint 检查
-cargo test                          # 测试
 cargo fmt --check && cargo clippy -- -D warnings && cargo test   # 完整检查
 
 # 构建
@@ -78,20 +80,21 @@ cargo tarpaulin                     # 生成覆盖率报告
 │   ├── config/
 │   │   ├── mod.rs       # 配置模块入口
 │   │   └── settings.rs  # TOML 配置管理
+│   ├── feishu/
+│   │   ├── mod.rs       # 飞书模块入口
+│   │   ├── types.rs     # 飞书数据模型
+│   │   ├── bridge.rs    # lark-cli 子进程桥接
+│   │   ├── auth.rs      # 飞书认证
+│   │   ├── chat.rs      # 群聊管理
+│   │   └── listen.rs    # 消息监听
+│   ├── gateway/
+│   │   └── mod.rs       # AI 网关占位模块
 │   ├── logging.rs       # tracing 双层日志
 │   └── datetime.rs      # 日期时间工具
 ├── tests/               # 集成测试
 ├── .github/             # CI/CD 配置
 └── .githooks/           # Git hooks
 ```
-
-## 自定义指南
-
-1. 修改 `Cargo.toml` 中的 `name`、`version`、`description`
-2. 更新 `src/cli.rs` 中的命令名称和子命令
-3. 在 `src/config/settings.rs` 中修改 `PROJECT_DIR` 常量（`.{{project_name}}`）
-4. 在 `src/logging.rs` 中修改日志路径
-5. 更新 `AGENTS.md` 中的项目名称和描述
 
 ## Git 工作流
 
@@ -122,13 +125,3 @@ cargo tarpaulin                     # 生成覆盖率报告
 - `perf` - 性能优化
 - `test` - 测试相关
 - `chore` - 构建/工具
-
-## 模板使用
-
-### 开始新项目
-
-1. 克隆此仓库或 fork
-2. 全局搜索替换 `ai-rust-starter` 为你的项目名
-3. 搜索替换 `.ai-rust-starter` 为你的配置目录名
-4. 修改 `Cargo.toml` 中的项目元信息
-5. 开始编写你的业务代码
