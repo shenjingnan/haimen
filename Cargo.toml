@@ -1,9 +1,9 @@
 [package]
-name = "ai-rust-starter"
+name = "haimen"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "A Rust project starter template"
+description = "AI 网关基建 CLI"
 license = "MIT"
 
 [dependencies]
@@ -33,7 +33,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 # --- 可选依赖（按需取消注释） ---
 # reqwest = { version = "0.12", features = ["json"] }   # HTTP 客户端
 # url = "2"                                              # URL 解析
-# futures-util = "0.3"                                   # 异步流处理
+futures-util = "0.3"                                   # 异步流处理
 
 [dev-dependencies]
 tempfile = "3"

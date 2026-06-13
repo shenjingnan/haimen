@@ -1,7 +1,7 @@
 /// 日志初始化模块
 ///
 /// 初始化双层日志系统：
-/// - 文件日志: 写入 `~/.ai-rust-starter/logs/app.log`（info 级别以上，无 ANSI 颜色）
+/// - 文件日志: 写入 `~/.haimen/logs/app.log`（info 级别以上，无 ANSI 颜色）
 /// - stderr 日志: 受 `RUST_LOG` 环境变量控制（默认 warn 级别以上）
 use std::fs::OpenOptions;
 use std::io;
@@ -58,7 +58,7 @@ fn get_log_path() -> PathBuf {
 
 /// 获取日志目录路径
 fn get_log_dir() -> PathBuf {
-    crate::config::settings::get_home_dir().join(".ai-rust-starter/logs")
+    crate::config::settings::get_home_dir().join(".haimen/logs")
 }
 
 #[cfg(test)]
@@ -71,7 +71,7 @@ mod tests {
     fn test_log_path_uses_project_dir() {
         run_with_temp_home(|_home| {
             let log_path = get_log_path();
-            assert!(log_path.starts_with(_home.join(".ai-rust-starter/logs")));
+            assert!(log_path.starts_with(_home.join(".haimen/logs")));
             assert_eq!(
                 log_path.file_name().unwrap(),
                 "app.log",
@@ -94,7 +94,7 @@ mod tests {
     #[test]
     fn test_file_writer_appends() {
         run_with_temp_home(|home| {
-            let log_path = home.join(".ai-rust-starter/logs/app.log");
+            let log_path = home.join(".haimen/logs/app.log");
             std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
 
             let mut writer = OpenOptions::new()
@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn test_make_file_writer_writes_content() {
         run_with_temp_home(|home| {
-            let log_path = home.join(".ai-rust-starter/logs/app.log");
+            let log_path = home.join(".haimen/logs/app.log");
             let writer = make_file_writer(log_path.clone());
 
             {
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn test_init_logging_creates_directory() {
         run_with_temp_home(|home| {
-            let log_dir = home.join(".ai-rust-starter/logs");
+            let log_dir = home.join(".haimen/logs");
             assert!(!log_dir.exists(), "测试前日志目录不应存在");
             init_logging();
             assert!(log_dir.exists(), "init_logging 应创建日志目录");
@@ -165,7 +165,7 @@ mod tests {
     #[test]
     fn test_tracing_events_written_to_file() {
         run_with_temp_home(|home| {
-            let log_path = home.join(".ai-rust-starter/logs/app.log");
+            let log_path = home.join(".haimen/logs/app.log");
 
             let subscriber = Registry::default().with(
                 fmt::layer()
@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn test_tracing_events_no_ansi() {
         run_with_temp_home(|home| {
-            let log_path = home.join(".ai-rust-starter/logs/app.log");
+            let log_path = home.join(".haimen/logs/app.log");
 
             let subscriber = Registry::default().with(
                 fmt::layer()
@@ -218,7 +218,7 @@ mod tests {
     #[test]
     fn test_tracing_events_filtered_by_level() {
         run_with_temp_home(|home| {
-            let log_path = home.join(".ai-rust-starter/logs/app.log");
+            let log_path = home.join(".haimen/logs/app.log");
 
             let subscriber = Registry::default().with(
                 fmt::layer()
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn test_make_file_writer_multiple_calls_produce_unique_writers() {
         run_with_temp_home(|home| {
-            let log_path = home.join(".ai-rust-starter/logs/app.log");
+            let log_path = home.join(".haimen/logs/app.log");
             let writer = make_file_writer(log_path.clone());
 
             {
