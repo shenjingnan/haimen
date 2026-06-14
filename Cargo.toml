@@ -34,7 +34,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 # reqwest = { version = "0.12", features = ["json"] }   # HTTP 客户端
 # url = "2"                                              # URL 解析
 futures-util = "0.3"                                   # 异步流处理
-rmcp = { version = "1.7.0", default-features = false, features = ["client", "transport-child-process"] }
 
 [dev-dependencies]
 tempfile = "3"

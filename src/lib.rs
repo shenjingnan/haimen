@@ -1,5 +1,4 @@
 /// 通用工具模块
-pub mod agent;
 pub mod cli;
 pub mod config;
 pub mod datetime;
