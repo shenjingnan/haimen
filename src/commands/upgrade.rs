@@ -394,21 +394,17 @@ mod tests {
         let result = detect_target_triple();
         // On unsupported platforms this will return Err, which is fine
         if let Ok(triple) = result {
-            let parts: Vec<&str> = triple.split('-').collect();
+            let valid_triples = [
+                "aarch64-apple-darwin",
+                "x86_64-apple-darwin",
+                "aarch64-unknown-linux-gnu",
+                "x86_64-unknown-linux-gnu",
+                "x86_64-pc-windows-msvc",
+            ];
             assert!(
-                parts.len() >= 3,
-                "triple '{}' should have at least 3 segments",
+                valid_triples.iter().any(|&t| t == triple),
+                "unknown triple: {}",
                 triple
-            );
-            assert!(
-                ["aarch64", "x86_64"].contains(&parts[0]),
-                "unknown arch: {}",
-                parts[0]
-            );
-            assert!(
-                ["darwin", "linux", "windows"].contains(&parts[parts.len() - 1]),
-                "unknown os: {}",
-                parts[parts.len() - 1]
             );
         }
     }
@@ -417,8 +413,15 @@ mod tests {
     fn test_detect_target_triple_ok() {
         let result = detect_target_triple();
         if let Ok(triple) = result {
+            let valid_triples = [
+                "aarch64-apple-darwin",
+                "x86_64-apple-darwin",
+                "aarch64-unknown-linux-gnu",
+                "x86_64-unknown-linux-gnu",
+                "x86_64-pc-windows-msvc",
+            ];
             assert!(
-                triple.contains("apple") || triple.contains("linux") || triple.contains("pc"),
+                valid_triples.iter().any(|&t| t == triple),
                 "unknown triple: {}",
                 triple
             );
