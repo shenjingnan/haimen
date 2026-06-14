@@ -1,5 +1,6 @@
 /// 通用工具模块
 pub mod cli;
+pub mod commands;
 pub mod config;
 pub mod datetime;
 pub mod feishu;

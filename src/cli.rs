@@ -45,6 +45,10 @@ pub enum Commands {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// 升级 haimen 到最新版本
+    Upgrade,
+    /// 卸载 haimen
+    Uninstall,
 }
 
 #[derive(Subcommand)]
@@ -249,6 +253,8 @@ pub async fn run(cli: Cli) -> Result<(), String> {
             cmd_completion(shell, &mut std::io::stdout());
             Ok(())
         }
+        Some(Commands::Upgrade) => crate::commands::upgrade::cmd_upgrade().await,
+        Some(Commands::Uninstall) => crate::commands::uninstall::cmd_uninstall(),
         None => unreachable!(),
     }
 }
@@ -308,7 +314,15 @@ mod tests {
             output.contains("complete -F"),
             "bash completion should contain complete -F"
         );
-        for sub in &["config", "feishu", "gateway", "serve", "completion"] {
+        for sub in &[
+            "config",
+            "feishu",
+            "gateway",
+            "serve",
+            "completion",
+            "upgrade",
+            "uninstall",
+        ] {
             assert!(
                 output.contains(sub),
                 "bash completion should contain subcommand {}",
@@ -326,7 +340,15 @@ mod tests {
             output.contains("#compdef"),
             "zsh completion should start with #compdef"
         );
-        for sub in &["config", "feishu", "gateway", "serve", "completion"] {
+        for sub in &[
+            "config",
+            "feishu",
+            "gateway",
+            "serve",
+            "completion",
+            "upgrade",
+            "uninstall",
+        ] {
             assert!(
                 output.contains(sub),
                 "zsh completion should contain subcommand {}",
@@ -344,7 +366,15 @@ mod tests {
             output.contains("complete -c"),
             "fish completion should contain complete -c"
         );
-        for sub in &["config", "feishu", "gateway", "serve", "completion"] {
+        for sub in &[
+            "config",
+            "feishu",
+            "gateway",
+            "serve",
+            "completion",
+            "upgrade",
+            "uninstall",
+        ] {
             assert!(
                 output.contains(sub),
                 "fish completion should contain subcommand {}",
@@ -362,7 +392,15 @@ mod tests {
             output.contains("Register-ArgumentCompleter"),
             "powershell completion should register argument completer"
         );
-        for sub in &["config", "feishu", "gateway", "serve", "completion"] {
+        for sub in &[
+            "config",
+            "feishu",
+            "gateway",
+            "serve",
+            "completion",
+            "upgrade",
+            "uninstall",
+        ] {
             assert!(
                 output.contains(sub),
                 "powershell completion should contain subcommand {}",
@@ -383,7 +421,15 @@ mod tests {
             let mut buf = Vec::new();
             cmd_completion(shell, &mut buf);
             let output = String::from_utf8(buf).unwrap();
-            for sub in &["config", "feishu", "gateway", "serve", "completion"] {
+            for sub in &[
+                "config",
+                "feishu",
+                "gateway",
+                "serve",
+                "completion",
+                "upgrade",
+                "uninstall",
+            ] {
                 assert!(
                     output.contains(sub),
                     "{:?} completion should contain subcommand {}",
@@ -392,6 +438,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_cli_parse_upgrade() {
+        let cli = Cli::try_parse_from(&["test", "upgrade"]).unwrap();
+        assert!(matches!(cli.command.unwrap(), Commands::Upgrade));
+    }
+
+    #[test]
+    fn test_cli_parse_uninstall() {
+        let cli = Cli::try_parse_from(&["test", "uninstall"]).unwrap();
+        assert!(matches!(cli.command.unwrap(), Commands::Uninstall));
     }
 
     #[test]
@@ -509,6 +567,14 @@ mod tests {
         assert!(
             help.contains("config"),
             "help should contain config subcommand"
+        );
+        assert!(
+            help.contains("upgrade"),
+            "help should contain upgrade subcommand"
+        );
+        assert!(
+            help.contains("uninstall"),
+            "help should contain uninstall subcommand"
         );
     }
 }

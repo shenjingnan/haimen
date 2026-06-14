@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "AI 网关基建 CLI"
 license = "MIT"
+repository = "https://github.com/shenjingnan/haimen"
 
 [dependencies]
 # CLI 框架
@@ -37,9 +38,10 @@ chrono = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 
-# --- 可选依赖（按需取消注释） ---
-# reqwest = { version = "0.12", features = ["json"] }   # HTTP 客户端
-# url = "2"                                              # URL 解析
+# HTTP 客户端（upgrade 命令使用）
+reqwest = { version = "0.12", features = ["json", "stream"] }
+# URL 解析
+# url = "2"
 futures-util = "0.3"                                   # 异步流处理
 
 [dev-dependencies]
