@@ -5,4 +5,5 @@ pub mod auth;
 pub mod bridge;
 pub mod chat;
 pub mod listen;
+pub mod send;
 pub mod types;

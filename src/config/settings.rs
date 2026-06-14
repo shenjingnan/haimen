@@ -3,6 +3,7 @@
 /// 提供通用的配置读写功能，支持 ${env.VAR} 环境变量引用。
 /// 配置文件存储在 `~/.{{project_name}}/settings.toml`。
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 const PROJECT_DIR: &str = ".haimen";
@@ -118,6 +119,40 @@ pub struct GatewayConfig {
     /// 模型名称
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// MCP 服务器配置（haimen 作为客户端连接）
+    #[serde(default)]
+    pub mcp_servers: HashMap<String, McpServerConfig>,
+}
+
+/// MCP 服务器配置
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpServerConfig {
+    /// 连接类型: stdio
+    #[serde(default = "default_mcp_type")]
+    pub r#type: String,
+    /// 可执行文件路径
+    pub command: String,
+    /// 启动参数
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// 描述
+    #[serde(default)]
+    pub description: String,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            r#type: default_mcp_type(),
+            command: String::new(),
+            args: Vec::new(),
+            description: String::new(),
+        }
+    }
+}
+
+fn default_mcp_type() -> String {
+    "stdio".to_string()
 }
 
 /// 应用配置

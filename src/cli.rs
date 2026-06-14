@@ -85,6 +85,8 @@ pub enum FeishuChatAction {
 pub enum GatewayCommands {
     /// 显示网关状态
     Status,
+    /// 启动网关（监听飞书消息 → MCP 处理 → 结果回飞书）
+    Listen,
 }
 
 /// config 命令
@@ -174,6 +176,20 @@ fn cmd_gateway_status() -> Result<(), String> {
         println!("  提供商: (未配置)");
     }
     println!("  活跃连接: {}", status.active_connections);
+    if status.mcp_servers.is_empty() {
+        println!("  MCP 服务器: (未配置)");
+        println!();
+        println!("提示: 在 ~/.haimen/settings.toml 中添加以下配置:");
+        println!("  [gateway.mcp_servers.claude-code]");
+        println!("  type = \"stdio\"");
+        println!("  command = \"claude\"");
+        println!("  args = [\"mcp\", \"serve\"]");
+    } else {
+        println!("  MCP 服务器:");
+        for server in &status.mcp_servers {
+            println!("    - {}", server);
+        }
+    }
     Ok(())
 }
 
@@ -214,6 +230,7 @@ pub async fn run(cli: Cli) -> Result<(), String> {
         }
         Some(Commands::Gateway(gateway_cmd)) => match gateway_cmd {
             GatewayCommands::Status => cmd_gateway_status(),
+            GatewayCommands::Listen => crate::gateway::listen().await,
         },
         Some(Commands::Completion { shell }) => {
             cmd_completion(shell, &mut std::io::stdout());
