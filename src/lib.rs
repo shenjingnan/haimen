@@ -5,6 +5,7 @@ pub mod datetime;
 pub mod feishu;
 pub mod gateway;
 pub mod logging;
+pub mod web;
 
 #[cfg(test)]
 pub(crate) mod test_util {
