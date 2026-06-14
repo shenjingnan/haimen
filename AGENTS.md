@@ -16,6 +16,10 @@
 | serde          | 1.x   | JSON/TOML 序列化/反序列化    |
 | tracing        | 0.1   | 日志和诊断                   |
 | futures-util   | 0.3   | 异步流处理                   |
+| React          | 19    | 前端 UI 框架                 |
+| Vite           | 8     | 前端构建工具                 |
+| Tailwind CSS   | 4     | CSS 工具链                   |
+| Ant Design     | 6     | UI 组件库                    |
 
 ## 快速命令参考
 
@@ -45,6 +49,11 @@ cargo build --release               # 发布构建
 
 # 文档
 cargo doc --open                    # 生成并打开 API 文档
+
+# 前端开发（web-ui/）
+cd web-ui && pnpm dev               # 启动 Vite 开发服务器（HMR）
+cd web-ui && pnpm build             # 构建前端产物
+cd web-ui && pnpm lint              # ESLint 检查
 
 # 覆盖率
 cargo tarpaulin                     # 生成覆盖率报告

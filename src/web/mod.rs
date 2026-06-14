@@ -1,3 +1,6 @@
+pub mod api;
+pub mod r#static;
+
 use std::net::SocketAddr;
 
 /// 服务器配置
@@ -9,8 +12,11 @@ pub struct ServeConfig {
 /// 启动 HTTP 服务器
 pub async fn start(config: ServeConfig) -> Result<(), String> {
     let app = axum::Router::new()
-        .route("/", axum::routing::get(root_handler))
-        .route("/health", axum::routing::get(health_handler));
+        // API 路由（优先匹配）
+        .route("/health", axum::routing::get(health_handler))
+        .route("/api/v1/system/info", axum::routing::get(api::system::info))
+        // 静态文件和 SPA fallback
+        .fallback(r#static::handle);
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()
@@ -26,37 +32,6 @@ pub async fn start(config: ServeConfig) -> Result<(), String> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| format!("服务器错误: {}", e))
-}
-
-/// 主页：返回 HTML 页面
-async fn root_handler() -> axum::response::Html<String> {
-    axum::response::Html(format!(
-        r#"<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>海门 AI 网关</title>
-    <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 640px; margin: 80px auto; padding: 0 20px; text-align: center; color: #333; }}
-        h1 {{ font-size: 2em; margin-bottom: 8px; }}
-        .version {{ color: #888; font-size: 0.9em; margin-bottom: 40px; }}
-        .status {{ background: #f5f5f5; border-radius: 8px; padding: 20px; }}
-        .status a {{ color: #0066cc; text-decoration: none; }}
-        .status a:hover {{ text-decoration: underline; }}
-    </style>
-</head>
-<body>
-    <h1>海门 AI 网关</h1>
-    <p class="version">版本 {version}</p>
-    <div class="status">
-        <p>服务器运行正常</p>
-        <p><a href="/health">健康检查 /health</a></p>
-    </div>
-</body>
-</html>"#,
-        version = env!("CARGO_PKG_VERSION")
-    ))
 }
 
 /// 健康检查：返回 JSON
