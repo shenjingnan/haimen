@@ -25,6 +25,10 @@ anyhow = "1"
 
 # Web 框架
 axum = "0.7"
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+
+# 静态资源嵌入
+rust-embed = "8"
 
 # 时间处理
 chrono = "0.4"
