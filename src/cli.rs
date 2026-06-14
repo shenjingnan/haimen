@@ -29,6 +29,15 @@ pub enum Commands {
     /// AI 网关管理
     #[command(subcommand)]
     Gateway(GatewayCommands),
+    /// 启动 HTTP Web 服务器
+    Serve {
+        /// 监听地址
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// 监听端口
+        #[arg(long, default_value_t = 9527)]
+        port: u16,
+    },
     /// 生成 Shell 补全脚本
     #[command(hide = true)]
     Completion {
@@ -232,6 +241,10 @@ pub async fn run(cli: Cli) -> Result<(), String> {
             GatewayCommands::Status => cmd_gateway_status(),
             GatewayCommands::Listen => crate::gateway::listen().await,
         },
+        Some(Commands::Serve { host, port }) => {
+            let config = crate::web::ServeConfig { host, port };
+            crate::web::start(config).await
+        }
         Some(Commands::Completion { shell }) => {
             cmd_completion(shell, &mut std::io::stdout());
             Ok(())
@@ -295,7 +308,7 @@ mod tests {
             output.contains("complete -F"),
             "bash completion should contain complete -F"
         );
-        for sub in &["config", "feishu", "gateway", "completion"] {
+        for sub in &["config", "feishu", "gateway", "serve", "completion"] {
             assert!(
                 output.contains(sub),
                 "bash completion should contain subcommand {}",
@@ -313,7 +326,7 @@ mod tests {
             output.contains("#compdef"),
             "zsh completion should start with #compdef"
         );
-        for sub in &["config", "feishu", "gateway", "completion"] {
+        for sub in &["config", "feishu", "gateway", "serve", "completion"] {
             assert!(
                 output.contains(sub),
                 "zsh completion should contain subcommand {}",
@@ -331,7 +344,7 @@ mod tests {
             output.contains("complete -c"),
             "fish completion should contain complete -c"
         );
-        for sub in &["config", "feishu", "gateway", "completion"] {
+        for sub in &["config", "feishu", "gateway", "serve", "completion"] {
             assert!(
                 output.contains(sub),
                 "fish completion should contain subcommand {}",
@@ -349,7 +362,7 @@ mod tests {
             output.contains("Register-ArgumentCompleter"),
             "powershell completion should register argument completer"
         );
-        for sub in &["config", "feishu", "gateway", "completion"] {
+        for sub in &["config", "feishu", "gateway", "serve", "completion"] {
             assert!(
                 output.contains(sub),
                 "powershell completion should contain subcommand {}",
@@ -370,7 +383,7 @@ mod tests {
             let mut buf = Vec::new();
             cmd_completion(shell, &mut buf);
             let output = String::from_utf8(buf).unwrap();
-            for sub in &["config", "feishu", "gateway", "completion"] {
+            for sub in &["config", "feishu", "gateway", "serve", "completion"] {
                 assert!(
                     output.contains(sub),
                     "{:?} completion should contain subcommand {}",

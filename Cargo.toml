@@ -23,6 +23,9 @@ toml = "0.8"
 thiserror = "2"
 anyhow = "1"
 
+# Web 框架
+axum = "0.7"
+
 # 时间处理
 chrono = "0.4"
 
