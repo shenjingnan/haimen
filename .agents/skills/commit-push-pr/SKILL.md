@@ -9,6 +9,17 @@ description: 提交、推送并创建 PR
 
 - 全部上下文: !`bash .agents/skills/commit-push-pr/scripts/collect-context.sh`
 
+## Attribution 信息
+
+每次 commit 的 body 和 PR 描述中必须附加以下 attribution
+信息（使用上方上下文中的"当前模型"和"模型公司域名"）：
+
+```
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+Co-Authored-By: <当前模型>
+```
+
 ## 你的任务
 
 根据上述变更：
@@ -35,12 +46,21 @@ Commit message **必须**以以下格式结尾：
 Co-Authored-By: <模型名称> <noreply@<对应主域名>>
 ```
 
-## Attribution 信息
+### 模型与域名映射
 
-每次 commit 的 body 和 PR 描述中必须附加以下 attribution 信息：
+根据当前会话实际使用的模型，选择对应的 `noreply` 邮箱域名：
 
-```
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
+| 模型系列           | 域名示例                   |
+| ------------------ | -------------------------- |
+| GLM (智谱)         | `noreply@bigmodel.cn`      |
+| Claude (Anthropic) | `noreply@anthropic.com`    |
+| GPT (OpenAI)       | `noreply@openai.com`       |
+| Gemini (Google)    | `noreply@google.com`       |
+| DeepSeek           | `noreply@deepseek.com`     |
+| Qwen (通义)        | `noreply@alibabacloud.com` |
 
-Co-Authored-By: <当前模型>
+### 如何获取模型名称
+
+```bash
+jq -r '.env.ANTHROPIC_MODEL' ~/.claude/settings.json
 ```
