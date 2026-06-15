@@ -2,6 +2,40 @@
 
 **haimen** 是一个 AI 网关基建 CLI 工具，集成飞书（Feishu/Lark），支持在终端接收和处理飞书消息。
 
+## 安装
+
+### 方式一：一键安装脚本（推荐）
+
+```bash
+# macOS / Linux
+curl -fsSL https://haimen.dev/install.sh | sh
+
+# Windows PowerShell
+irm https://haimen.dev/install.ps1 | iex
+```
+
+### 方式二：cargo install
+
+```bash
+cargo install haimen
+```
+
+### 方式三：手动下载
+
+从 [GitHub Releases](https://github.com/shenjingnan/haimen/releases) 下载对应平台的压缩包，解压后放入 `PATH`。
+
+### 升级
+
+```bash
+haimen upgrade
+```
+
+### 卸载
+
+```bash
+haimen uninstall
+```
+
 ## 特性
 
 - **飞书消息监听** — 实时接收飞书消息并在终端展示（事件订阅模式 / 轮询模式）
@@ -65,6 +99,10 @@ COMMANDS:
     listen [OPTIONS]  监听飞书消息
   gateway
     status            显示网关状态
+    listen            启动 AI 网关（飞书消息 → MCP → 回飞书）
+  serve [OPTIONS]     启动 HTTP Web 服务器
+  upgrade             升级 haimen 到最新版本
+  uninstall           卸载 haimen
   completion <SHELL>  生成 Shell 补全脚本
 ```
 
