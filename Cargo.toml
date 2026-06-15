@@ -26,7 +26,7 @@ anyhow = "1"
 
 # Web 框架
 axum = "0.7"
-tower-http = { version = "0.5", features = ["cors", "fs"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
 
 # 静态资源嵌入
 rust-embed = "8"
