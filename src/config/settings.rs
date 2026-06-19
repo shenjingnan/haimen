@@ -105,7 +105,7 @@ fn default_interval_secs() -> u64 {
 }
 
 /// AI 网关配置
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GatewayConfig {
     /// 是否启用 AI 处理
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -119,9 +119,41 @@ pub struct GatewayConfig {
     /// 模型名称
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// 默认工作目录（Claude Code session 绑定到此目录）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_dir: Option<String>,
+    /// 会话空闲超时（分钟），超过此时间无消息自动切新会话，默认 30
+    #[serde(default = "default_session_idle_timeout")]
+    pub session_idle_timeout_mins: u64,
+    /// 会话最大轮次，达到后自动切新会话，默认 20
+    #[serde(default = "default_session_max_turns")]
+    pub session_max_turns: u32,
     /// MCP 服务器配置（haimen 作为客户端连接）
     #[serde(default)]
     pub mcp_servers: HashMap<String, McpServerConfig>,
+}
+
+fn default_session_idle_timeout() -> u64 {
+    30
+}
+
+fn default_session_max_turns() -> u32 {
+    20
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            provider: None,
+            api_key: None,
+            model: None,
+            work_dir: None,
+            session_idle_timeout_mins: default_session_idle_timeout(),
+            session_max_turns: default_session_max_turns(),
+            mcp_servers: HashMap::new(),
+        }
+    }
 }
 
 /// MCP 服务器配置
