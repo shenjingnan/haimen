@@ -1,5 +1,7 @@
+use std::sync::Arc;
+
 use crate::config;
-use crate::feishu;
+use crate::connectors::lark as feishu;
 use clap::{CommandFactory, Parser, Subcommand};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -29,6 +31,9 @@ pub enum Commands {
     /// AI 网关管理
     #[command(subcommand)]
     Gateway(GatewayCommands),
+    /// AI Agent 调试
+    #[command(subcommand)]
+    Agent(AgentCommands),
     /// 启动 HTTP Web 服务器
     Serve {
         /// 监听地址
@@ -99,7 +104,30 @@ pub enum GatewayCommands {
     /// 显示网关状态
     Status,
     /// 启动网关（监听飞书消息 → MCP 处理 → 结果回飞书）
-    Listen,
+    Listen {
+        /// Echo 模式：收消息后直接返回，不经过 Agent 处理
+        #[arg(long)]
+        echo: bool,
+    },
+}
+
+/// AI Agent 调试命令
+#[derive(Subcommand)]
+pub enum AgentCommands {
+    /// 单次运行 Agent，传入 prompt
+    Run {
+        /// AI 提供商（默认从配置读取）
+        #[arg(long)]
+        provider: Option<String>,
+        /// 发送给 Agent 的消息
+        prompt: String,
+    },
+    /// 交互式 Agent 会话（支持 resume）
+    Chat {
+        /// AI 提供商（默认从配置读取）
+        #[arg(long)]
+        provider: Option<String>,
+    },
 }
 
 /// config 命令
@@ -206,6 +234,80 @@ fn cmd_gateway_status() -> Result<(), String> {
     Ok(())
 }
 
+/// 根据 provider 名称构造 AgentProvider
+fn create_agent(
+    provider: Option<String>,
+) -> Result<Box<dyn crate::gateway::provider::AgentProvider>, String> {
+    let config = config::settings::load_settings()
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
+    let provider_name = provider
+        .as_deref()
+        .or(config.gateway.provider.as_deref())
+        .unwrap_or("claude-code");
+
+    match provider_name {
+        "claude-code" => Ok(Box::new(crate::agents::claude_code::agent::ClaudeAgent)),
+        "mcp" => Err("MCP Agent 暂不支持直接调用".to_string()),
+        other => Err(format!("不支持的 AI 提供商: {}", other)),
+    }
+}
+
+/// agent run 命令：单次调用 Agent
+async fn cmd_agent_run(provider: Option<String>, prompt: String) -> Result<(), String> {
+    let agent = create_agent(provider)?;
+    agent.check_available().await?;
+
+    println!("🤖 正在调用 {}...", agent.name());
+    let (response, session_id) = agent.process(&prompt, None).await?;
+
+    println!("{}", response);
+    tracing::info!(response_len = response.len(), session_id = %session_id, "Agent 处理完成");
+    Ok(())
+}
+
+/// agent chat 命令：交互式多轮对话
+async fn cmd_agent_chat(provider: Option<String>) -> Result<(), String> {
+    let agent = create_agent(provider)?;
+    agent.check_available().await?;
+
+    println!("🤖 {} 交互模式已启动（输入 /quit 退出）", agent.name());
+    let mut session_id: Option<String> = None;
+
+    loop {
+        // 读取用户输入
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| format!("读取输入失败: {}", e))?;
+
+        let input = input.trim().to_string();
+        if input.is_empty() {
+            continue;
+        }
+        if input == "/quit" || input == "/exit" {
+            break;
+        }
+
+        // 检查命令
+        if input == "/new" {
+            session_id = None;
+            println!("🔄 已创建新会话");
+            continue;
+        }
+
+        // 调用 Agent
+        let (response, new_session_id) = agent.process(&input, session_id.as_deref()).await?;
+        session_id = Some(new_session_id);
+
+        println!("{}", response);
+    }
+
+    Ok(())
+}
+
 /// 构造桥接实例
 fn create_bridge() -> feishu::bridge::LarkCliBridge {
     let config = config::settings::load_settings()
@@ -243,11 +345,35 @@ pub async fn run(cli: Cli) -> Result<(), String> {
         }
         Some(Commands::Gateway(gateway_cmd)) => match gateway_cmd {
             GatewayCommands::Status => cmd_gateway_status(),
-            GatewayCommands::Listen => crate::gateway::listen().await,
+            GatewayCommands::Listen { echo } => {
+                if echo {
+                    crate::gateway::listen_echo().await
+                } else {
+                    crate::gateway::listen().await
+                }
+            }
+        },
+        Some(Commands::Agent(agent_cmd)) => match agent_cmd {
+            AgentCommands::Run { provider, prompt } => cmd_agent_run(provider, prompt).await,
+            AgentCommands::Chat { provider } => cmd_agent_chat(provider).await,
         },
         Some(Commands::Serve { host, port }) => {
-            let config = crate::web::ServeConfig { host, port };
-            crate::web::start(config).await
+            let settings = crate::config::settings::load_settings()
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let agent: Arc<dyn crate::gateway::provider::AgentProvider> =
+                Arc::new(crate::agents::claude_code::agent::ClaudeAgent);
+
+            let webhook_state = settings.github.map(|cfg| {
+                let connector = crate::connectors::github::GitHubConnector::new(cfg, agent.clone());
+                crate::gateway::webhook::WebhookState {
+                    github: Some(Arc::new(connector)),
+                }
+            });
+
+            let serve_config = crate::web::ServeConfig { host, port };
+            crate::web::start(serve_config, webhook_state).await
         }
         Some(Commands::Completion { shell }) => {
             cmd_completion(shell, &mut std::io::stdout());
@@ -319,6 +445,7 @@ mod tests {
             "feishu",
             "gateway",
             "serve",
+            "agent",
             "completion",
             "upgrade",
             "uninstall",
@@ -345,6 +472,7 @@ mod tests {
             "feishu",
             "gateway",
             "serve",
+            "agent",
             "completion",
             "upgrade",
             "uninstall",
@@ -371,6 +499,7 @@ mod tests {
             "feishu",
             "gateway",
             "serve",
+            "agent",
             "completion",
             "upgrade",
             "uninstall",
@@ -397,6 +526,7 @@ mod tests {
             "feishu",
             "gateway",
             "serve",
+            "agent",
             "completion",
             "upgrade",
             "uninstall",
@@ -426,6 +556,7 @@ mod tests {
                 "feishu",
                 "gateway",
                 "serve",
+                "agent",
                 "completion",
                 "upgrade",
                 "uninstall",
@@ -442,25 +573,25 @@ mod tests {
 
     #[test]
     fn test_cli_parse_upgrade() {
-        let cli = Cli::try_parse_from(&["test", "upgrade"]).unwrap();
+        let cli = Cli::try_parse_from(["test", "upgrade"]).unwrap();
         assert!(matches!(cli.command.unwrap(), Commands::Upgrade));
     }
 
     #[test]
     fn test_cli_parse_uninstall() {
-        let cli = Cli::try_parse_from(&["test", "uninstall"]).unwrap();
+        let cli = Cli::try_parse_from(["test", "uninstall"]).unwrap();
         assert!(matches!(cli.command.unwrap(), Commands::Uninstall));
     }
 
     #[test]
     fn test_cli_parse_config() {
-        let cli = Cli::try_parse_from(&["test", "config"]).unwrap();
+        let cli = Cli::try_parse_from(["test", "config"]).unwrap();
         assert!(matches!(cli.command.unwrap(), Commands::Config));
     }
 
     #[test]
     fn test_cli_parse_feishu_auth_status() {
-        let cli = Cli::try_parse_from(&["test", "feishu", "auth", "status"]).unwrap();
+        let cli = Cli::try_parse_from(["test", "feishu", "auth", "status"]).unwrap();
         match cli.command.unwrap() {
             Commands::Feishu(FeishuCommands::Auth { action }) => {
                 assert!(matches!(action, FeishuAuthAction::Status));
@@ -471,7 +602,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse_feishu_auth_login() {
-        let cli = Cli::try_parse_from(&["test", "feishu", "auth", "login"]).unwrap();
+        let cli = Cli::try_parse_from(["test", "feishu", "auth", "login"]).unwrap();
         match cli.command.unwrap() {
             Commands::Feishu(FeishuCommands::Auth { action }) => {
                 assert!(matches!(action, FeishuAuthAction::Login));
@@ -482,7 +613,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse_feishu_chat_list() {
-        let cli = Cli::try_parse_from(&["test", "feishu", "chat", "list"]).unwrap();
+        let cli = Cli::try_parse_from(["test", "feishu", "chat", "list"]).unwrap();
         match cli.command.unwrap() {
             Commands::Feishu(FeishuCommands::Chat { action }) => {
                 assert!(matches!(action, FeishuChatAction::List));
@@ -493,7 +624,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse_feishu_listen_defaults() {
-        let cli = Cli::try_parse_from(&["test", "feishu", "listen"]).unwrap();
+        let cli = Cli::try_parse_from(["test", "feishu", "listen"]).unwrap();
         match cli.command.unwrap() {
             Commands::Feishu(FeishuCommands::Listen {
                 mode,
@@ -512,7 +643,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse_feishu_listen_with_options() {
-        let cli = Cli::try_parse_from(&[
+        let cli = Cli::try_parse_from([
             "test",
             "feishu",
             "listen",
@@ -544,7 +675,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse_gateway_status() {
-        let cli = Cli::try_parse_from(&["test", "gateway", "status"]).unwrap();
+        let cli = Cli::try_parse_from(["test", "gateway", "status"]).unwrap();
         match cli.command.unwrap() {
             Commands::Gateway(GatewayCommands::Status) => {}
             _ => panic!("Expected Gateway status command"),

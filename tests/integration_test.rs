@@ -5,13 +5,13 @@ use haimen::cli::{self, Cli};
 #[test]
 fn test_cli_config_output() {
     // 验证 CLI 可以正确解析 config 命令
-    let cli = Cli::try_parse_from(&["test", "config"]).unwrap();
+    let cli = Cli::try_parse_from(["test", "config"]).unwrap();
     assert!(matches!(cli.command.unwrap(), cli::Commands::Config));
 }
 
 #[test]
 fn test_cli_feishu_auth_status() {
-    let cli = Cli::try_parse_from(&["test", "feishu", "auth", "status"]).unwrap();
+    let cli = Cli::try_parse_from(["test", "feishu", "auth", "status"]).unwrap();
     assert!(matches!(
         cli.command.unwrap(),
         cli::Commands::Feishu(cli::FeishuCommands::Auth { .. })
@@ -20,7 +20,7 @@ fn test_cli_feishu_auth_status() {
 
 #[test]
 fn test_cli_feishu_listen() {
-    let cli = Cli::try_parse_from(&["test", "feishu", "listen"]).unwrap();
+    let cli = Cli::try_parse_from(["test", "feishu", "listen"]).unwrap();
     assert!(matches!(
         cli.command.unwrap(),
         cli::Commands::Feishu(cli::FeishuCommands::Listen { .. })
@@ -29,7 +29,7 @@ fn test_cli_feishu_listen() {
 
 #[test]
 fn test_cli_gateway_status() {
-    let cli = Cli::try_parse_from(&["test", "gateway", "status"]).unwrap();
+    let cli = Cli::try_parse_from(["test", "gateway", "status"]).unwrap();
     assert!(matches!(
         cli.command.unwrap(),
         cli::Commands::Gateway(cli::GatewayCommands::Status)
@@ -38,7 +38,7 @@ fn test_cli_gateway_status() {
 
 #[tokio::test]
 async fn test_run_config_returns_ok() {
-    let cli = Cli::try_parse_from(&["test", "config"]).unwrap();
+    let cli = Cli::try_parse_from(["test", "config"]).unwrap();
     let result = cli::run(cli).await;
     assert!(result.is_ok());
 }

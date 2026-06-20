@@ -402,7 +402,7 @@ mod tests {
                 "x86_64-pc-windows-msvc",
             ];
             assert!(
-                valid_triples.iter().any(|&t| t == triple),
+                valid_triples.contains(&triple),
                 "unknown triple: {}",
                 triple
             );
@@ -421,7 +421,7 @@ mod tests {
                 "x86_64-pc-windows-msvc",
             ];
             assert!(
-                valid_triples.iter().any(|&t| t == triple),
+                valid_triples.contains(&triple),
                 "unknown triple: {}",
                 triple
             );

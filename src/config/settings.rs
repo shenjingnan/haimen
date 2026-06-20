@@ -131,6 +131,13 @@ pub struct GatewayConfig {
     /// MCP 服务器配置（haimen 作为客户端连接）
     #[serde(default)]
     pub mcp_servers: HashMap<String, McpServerConfig>,
+    /// 默认 IM 通道: "lark" | "telegram" | "discord"
+    #[serde(default = "default_channel")]
+    pub channel: String,
+}
+
+fn default_channel() -> String {
+    "lark".to_string()
 }
 
 fn default_session_idle_timeout() -> u64 {
@@ -152,6 +159,7 @@ impl Default for GatewayConfig {
             session_idle_timeout_mins: default_session_idle_timeout(),
             session_max_turns: default_session_max_turns(),
             mcp_servers: HashMap::new(),
+            channel: default_channel(),
         }
     }
 }
@@ -205,6 +213,9 @@ pub struct AppConfig {
     /// AI 网关配置
     #[serde(default)]
     pub gateway: GatewayConfig,
+    /// GitHub Webhook 配置
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github: Option<crate::connectors::github::config::GitHubConfig>,
 }
 
 fn default_log_level() -> String {
@@ -219,6 +230,7 @@ impl Default for AppConfig {
             custom: None,
             feishu: FeishuConfig::default(),
             gateway: GatewayConfig::default(),
+            github: None,
         }
     }
 }
@@ -373,6 +385,7 @@ mod tests {
             custom: Some(std::collections::HashMap::new()),
             feishu: FeishuConfig::default(),
             gateway: GatewayConfig::default(),
+            github: None,
         };
         let toml_str = toml::to_string(&config).unwrap();
         let deserialized: AppConfig = toml::from_str(&toml_str).unwrap();

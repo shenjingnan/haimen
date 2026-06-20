@@ -5,7 +5,7 @@ use rmcp::transport::child_process::TokioChildProcess;
 use tokio::process::Command;
 use tracing;
 
-use crate::agent::error::{AgentError, AgentResult};
+use crate::agents::error::{AgentError, AgentResult};
 
 /// MCP 客户端，用于连接 MCP 服务端（如 claude mcp serve）
 pub struct McpClient {
