@@ -1,4 +1,5 @@
 pub mod chat_loop;
+pub mod session;
 
 use crate::feishu::bridge::LarkCliBridge;
 
