@@ -1,9 +1,10 @@
 /// 通用工具模块
+pub mod agents;
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod connectors;
 pub mod datetime;
-pub mod feishu;
 pub mod gateway;
 pub mod logging;
 pub mod web;

@@ -1,5 +1,7 @@
+use std::sync::Arc;
+
 use crate::config;
-use crate::feishu;
+use crate::connectors::lark as feishu;
 use clap::{CommandFactory, Parser, Subcommand};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -246,8 +248,22 @@ pub async fn run(cli: Cli) -> Result<(), String> {
             GatewayCommands::Listen => crate::gateway::listen().await,
         },
         Some(Commands::Serve { host, port }) => {
-            let config = crate::web::ServeConfig { host, port };
-            crate::web::start(config).await
+            let settings = crate::config::settings::load_settings()
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let agent: Arc<dyn crate::gateway::provider::AgentProvider> =
+                Arc::new(crate::agents::claude_code::agent::ClaudeAgent);
+
+            let webhook_state = settings.github.map(|cfg| {
+                let connector = crate::connectors::github::GitHubConnector::new(cfg, agent.clone());
+                crate::gateway::webhook::WebhookState {
+                    github: Some(Arc::new(connector)),
+                }
+            });
+
+            let serve_config = crate::web::ServeConfig { host, port };
+            crate::web::start(serve_config, webhook_state).await
         }
         Some(Commands::Completion { shell }) => {
             cmd_completion(shell, &mut std::io::stdout());

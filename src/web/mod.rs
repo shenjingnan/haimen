@@ -3,6 +3,8 @@ pub mod r#static;
 
 use std::net::SocketAddr;
 
+use crate::gateway::webhook::WebhookState;
+
 /// 服务器配置
 pub struct ServeConfig {
     pub host: String,
@@ -10,13 +12,27 @@ pub struct ServeConfig {
 }
 
 /// 启动 HTTP 服务器
-pub async fn start(config: ServeConfig) -> Result<(), String> {
-    let app = axum::Router::new()
-        // API 路由（优先匹配）
-        .route("/health", axum::routing::get(health_handler))
-        .route("/api/v1/system/info", axum::routing::get(api::system::info))
-        // 静态文件和 SPA fallback
-        .fallback(r#static::handle);
+///
+/// - `config`: 服务器地址配置
+/// - `webhook_state`: 可选的 Webhook 处理器
+pub async fn start(config: ServeConfig, webhook_state: Option<WebhookState>) -> Result<(), String> {
+    // 构建基础路由（所有路由都工作在任何状态类型下，因为他们不提取 State）
+    let app = if let Some(state) = webhook_state {
+        axum::Router::new()
+            .route("/health", axum::routing::get(health_handler))
+            .route("/api/v1/system/info", axum::routing::get(api::system::info))
+            .route(
+                "/webhook/github",
+                axum::routing::post(api::webhook::handle_github_webhook),
+            )
+            .fallback(r#static::handle)
+            .with_state(state)
+    } else {
+        axum::Router::new()
+            .route("/health", axum::routing::get(health_handler))
+            .route("/api/v1/system/info", axum::routing::get(api::system::info))
+            .fallback(r#static::handle)
+    };
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()
