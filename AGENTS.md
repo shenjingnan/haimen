@@ -32,6 +32,10 @@ cargo run -- feishu chat list       # 列出飞书群聊
 cargo run -- feishu listen          # 监听飞书消息
 cargo run -- completion bash        # 生成 shell 补全
 
+# 安装 pre-commit 钩子（新 clone 后必须执行一次）
+npm install -g lefthook             # 安装 lefthook
+lefthook install                    # 注册 pre-commit 钩子
+
 # 测试
 cargo test                          # 运行测试
 cargo test -- --test-threads=1      # 单线程测试（避免 env 竞争）
