@@ -32,7 +32,7 @@ mod tests {
         let now = iso_timestamp_now();
         assert!(now.len() >= 24, "时间戳长度至少 24（含时区偏移）: {}", now);
         assert!(now.contains('T'), "时间戳应包含 T 分隔符: {}", now);
-        let offset_start = now.rfind(|c: char| c == '+' || c == '-');
+        let offset_start = now.rfind(['+', '-']);
         assert!(
             offset_start.is_some() && offset_start.unwrap() > 10,
             "时间戳应包含时区偏移（如 +08:00）: {}",

@@ -573,25 +573,25 @@ mod tests {
 
     #[test]
     fn test_cli_parse_upgrade() {
-        let cli = Cli::try_parse_from(&["test", "upgrade"]).unwrap();
+        let cli = Cli::try_parse_from(["test", "upgrade"]).unwrap();
         assert!(matches!(cli.command.unwrap(), Commands::Upgrade));
     }
 
     #[test]
     fn test_cli_parse_uninstall() {
-        let cli = Cli::try_parse_from(&["test", "uninstall"]).unwrap();
+        let cli = Cli::try_parse_from(["test", "uninstall"]).unwrap();
         assert!(matches!(cli.command.unwrap(), Commands::Uninstall));
     }
 
     #[test]
     fn test_cli_parse_config() {
-        let cli = Cli::try_parse_from(&["test", "config"]).unwrap();
+        let cli = Cli::try_parse_from(["test", "config"]).unwrap();
         assert!(matches!(cli.command.unwrap(), Commands::Config));
     }
 
     #[test]
     fn test_cli_parse_feishu_auth_status() {
-        let cli = Cli::try_parse_from(&["test", "feishu", "auth", "status"]).unwrap();
+        let cli = Cli::try_parse_from(["test", "feishu", "auth", "status"]).unwrap();
         match cli.command.unwrap() {
             Commands::Feishu(FeishuCommands::Auth { action }) => {
                 assert!(matches!(action, FeishuAuthAction::Status));
@@ -602,7 +602,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse_feishu_auth_login() {
-        let cli = Cli::try_parse_from(&["test", "feishu", "auth", "login"]).unwrap();
+        let cli = Cli::try_parse_from(["test", "feishu", "auth", "login"]).unwrap();
         match cli.command.unwrap() {
             Commands::Feishu(FeishuCommands::Auth { action }) => {
                 assert!(matches!(action, FeishuAuthAction::Login));
@@ -613,7 +613,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse_feishu_chat_list() {
-        let cli = Cli::try_parse_from(&["test", "feishu", "chat", "list"]).unwrap();
+        let cli = Cli::try_parse_from(["test", "feishu", "chat", "list"]).unwrap();
         match cli.command.unwrap() {
             Commands::Feishu(FeishuCommands::Chat { action }) => {
                 assert!(matches!(action, FeishuChatAction::List));
@@ -624,7 +624,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse_feishu_listen_defaults() {
-        let cli = Cli::try_parse_from(&["test", "feishu", "listen"]).unwrap();
+        let cli = Cli::try_parse_from(["test", "feishu", "listen"]).unwrap();
         match cli.command.unwrap() {
             Commands::Feishu(FeishuCommands::Listen {
                 mode,
@@ -643,7 +643,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse_feishu_listen_with_options() {
-        let cli = Cli::try_parse_from(&[
+        let cli = Cli::try_parse_from([
             "test",
             "feishu",
             "listen",
@@ -675,7 +675,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse_gateway_status() {
-        let cli = Cli::try_parse_from(&["test", "gateway", "status"]).unwrap();
+        let cli = Cli::try_parse_from(["test", "gateway", "status"]).unwrap();
         match cli.command.unwrap() {
             Commands::Gateway(GatewayCommands::Status) => {}
             _ => panic!("Expected Gateway status command"),
