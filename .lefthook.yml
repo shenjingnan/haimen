@@ -1,0 +1,16 @@
+# lefthook 配置
+# 安装: brew install lefthook && lefthook install
+
+pre-commit:
+  parallel: true
+  commands:
+    format:
+      glob: "*"
+      run: cargo fmt --check
+      stage_fixed: true
+    clippy:
+      glob: "*"
+      run: cargo clippy -- -D warnings
+    test:
+      glob: "*"
+      run: cargo test -- --test-threads=1
