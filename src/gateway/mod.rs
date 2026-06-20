@@ -55,3 +55,18 @@ pub async fn listen() -> Result<(), String> {
 
     chat_loop::run_chat_loop(&*channel, &*agent, &config.gateway).await
 }
+
+/// 启动网关监听（Echo 模式）
+///
+/// 只启动 Channel，收到消息后直接 echo 回去，不经过 Agent 处理。
+/// 用于验证通道连通性和消息格式。
+pub async fn listen_echo() -> Result<(), String> {
+    let config = load_settings().ok().flatten().unwrap_or_default();
+
+    let channel: Box<dyn MessageChannel> = match config.gateway.channel.as_str() {
+        "lark" => Box::new(LarkChannel::new(&config.feishu.lark_cli_path)),
+        other => return Err(format!("不支持的 IM 通道: {}", other)),
+    };
+
+    chat_loop::run_echo_loop(&*channel).await
+}

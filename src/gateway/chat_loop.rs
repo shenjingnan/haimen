@@ -152,6 +152,33 @@ where
     Err("消息流意外结束".to_string())
 }
 
+/// 运行 Echo 循环（Channel 调试模式）
+///
+/// 只启动 Channel 监听，收到消息后直接 echo 回去，不经过 Agent 处理。
+/// 用于验证通道连通性和消息格式。
+pub async fn run_echo_loop<C: MessageChannel + ?Sized>(channel: &C) -> Result<(), String> {
+    channel.health_check().await?;
+
+    let mut stream = channel.listen().await?;
+
+    tracing::info!(channel = %channel.name(), "Echo 模式已启动");
+
+    while let Some(message) = stream.next().await {
+        tracing::info!(
+            sender = %message.sender_id,
+            conversation_id = %message.conversation_id,
+            "收到消息 (echo)"
+        );
+
+        let echo = format!("🔄 Echo: {}", message.content);
+        if let Err(e) = channel.send(&message.conversation_id, &echo).await {
+            tracing::warn!(error = %e, "发送 echo 失败");
+        }
+    }
+
+    Err("消息流意外结束".to_string())
+}
+
 /// 从消息中解析内置命令
 fn parse_command(msg: &str) -> Option<GatewayCommand> {
     let trimmed = msg.trim();
