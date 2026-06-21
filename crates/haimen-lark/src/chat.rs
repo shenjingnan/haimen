@@ -1,5 +1,5 @@
-use super::bridge::LarkCliBridge;
-use super::types::{ChatInfo, ChatListResponse};
+use crate::bridge::LarkCliBridge;
+use crate::types::{ChatInfo, ChatListResponse};
 
 /// 列出可访问的群聊
 pub async fn list_chats(bridge: &LarkCliBridge) -> Result<Vec<ChatInfo>, String> {
@@ -7,7 +7,6 @@ pub async fn list_chats(bridge: &LarkCliBridge) -> Result<Vec<ChatInfo>, String>
         .exec(&["im", "+chat-list", "--as", "bot", "--format", "json"])
         .await?;
 
-    // 从 data 字段中提取
     let data = value
         .get("data")
         .ok_or_else(|| "聊天列表响应缺少 data 字段".to_string())?;

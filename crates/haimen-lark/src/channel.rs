@@ -5,13 +5,12 @@ use chrono::Utc;
 use futures_util::Stream;
 use futures_util::StreamExt;
 
-use crate::gateway::channel::MessageChannel;
-use crate::gateway::model::Message;
+use haimen_core::Message;
+use haimen_core::MessageChannel;
 
-use super::bridge::LarkCliBridge;
-use super::types::FeishuEvent;
+use crate::bridge::LarkCliBridge;
+use crate::types::FeishuEvent;
 
-/// 飞书/Lark 消息通道，实现 MessageChannel trait
 pub struct LarkChannel {
     bridge: LarkCliBridge,
 }

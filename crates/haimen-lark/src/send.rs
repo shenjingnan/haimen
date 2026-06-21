@@ -1,6 +1,5 @@
-use super::bridge::LarkCliBridge;
+use crate::bridge::LarkCliBridge;
 
-/// 发送文本消息到飞书聊天
 pub async fn send_text(bridge: &LarkCliBridge, chat_id: &str, text: &str) -> Result<(), String> {
     bridge
         .exec(&[
@@ -17,7 +16,6 @@ pub async fn send_text(bridge: &LarkCliBridge, chat_id: &str, text: &str) -> Res
     Ok(())
 }
 
-/// 发送 Markdown 消息到飞书聊天
 pub async fn send_markdown(
     bridge: &LarkCliBridge,
     chat_id: &str,

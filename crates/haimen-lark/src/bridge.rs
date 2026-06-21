@@ -5,7 +5,7 @@ use futures_util::Stream;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-use super::types::BridgeHealth;
+use crate::types::BridgeHealth;
 
 /// lark-cli 子进程桥接器
 pub struct LarkCliBridge {
@@ -13,14 +13,12 @@ pub struct LarkCliBridge {
 }
 
 impl LarkCliBridge {
-    /// 创建桥接器实例
     pub fn new(lark_cli_path: impl Into<String>) -> Self {
         Self {
             lark_cli_path: lark_cli_path.into(),
         }
     }
 
-    /// 执行一次性 lark-cli 命令并解析 JSON 输出
     pub async fn exec(&self, args: &[&str]) -> Result<serde_json::Value, String> {
         let output = Command::new(&self.lark_cli_path)
             .args(args)
@@ -45,7 +43,6 @@ impl LarkCliBridge {
         let value: serde_json::Value = serde_json::from_str(stdout.trim())
             .map_err(|e| format!("解析 lark-cli 输出失败: {}", e))?;
 
-        // 检查 lark-cli 的 ok 字段
         if let Some(obj) = value.as_object() {
             if let Some(false) = obj.get("ok").and_then(|v| v.as_bool()) {
                 let code = obj
@@ -65,7 +62,6 @@ impl LarkCliBridge {
         Ok(value)
     }
 
-    /// 启动长驻 lark-cli 进程并返回 stdout 行流
     pub async fn stream(
         &self,
         args: &[&str],
@@ -86,7 +82,6 @@ impl LarkCliBridge {
         let reader = BufReader::new(stdout);
         let lines = reader.lines();
 
-        // 将 child 移入 unfold 状态中，保持进程存活
         let stream =
             futures_util::stream::unfold((lines, child), |(mut lines, _child)| async move {
                 match lines.next_line().await {
@@ -101,9 +96,7 @@ impl LarkCliBridge {
         Ok(Box::pin(stream))
     }
 
-    /// 快速健康检查
     pub async fn health_check(&self) -> BridgeHealth {
-        // 检查 lark-cli 是否存在
         let lark_cli_found = Command::new(&self.lark_cli_path)
             .arg("--version")
             .stdout(Stdio::null())
@@ -121,7 +114,6 @@ impl LarkCliBridge {
             };
         }
 
-        // 检查认证状态：运行 auth status 成功即视为已认证
         let authenticated = Command::new(&self.lark_cli_path)
             .args(["auth", "status", "--json"])
             .stdout(Stdio::null())
@@ -138,7 +130,6 @@ impl LarkCliBridge {
         }
     }
 
-    /// 获取 lark-cli 路径
     #[allow(dead_code)]
     pub fn path(&self) -> &str {
         &self.lark_cli_path

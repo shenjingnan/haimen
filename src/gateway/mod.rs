@@ -8,9 +8,9 @@ pub mod webhook;
 use crate::agents::claude_code::agent::ClaudeAgent;
 use crate::config::settings::load_settings;
 use crate::connectors::dingtalk::channel::DingTalkChannel;
-use crate::connectors::lark::channel::LarkChannel;
 use crate::gateway::channel::MessageChannel;
 use crate::gateway::provider::AgentProvider;
+use haimen_lark::LarkChannel;
 
 /// 网关状态
 pub struct GatewayStatus {

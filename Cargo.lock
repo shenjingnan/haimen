@@ -757,6 +757,8 @@ dependencies = [
  "clap_complete",
  "dingtalk-stream",
  "futures-util",
+ "haimen-core",
+ "haimen-lark",
  "hex",
  "hmac",
  "reqwest",
@@ -774,6 +776,29 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "haimen-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures-util",
+]
+
+[[package]]
+name = "haimen-lark"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures-util",
+ "haimen-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
