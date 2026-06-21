@@ -2,6 +2,7 @@
 members = [
     "crates/haimen-core",
     "crates/haimen-lark",
+    "crates/haimen-xiaozhi",
     ".",    # 根目录的主 crate
 ]
 
@@ -32,7 +33,7 @@ thiserror = "2"
 anyhow = "1"
 
 # Web 框架
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 
 # 静态资源嵌入
@@ -64,6 +65,9 @@ tokio-util = "0.7"
 tokio-stream = "0.1"
 tempfile = "3"
 
+# UUID
+uuid = { version = "1", features = ["v4"] }
+
 
 [dependencies]
 clap = { workspace = true }
@@ -94,6 +98,7 @@ tokio-stream = { workspace = true }
 # Workspace crate 依赖
 haimen-core = { path = "crates/haimen-core" }
 haimen-lark = { path = "crates/haimen-lark" }
+haimen-xiaozhi = { path = "crates/haimen-xiaozhi" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

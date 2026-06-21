@@ -16,22 +16,28 @@ pub struct ServeConfig {
 /// - `config`: 服务器地址配置
 /// - `webhook_state`: 可选的 Webhook 处理器
 pub async fn start(config: ServeConfig, webhook_state: Option<WebhookState>) -> Result<(), String> {
-    // 构建基础路由（所有路由都工作在任何状态类型下，因为他们不提取 State）
+    use haimen_xiaozhi;
+
+    // 构建路由（WebhookState 分支需要用 .with_state() 传递 state）
     let app = if let Some(state) = webhook_state {
-        axum::Router::new()
-            .route("/health", axum::routing::get(health_handler))
-            .route("/api/v1/system/info", axum::routing::get(api::system::info))
-            .route(
-                "/webhook/github",
-                axum::routing::post(api::webhook::handle_github_webhook),
-            )
-            .fallback(r#static::handle)
-            .with_state(state)
+        haimen_xiaozhi::add_routes(
+            axum::Router::new()
+                .route("/health", axum::routing::get(health_handler))
+                .route("/api/v1/system/info", axum::routing::get(api::system::info))
+                .route(
+                    "/webhook/github",
+                    axum::routing::post(api::webhook::handle_github_webhook),
+                )
+                .with_state(state),
+        )
+        .fallback(r#static::handle)
     } else {
-        axum::Router::new()
-            .route("/health", axum::routing::get(health_handler))
-            .route("/api/v1/system/info", axum::routing::get(api::system::info))
-            .fallback(r#static::handle)
+        haimen_xiaozhi::add_routes(
+            axum::Router::new()
+                .route("/health", axum::routing::get(health_handler))
+                .route("/api/v1/system/info", axum::routing::get(api::system::info)),
+        )
+        .fallback(r#static::handle)
     };
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
@@ -44,7 +50,7 @@ pub async fn start(config: ServeConfig, webhook_state: Option<WebhookState>) -> 
         .await
         .map_err(|e| format!("绑定地址失败: {}", e))?;
 
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service())
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| format!("服务器错误: {}", e))
