@@ -216,6 +216,9 @@ pub struct AppConfig {
     /// GitHub Webhook 配置
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github: Option<crate::connectors::github::config::GitHubConfig>,
+    /// 钉钉配置（可选，不配置时禁用钉钉通道）
+    #[serde(default)]
+    pub dingtalk: Option<crate::connectors::dingtalk::config::DingTalkConfig>,
 }
 
 fn default_log_level() -> String {
@@ -231,6 +234,7 @@ impl Default for AppConfig {
             feishu: FeishuConfig::default(),
             gateway: GatewayConfig::default(),
             github: None,
+            dingtalk: None,
         }
     }
 }
@@ -386,6 +390,7 @@ mod tests {
             feishu: FeishuConfig::default(),
             gateway: GatewayConfig::default(),
             github: None,
+            dingtalk: None,
         };
         let toml_str = toml::to_string(&config).unwrap();
         let deserialized: AppConfig = toml::from_str(&toml_str).unwrap();
