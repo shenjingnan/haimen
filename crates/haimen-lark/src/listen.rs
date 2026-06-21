@@ -1,15 +1,10 @@
 use futures_util::StreamExt;
 use tokio::time::{Duration, sleep};
 
-use super::bridge::LarkCliBridge;
-use super::types::FeishuEvent;
+use crate::bridge::LarkCliBridge;
+use crate::types::FeishuEvent;
 
-/// 事件订阅模式：监听飞书消息
-///
-/// 通过 `lark-cli event consume im.message.receive_v1` 实时接收消息。
-/// 需要飞书开发者后台启用 im.message.receive_v1 事件订阅。
 pub async fn listen_events(bridge: &LarkCliBridge, use_json: bool) -> Result<(), String> {
-    // 先做健康检查
     let health = bridge.health_check().await;
     if !health.lark_cli_found {
         return Err("lark-cli 未安装。请执行: npm install -g @larksuite/cli".to_string());
@@ -53,7 +48,6 @@ pub async fn listen_events(bridge: &LarkCliBridge, use_json: bool) -> Result<(),
                 }
             }
             Err(e) => {
-                // 非 NDJSON 行（如 lark-cli 的日志），在 quiet 模式应很少出现
                 tracing::debug!("忽略非事件行: {} ({})", line.trim(), e);
             }
         }
@@ -62,9 +56,6 @@ pub async fn listen_events(bridge: &LarkCliBridge, use_json: bool) -> Result<(),
     Err("lark-cli 事件流意外结束".to_string())
 }
 
-/// 轮询模式：定期检查新消息
-///
-/// 通过 lark-cli 定期查询指定聊天的消息。
 pub async fn listen_poll(
     bridge: &LarkCliBridge,
     chat_id: &str,
@@ -84,7 +75,6 @@ pub async fn listen_poll(
         chat_id, interval_secs
     );
 
-    // 记录最新消息的时间作为游标
     let mut cursor: Option<String> = None;
 
     loop {
@@ -113,7 +103,6 @@ pub async fn listen_poll(
                             if let Ok(event) =
                                 serde_json::from_value::<FeishuEvent>(msg_value.clone())
                             {
-                                // 更新游标
                                 cursor = Some(event.create_time.clone());
 
                                 if use_json {
@@ -131,7 +120,6 @@ pub async fn listen_poll(
             }
             Err(e) => {
                 eprintln!("轮询消息失败: {}", e);
-                // 不要退出，继续重试
             }
         }
 
@@ -139,7 +127,6 @@ pub async fn listen_poll(
     }
 }
 
-/// 格式化输出飞书事件
 fn print_event_pretty(event: &FeishuEvent) {
     let chat_label = match event.chat_type.as_str() {
         "p2p" => "私聊",
@@ -147,7 +134,6 @@ fn print_event_pretty(event: &FeishuEvent) {
         _ => &event.chat_type,
     };
 
-    // 尝试格式化时间
     let time_str = if event.create_time.len() >= 13 {
         let millis: i64 = event.create_time[..13].parse().unwrap_or(0);
         let secs = millis / 1000;
@@ -174,9 +160,7 @@ fn print_event_pretty(event: &FeishuEvent) {
     println!("[{}] 来自 {} ({})", time_str, event.sender_id, chat_label);
     println!("━━━ {} ━━━", msg_type_label);
 
-    // 文本消息直接显示内容，其他类型显示原始 JSON
     if event.message_type == "text" {
-        // 尝试解析文本内容中的 JSON
         if let Ok(text_obj) = serde_json::from_str::<serde_json::Value>(&event.content) {
             if let Some(text) = text_obj.get("text").and_then(|t| t.as_str()) {
                 println!("{}", text);
@@ -184,7 +168,6 @@ fn print_event_pretty(event: &FeishuEvent) {
                 println!("{}", event.content);
             }
         } else {
-            // 不是 JSON，直接打印
             let text = event.content.trim_start_matches('"').trim_end_matches('"');
             println!("{}", text);
         }

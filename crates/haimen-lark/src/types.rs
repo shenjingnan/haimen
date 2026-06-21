@@ -24,21 +24,13 @@ pub struct LarkCliError {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct FeishuEvent {
-    /// 消息 ID
     pub message_id: String,
-    /// 聊天 ID
     pub chat_id: String,
-    /// 聊天类型: "p2p" | "group"
     pub chat_type: String,
-    /// 发送者 ID
     pub sender_id: String,
-    /// 消息类型: "text", "image", "post" 等
     pub message_type: String,
-    /// 消息内容（文本或 JSON）
     pub content: String,
-    /// 创建时间（毫秒时间戳）
     pub create_time: String,
-    /// 事件 ID
     pub event_id: Option<String>,
 }
 

@@ -1,3 +1,10 @@
+[workspace]
+members = [
+    "crates/haimen-core",
+    "crates/haimen-lark",
+    ".",    # 根目录的主 crate
+]
+
 [package]
 name = "haimen"
 version = "0.1.0"
@@ -7,7 +14,7 @@ description = "AI 网关基建 CLI"
 license = "MIT"
 repository = "https://github.com/shenjingnan/haimen"
 
-[dependencies]
+[workspace.dependencies]
 # CLI 框架
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
@@ -38,22 +45,58 @@ chrono = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 
-# HTTP 客户端（upgrade 命令使用）
+# HTTP 客户端
 reqwest = { version = "0.13", features = ["json", "stream"] }
-# URL 解析
-# url = "2"
-futures-util = "0.3"                                   # 异步流处理
-async-trait = "0.1"                                    # async fn in traits
+
+# 异步流处理
+futures-util = "0.3"
+async-trait = "0.1"
+
+# MCP 协议
 rmcp = { version = "1.7.0", features = ["client", "transport-child-process"] }
 hmac = "0.13.0"
 sha2 = "0.11.0"
 hex = "0.4.3"
+
+# 钉钉集成
 dingtalk-stream = "0.1.7"
 tokio-util = "0.7"
 tokio-stream = "0.1"
+tempfile = "3"
+
+
+[dependencies]
+clap = { workspace = true }
+clap_complete = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+rust-embed = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = { workspace = true }
+futures-util = { workspace = true }
+async-trait = { workspace = true }
+rmcp = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+dingtalk-stream = { workspace = true }
+tokio-util = { workspace = true }
+tokio-stream = { workspace = true }
+
+# Workspace crate 依赖
+haimen-core = { path = "crates/haimen-core" }
+haimen-lark = { path = "crates/haimen-lark" }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 
 [profile.dist]
 inherits = "release"

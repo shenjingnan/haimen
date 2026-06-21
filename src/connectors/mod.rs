@@ -1,4 +1,3 @@
 /// 外部系统连接器（消息通道、Webhook 等）
 pub mod dingtalk;
 pub mod github;
-pub mod lark;

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::config;
-use crate::connectors::lark as feishu;
 use clap::{CommandFactory, Parser, Subcommand};
+use haimen_lark as feishu;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
