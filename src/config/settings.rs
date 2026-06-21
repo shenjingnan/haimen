@@ -216,6 +216,9 @@ pub struct AppConfig {
     /// GitHub Webhook 配置
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github: Option<crate::connectors::github::config::GitHubConfig>,
+    /// 钉钉配置（可选，不配置时禁用钉钉通道）
+    #[serde(default)]
+    pub dingtalk: Option<crate::connectors::dingtalk::config::DingTalkConfig>,
 }
 
 fn default_log_level() -> String {
@@ -231,6 +234,7 @@ impl Default for AppConfig {
             feishu: FeishuConfig::default(),
             gateway: GatewayConfig::default(),
             github: None,
+            dingtalk: None,
         }
     }
 }
@@ -386,9 +390,71 @@ mod tests {
             feishu: FeishuConfig::default(),
             gateway: GatewayConfig::default(),
             github: None,
+            dingtalk: None,
         };
         let toml_str = toml::to_string(&config).unwrap();
         let deserialized: AppConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(config, deserialized);
+    }
+
+    #[test]
+    fn test_load_settings_with_dingtalk() {
+        run_with_temp_home(|home| {
+            let settings_dir = home.join(".haimen");
+            std::fs::create_dir_all(&settings_dir).unwrap();
+            std::fs::write(
+                settings_dir.join("settings.toml"),
+                r#"
+                    [dingtalk]
+                    client_id = "dingxxxxxxxxxxxxxxx"
+                    client_secret = "${env.DINGTALK_CLIENT_SECRET}"
+
+                    [gateway]
+                    channel = "dingtalk"
+                "#,
+            )
+            .unwrap();
+
+            let config = load_settings().unwrap().unwrap();
+            let dt = config.dingtalk.expect("dingtalk config should exist");
+            assert_eq!(dt.client_id, "dingxxxxxxxxxxxxxxx");
+            assert_eq!(dt.client_secret, "${env.DINGTALK_CLIENT_SECRET}");
+        });
+    }
+
+    #[test]
+    fn test_load_settings_without_dingtalk() {
+        run_with_temp_home(|home| {
+            let settings_dir = home.join(".haimen");
+            std::fs::create_dir_all(&settings_dir).unwrap();
+            std::fs::write(settings_dir.join("settings.toml"), r#"debug = true"#).unwrap();
+
+            let config = load_settings().unwrap().unwrap();
+            assert!(config.dingtalk.is_none());
+        });
+    }
+
+    #[test]
+    fn test_load_settings_channel_matches_config() {
+        run_with_temp_home(|home| {
+            let settings_dir = home.join(".haimen");
+            std::fs::create_dir_all(&settings_dir).unwrap();
+            std::fs::write(
+                settings_dir.join("settings.toml"),
+                r#"
+                    [dingtalk]
+                    client_id = "id"
+                    client_secret = "secret"
+
+                    [gateway]
+                    channel = "dingtalk"
+                "#,
+            )
+            .unwrap();
+
+            let config = load_settings().unwrap().unwrap();
+            assert_eq!(config.gateway.channel, "dingtalk");
+            assert!(config.dingtalk.is_some());
+        });
     }
 }

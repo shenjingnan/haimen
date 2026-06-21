@@ -7,6 +7,7 @@ pub mod webhook;
 
 use crate::agents::claude_code::agent::ClaudeAgent;
 use crate::config::settings::load_settings;
+use crate::connectors::dingtalk::channel::DingTalkChannel;
 use crate::connectors::lark::channel::LarkChannel;
 use crate::gateway::channel::MessageChannel;
 use crate::gateway::provider::AgentProvider;
@@ -42,6 +43,12 @@ pub async fn listen() -> Result<(), String> {
     // 根据配置构造 IM 通道
     let channel: Box<dyn MessageChannel> = match config.gateway.channel.as_str() {
         "lark" => Box::new(LarkChannel::new(&config.feishu.lark_cli_path)),
+        "dingtalk" => {
+            let dt_config = config
+                .dingtalk
+                .ok_or_else(|| "未配置 [dingtalk] 节".to_string())?;
+            Box::new(DingTalkChannel::new(dt_config))
+        }
         other => return Err(format!("不支持的 IM 通道: {}", other)),
     };
 
@@ -65,6 +72,12 @@ pub async fn listen_echo() -> Result<(), String> {
 
     let channel: Box<dyn MessageChannel> = match config.gateway.channel.as_str() {
         "lark" => Box::new(LarkChannel::new(&config.feishu.lark_cli_path)),
+        "dingtalk" => {
+            let dt_config = config
+                .dingtalk
+                .ok_or_else(|| "未配置 [dingtalk] 节".to_string())?;
+            Box::new(DingTalkChannel::new(dt_config))
+        }
         other => return Err(format!("不支持的 IM 通道: {}", other)),
     };
 
