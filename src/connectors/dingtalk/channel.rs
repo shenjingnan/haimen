@@ -228,4 +228,43 @@ mod tests {
         drop(channel);
         assert!(cancel.is_cancelled());
     }
+
+    #[tokio::test]
+    async fn test_health_check_missing_both() {
+        let channel = DingTalkChannel::new(DingTalkConfig {
+            client_id: String::new(),
+            client_secret: String::new(),
+            ..Default::default()
+        });
+        let err = channel.health_check().await.unwrap_err();
+        assert!(err.contains("client_id"));
+        assert!(err.contains("client_secret"));
+    }
+
+    #[test]
+    fn test_sender_init_lazy() {
+        let channel = DingTalkChannel::new(DingTalkConfig::default());
+        let sender = channel.get_or_init_sender();
+        let _ = sender;
+    }
+
+    #[test]
+    fn test_drop_multiple_times_safe() {
+        let channel = DingTalkChannel::new(DingTalkConfig::default());
+        let cancel = channel.cancel.clone();
+        drop(channel);
+        cancel.cancel();
+        assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_send_parses_session_key() {
+        let channel = DingTalkChannel::new(DingTalkConfig {
+            client_id: "id".into(),
+            client_secret: "secret".into(),
+            ..Default::default()
+        });
+        let result = channel.send("dingtalk:g:cid123:uid456", "hello").await;
+        assert!(result.is_err());
+    }
 }

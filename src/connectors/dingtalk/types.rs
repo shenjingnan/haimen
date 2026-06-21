@@ -186,4 +186,19 @@ mod tests {
         assert_eq!(t, "x");
         assert_eq!(id, "uid");
     }
+
+    #[test]
+    fn test_build_session_key_empty_sender() {
+        assert_eq!(
+            build_session_key("cid123", "group", "", true),
+            "dingtalk:g:cid123"
+        );
+    }
+
+    #[test]
+    fn test_parse_target_malformed_too_short() {
+        let (t, id) = parse_target_from_session_key("dingtalk");
+        assert_eq!(t, "d");
+        assert_eq!(id, "");
+    }
 }

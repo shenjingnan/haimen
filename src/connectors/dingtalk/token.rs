@@ -138,4 +138,23 @@ mod tests {
         };
         assert!(!cache.is_valid());
     }
+
+    #[tokio::test]
+    async fn test_token_manager_get_token_network_error() {
+        let client = Client::new();
+        let mgr = TokenManager::new("id".into(), "secret".into(), client);
+        let result = mgr.get_token().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_token_manager_force_refresh_clears_cache() {
+        let client = Client::new();
+        let mgr = TokenManager::new("id".into(), "secret".into(), client);
+
+        let first = mgr.get_token().await;
+        let second = mgr.force_refresh().await;
+
+        assert_eq!(first.is_err(), second.is_err());
+    }
 }

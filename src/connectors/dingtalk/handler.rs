@@ -364,4 +364,138 @@ mod tests {
         let result = try_parse_message(&json, "specific_user", false);
         assert!(result.is_none());
     }
+
+    #[test]
+    fn test_extract_text_rich_text_partial_blocks() {
+        let json = r#"{
+            "richText": {
+                "blocks": [
+                    {"text": {"text": "Hello"}},
+                    {"image": {"url": "..."}},
+                    {"text": {"text": "World"}}
+                ]
+            }
+        }"#;
+        assert_eq!(extract_text_content(json), "HelloWorld");
+    }
+
+    #[test]
+    fn test_extract_text_text_empty_content() {
+        let json = r#"{"content":""}"#;
+        let result = extract_text_content(json);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_extract_text_rich_text_no_blocks() {
+        let json = r#"{"richText": {}}"#;
+        assert!(extract_text_content(json).contains("richText"));
+    }
+
+    #[test]
+    fn test_json_str_empty_value() {
+        let val = serde_json::json!({"msgId": ""});
+        assert_eq!(json_str(&val, &["/msgId"]), None);
+    }
+
+    #[test]
+    fn test_is_duplicate_cache_overflow() {
+        let h = make_handler("*");
+        for i in 0..5000 {
+            h.is_duplicate(&format!("msg_{}", i));
+        }
+        assert!(!h.is_duplicate("msg_0001"));
+    }
+
+    #[test]
+    fn test_is_authorized_whitespace_in_list() {
+        let h = make_handler("user1, user2, user3");
+        assert!(h.is_authorized("user1"));
+        assert!(h.is_authorized("user2"));
+        assert!(h.is_authorized("user3"));
+    }
+
+    #[test]
+    fn test_try_parse_message_missing_msg_id() {
+        let mut data: serde_json::Value = serde_json::json!({
+            "data": {
+                "msg_id": "msg_001",
+                "sender": {"sender_id": "user123"},
+                "conversation_id": "cid_abc",
+                "conversation_type": "group",
+                "create_at": Utc::now().timestamp_millis(),
+                "payload": {"content": "你好"}
+            }
+        });
+        data["data"]["msg_id"] = serde_json::Value::Null;
+        let result = try_parse_message(&data.to_string(), "*", false);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_try_parse_message_rich_text() {
+        let json = serde_json::json!({
+            "data": {
+                "msg_id": "msg_004",
+                "sender": {"sender_id": "user456"},
+                "conversation_id": "cid_def",
+                "conversation_type": "group",
+                "create_at": Utc::now().timestamp_millis(),
+                "payload": {
+                    "richText": {
+                        "blocks": [
+                            {"text": {"text": "钉钉 "}},
+                            {"text": {"text": "消息"}}
+                        ]
+                    }
+                }
+            }
+        })
+        .to_string();
+        let msg = try_parse_message(&json, "*", false).unwrap();
+        assert_eq!(msg.content, "钉钉 消息");
+    }
+
+    #[test]
+    fn test_is_old_message_just_under_limit() {
+        let recent = (Utc::now() - chrono::Duration::minutes(4)).timestamp_millis();
+        assert!(!DingTalkHandler::is_old_message(recent));
+    }
+
+    #[test]
+    fn test_is_old_message_future() {
+        let future = (Utc::now() + chrono::Duration::hours(1)).timestamp_millis();
+        assert!(!DingTalkHandler::is_old_message(future));
+    }
+
+    #[test]
+    fn test_is_old_message_zero() {
+        assert!(DingTalkHandler::is_old_message(0));
+    }
+
+    #[test]
+    fn test_is_duplicate_different_ids() {
+        let h = make_handler("*");
+        assert!(!h.is_duplicate("msg_001"));
+        assert!(!h.is_duplicate("msg_002"));
+        assert!(!h.is_duplicate("msg_003"));
+    }
+
+    #[test]
+    fn test_try_parse_message_empty_payload() {
+        let mut data: serde_json::Value = serde_json::json!({
+            "data": {
+                "msg_id": "msg_005",
+                "sender": {"sender_id": "user789"},
+                "conversation_id": "cid_xyz",
+                "conversation_type": "group",
+                "create_at": Utc::now().timestamp_millis(),
+                "payload": {"content": "你好"}
+            }
+        });
+        data["data"]["payload"] = serde_json::Value::Null;
+        let msg = try_parse_message(&data.to_string(), "*", false).unwrap();
+        // payload 为 null 时，extract_text_content("null") 返回 "null"
+        assert_eq!(msg.content, "null");
+    }
 }

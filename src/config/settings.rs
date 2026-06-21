@@ -396,4 +396,65 @@ mod tests {
         let deserialized: AppConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(config, deserialized);
     }
+
+    #[test]
+    fn test_load_settings_with_dingtalk() {
+        run_with_temp_home(|home| {
+            let settings_dir = home.join(".haimen");
+            std::fs::create_dir_all(&settings_dir).unwrap();
+            std::fs::write(
+                settings_dir.join("settings.toml"),
+                r#"
+                    [dingtalk]
+                    client_id = "dingxxxxxxxxxxxxxxx"
+                    client_secret = "${env.DINGTALK_CLIENT_SECRET}"
+
+                    [gateway]
+                    channel = "dingtalk"
+                "#,
+            )
+            .unwrap();
+
+            let config = load_settings().unwrap().unwrap();
+            let dt = config.dingtalk.expect("dingtalk config should exist");
+            assert_eq!(dt.client_id, "dingxxxxxxxxxxxxxxx");
+            assert_eq!(dt.client_secret, "${env.DINGTALK_CLIENT_SECRET}");
+        });
+    }
+
+    #[test]
+    fn test_load_settings_without_dingtalk() {
+        run_with_temp_home(|home| {
+            let settings_dir = home.join(".haimen");
+            std::fs::create_dir_all(&settings_dir).unwrap();
+            std::fs::write(settings_dir.join("settings.toml"), r#"debug = true"#).unwrap();
+
+            let config = load_settings().unwrap().unwrap();
+            assert!(config.dingtalk.is_none());
+        });
+    }
+
+    #[test]
+    fn test_load_settings_channel_matches_config() {
+        run_with_temp_home(|home| {
+            let settings_dir = home.join(".haimen");
+            std::fs::create_dir_all(&settings_dir).unwrap();
+            std::fs::write(
+                settings_dir.join("settings.toml"),
+                r#"
+                    [dingtalk]
+                    client_id = "id"
+                    client_secret = "secret"
+
+                    [gateway]
+                    channel = "dingtalk"
+                "#,
+            )
+            .unwrap();
+
+            let config = load_settings().unwrap().unwrap();
+            assert_eq!(config.gateway.channel, "dingtalk");
+            assert!(config.dingtalk.is_some());
+        });
+    }
 }
