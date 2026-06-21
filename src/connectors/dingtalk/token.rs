@@ -114,9 +114,12 @@ mod tests {
 
     #[test]
     fn test_token_cache_expired() {
+        // 使用小偏移量避免 Windows 单调时钟溢出
         let cache = TokenCache {
             token: "token".into(),
-            expires_at: Instant::now() - Duration::from_secs(3600),
+            expires_at: Instant::now()
+                .checked_sub(Duration::from_secs(3600))
+                .unwrap_or(Instant::now() - Duration::from_nanos(1)),
         };
         assert!(!cache.is_valid());
     }
