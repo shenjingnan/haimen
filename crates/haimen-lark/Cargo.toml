@@ -3,6 +3,9 @@ name = "haimen-lark"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
+description = "AI 网关 Lark/飞书消息通道连接器"
+license = "MIT"
+repository = "https://github.com/shenjingnan/haimen"
 
 [dependencies]
 haimen-core = { path = "../haimen-core" }

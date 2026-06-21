@@ -3,6 +3,9 @@ name = "haimen-core"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
+description = "AI 网关共享抽象层 - Message 消息模型与 MessageChannel 消息通道 trait"
+license = "MIT"
+repository = "https://github.com/shenjingnan/haimen"
 
 [dependencies]
 async-trait = { workspace = true }
