@@ -43,7 +43,11 @@ pub async fn handle_ota(
             timestamp: now.as_millis() as i64,
             timezone_offset,
         },
-        firmware: None,
+        firmware: Some(FirmwareInfo {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            url: String::new(),
+            force: false,
+        }),
         audio_params: AudioParams::default(),
     };
 

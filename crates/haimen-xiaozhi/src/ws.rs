@@ -3,7 +3,7 @@
 //! 管理设备 WebSocket 连接的整个生命周期，包括 HELLO 握手、
 //! 音频数据缓冲和回声回放。
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
@@ -27,6 +27,8 @@ struct Session {
     state: SessionState,
     audio_buffer: Vec<AudioFrame>,
     cumulated_timestamp: u32,
+    /// 录音截止时刻（5 秒超时用），None 表示未在录音
+    recording_deadline: Option<Instant>,
 }
 
 // ─── 公开 API ──────────────────────────────────────────────
@@ -57,6 +59,7 @@ async fn handle_ws_connection(mut socket: WebSocket, device_id: String) {
         state: SessionState::AwaitingHello,
         audio_buffer: Vec::new(),
         cumulated_timestamp: 0,
+        recording_deadline: None,
     };
 
     // ── HELLO 握手（30 秒超时） ──
@@ -109,20 +112,53 @@ async fn handle_ws_connection(mut socket: WebSocket, device_id: String) {
     }
 
     // ── 消息循环 ──
-    while let Some(msg) = socket.recv().await {
+    loop {
+        // 录音状态下，用 select! 竞争消息和 5 秒超时
+        let msg = if session.state == SessionState::Recording {
+            // 使用 Recording 启动时保存的截止时刻，确保 5 秒固定时长
+            let deadline = session
+                .recording_deadline
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(5));
+            let tokio_deadline = tokio::time::Instant::from_std(deadline);
+
+            tokio::select! {
+                msg = socket.recv() => msg,
+                _ = tokio::time::sleep_until(tokio_deadline) => {
+                    tracing::info!(
+                        device_id = %session.device_id,
+                        "Recording 5s timeout, triggering echo playback",
+                    );
+                    session.recording_deadline = None;
+                    echo_playback(&mut socket, &mut session).await;
+                    continue;
+                }
+            }
+        } else {
+            match socket.recv().await {
+                Some(msg) => Some(msg),
+                None => {
+                    tracing::info!(
+                        device_id = %session.device_id,
+                        "WebSocket connection closed",
+                    );
+                    return;
+                }
+            }
+        };
+
         match msg {
-            Ok(Message::Text(text)) => {
+            Some(Ok(Message::Text(text))) => {
                 handle_text_message(&text, &mut socket, &mut session).await;
             }
-            Ok(Message::Binary(data)) => {
+            Some(Ok(Message::Binary(data))) => {
                 handle_binary_message(&data, &mut socket, &mut session).await;
             }
-            Ok(Message::Close(_)) => break,
-            Ok(Message::Ping(_)) => {
+            Some(Ok(Message::Close(_))) => break,
+            Some(Ok(Message::Ping(_))) => {
                 // axum 内部自动回复 Pong
             }
-            Ok(Message::Pong(_)) => {}
-            Err(err) => {
+            Some(Ok(Message::Pong(_))) => {}
+            Some(Err(err)) => {
                 tracing::warn!(
                     device_id = %session.device_id,
                     error = %err,
@@ -130,6 +166,7 @@ async fn handle_ws_connection(mut socket: WebSocket, device_id: String) {
                 );
                 break;
             }
+            None => break,
         }
     }
 
@@ -199,10 +236,11 @@ async fn handle_listen(
         ListenState::Start => {
             tracing::debug!(
                 device_id = %session.device_id,
-                "Listen::Start — recording started",
+                "Listen::Start — recording started (5s timeout)",
             );
             session.audio_buffer.clear();
             session.cumulated_timestamp = 0;
+            session.recording_deadline = Some(Instant::now() + Duration::from_secs(5));
             session.state = SessionState::Recording;
         }
         ListenState::Stop => {
@@ -210,6 +248,7 @@ async fn handle_listen(
                 device_id = %session.device_id,
                 "Listen::Stop — recording stopped, starting echo playback",
             );
+            session.recording_deadline = None;
             echo_playback(socket, session).await;
         }
     }
@@ -223,6 +262,7 @@ async fn handle_abort(socket: &mut WebSocket, session: &mut Session) {
         device_id = %session.device_id,
         "Abort — clearing buffer and stopping playback",
     );
+    session.recording_deadline = None;
     session.audio_buffer.clear();
     let _ = send_json(
         socket,
@@ -314,6 +354,8 @@ async fn buffer_audio(data: &[u8], socket: &mut WebSocket, session: &mut Session
 /// - `Listen::Start` 或 `Abort`：立即停止播放，发送 `TTS::Stop`
 /// - 连接关闭：立即退出
 async fn echo_playback(socket: &mut WebSocket, session: &mut Session) {
+    session.recording_deadline = None;
+
     if session.audio_buffer.is_empty() {
         tracing::debug!("Echo playback skipped: empty audio buffer");
         return;
