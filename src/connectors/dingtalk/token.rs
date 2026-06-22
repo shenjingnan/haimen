@@ -20,7 +20,10 @@ struct TokenCache {
 
 impl TokenCache {
     fn is_valid(&self) -> bool {
-        Instant::now() < self.expires_at - Duration::from_secs(300)
+        match self.expires_at.checked_sub(Duration::from_secs(300)) {
+            Some(threshold) => Instant::now() < threshold,
+            None => false,
+        }
     }
 }
 
@@ -114,12 +117,11 @@ mod tests {
 
     #[test]
     fn test_token_cache_expired() {
-        // 使用小偏移量避免 Windows 单调时钟溢出
         let cache = TokenCache {
             token: "token".into(),
             expires_at: Instant::now()
                 .checked_sub(Duration::from_secs(3600))
-                .unwrap_or(Instant::now() - Duration::from_nanos(1)),
+                .unwrap_or(Instant::now()),
         };
         assert!(!cache.is_valid());
     }

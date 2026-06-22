@@ -28,12 +28,12 @@ fn test_cli_feishu_listen() {
 }
 
 #[test]
-fn test_cli_gateway_status() {
-    let cli = Cli::try_parse_from(["test", "gateway", "status"]).unwrap();
-    assert!(matches!(
-        cli.command.unwrap(),
-        cli::Commands::Gateway(cli::GatewayCommands::Status)
-    ));
+fn test_cli_gateway_status_removed() {
+    let result = Cli::try_parse_from(["test", "gateway", "status"]);
+    assert!(
+        result.is_err(),
+        "gateway subcommand should have been removed"
+    );
 }
 
 #[tokio::test]
