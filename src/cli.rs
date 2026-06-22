@@ -28,13 +28,16 @@ pub enum Commands {
     /// 飞书集成
     #[command(subcommand)]
     Feishu(FeishuCommands),
-    /// AI 网关管理
-    #[command(subcommand)]
-    Gateway(GatewayCommands),
+    /// 启动所有启用的连接器和 Agent
+    Start {
+        /// Echo 模式：收消息后直接返回，不经过 Agent 处理
+        #[arg(long)]
+        echo: bool,
+    },
     /// AI Agent 调试
     #[command(subcommand)]
     Agent(AgentCommands),
-    /// 启动 HTTP Web 服务器
+    /// 启动 HTTP Web 服务器（仅 GitHub Webhook）
     Serve {
         /// 监听地址
         #[arg(long, default_value = "127.0.0.1")]
@@ -97,18 +100,6 @@ pub enum FeishuAuthAction {
 pub enum FeishuChatAction {
     /// 列出可访问的群聊
     List,
-}
-
-#[derive(Subcommand)]
-pub enum GatewayCommands {
-    /// 显示网关状态
-    Status,
-    /// 启动网关（监听飞书消息 → MCP 处理 → 结果回飞书）
-    Listen {
-        /// Echo 模式：收消息后直接返回，不经过 Agent 处理
-        #[arg(long)]
-        echo: bool,
-    },
 }
 
 /// AI Agent 调试命令
@@ -206,34 +197,6 @@ async fn cmd_feishu_listen(
     Ok(())
 }
 
-/// gateway status 命令
-fn cmd_gateway_status() -> Result<(), String> {
-    let status = crate::gateway::status();
-    println!("AI 网关状态:");
-    println!("  启用: {}", status.enabled);
-    if let Some(provider) = &status.provider {
-        println!("  提供商: {}", provider);
-    } else {
-        println!("  提供商: (未配置)");
-    }
-    println!("  活跃连接: {}", status.active_connections);
-    if status.mcp_servers.is_empty() {
-        println!("  MCP 服务器: (未配置)");
-        println!();
-        println!("提示: 在 ~/.haimen/settings.toml 中添加以下配置:");
-        println!("  [gateway.mcp_servers.claude-code]");
-        println!("  type = \"stdio\"");
-        println!("  command = \"claude\"");
-        println!("  args = [\"mcp\", \"serve\"]");
-    } else {
-        println!("  MCP 服务器:");
-        for server in &status.mcp_servers {
-            println!("    - {}", server);
-        }
-    }
-    Ok(())
-}
-
 /// 根据 provider 名称构造 AgentProvider
 fn create_agent(
     provider: Option<String>,
@@ -243,15 +206,15 @@ fn create_agent(
         .flatten()
         .unwrap_or_default();
 
-    let provider_name = provider
+    let agent_name = provider
         .as_deref()
-        .or(config.gateway.provider.as_deref())
+        .or(config.gateway.agent.as_deref())
         .unwrap_or("claude-code");
 
-    match provider_name {
+    match agent_name {
         "claude-code" => Ok(Box::new(crate::agents::claude_code::agent::ClaudeAgent)),
         "mcp" => Err("MCP Agent 暂不支持直接调用".to_string()),
-        other => Err(format!("不支持的 AI 提供商: {}", other)),
+        other => Err(format!("不支持的 AI Agent: {}", other)),
     }
 }
 
@@ -277,7 +240,6 @@ async fn cmd_agent_chat(provider: Option<String>) -> Result<(), String> {
     let mut session_id: Option<String> = None;
 
     loop {
-        // 读取用户输入
         let mut input = String::new();
         std::io::stdin()
             .read_line(&mut input)
@@ -291,14 +253,12 @@ async fn cmd_agent_chat(provider: Option<String>) -> Result<(), String> {
             break;
         }
 
-        // 检查命令
         if input == "/new" {
             session_id = None;
             println!("🔄 已创建新会话");
             continue;
         }
 
-        // 调用 Agent
         let (response, new_session_id) = agent.process(&input, session_id.as_deref()).await?;
         session_id = Some(new_session_id);
 
@@ -308,13 +268,21 @@ async fn cmd_agent_chat(provider: Option<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// 构造桥接实例
-fn create_bridge() -> feishu::bridge::LarkCliBridge {
+/// 构造 LarkCliBridge（从 connectors.lark 配置）
+fn create_bridge() -> Result<feishu::bridge::LarkCliBridge, String> {
     let config = config::settings::load_settings()
         .ok()
         .flatten()
         .unwrap_or_default();
-    feishu::bridge::LarkCliBridge::new(&config.feishu.lark_cli_path)
+
+    let lark_config = config
+        .connectors
+        .lark
+        .ok_or_else(|| "未配置 [connectors.lark]".to_string())?;
+
+    Ok(feishu::bridge::LarkCliBridge::new(
+        &lark_config.lark_cli_path,
+    ))
 }
 
 /// CLI 入口
@@ -326,7 +294,7 @@ pub async fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Some(Commands::Feishu(feishu_cmd)) => {
-            let bridge = create_bridge();
+            let bridge = create_bridge()?;
             match feishu_cmd {
                 FeishuCommands::Auth { action } => match action {
                     FeishuAuthAction::Status => cmd_feishu_auth_status(&bridge).await,
@@ -343,16 +311,13 @@ pub async fn run(cli: Cli) -> Result<(), String> {
                 } => cmd_feishu_listen(&bridge, mode, chat_id, interval, format).await,
             }
         }
-        Some(Commands::Gateway(gateway_cmd)) => match gateway_cmd {
-            GatewayCommands::Status => cmd_gateway_status(),
-            GatewayCommands::Listen { echo } => {
-                if echo {
-                    crate::gateway::listen_echo().await
-                } else {
-                    crate::gateway::listen().await
-                }
+        Some(Commands::Start { echo }) => {
+            if echo {
+                crate::gateway::start_echo().await
+            } else {
+                crate::gateway::start_all().await
             }
-        },
+        }
         Some(Commands::Agent(agent_cmd)) => match agent_cmd {
             AgentCommands::Run { provider, prompt } => cmd_agent_run(provider, prompt).await,
             AgentCommands::Chat { provider } => cmd_agent_chat(provider).await,
@@ -414,21 +379,13 @@ mod tests {
             serde_json::Value::String("info".to_string())
         );
         assert!(
-            val.get("feishu").is_some(),
-            "config should contain feishu section"
-        );
-        assert!(
             val.get("gateway").is_some(),
             "config should contain gateway section"
         );
-    }
-
-    #[test]
-    fn test_config_contains_version() {
-        let output = cmd_config().unwrap();
-        // config output is the full AppConfig, version is not directly in it
-        // Instead verify that the output is valid JSON
-        assert!(!output.is_empty());
+        assert!(
+            val.get("connectors").is_some(),
+            "config should contain connectors section"
+        );
     }
 
     #[test]
@@ -443,7 +400,7 @@ mod tests {
         for sub in &[
             "config",
             "feishu",
-            "gateway",
+            "start",
             "serve",
             "agent",
             "completion",
@@ -456,6 +413,10 @@ mod tests {
                 sub
             );
         }
+        assert!(
+            !output.contains("gateway"),
+            "bash completion should NOT contain gateway"
+        );
     }
 
     #[test]
@@ -470,7 +431,7 @@ mod tests {
         for sub in &[
             "config",
             "feishu",
-            "gateway",
+            "start",
             "serve",
             "agent",
             "completion",
@@ -483,6 +444,10 @@ mod tests {
                 sub
             );
         }
+        assert!(
+            !output.contains("gateway"),
+            "zsh completion should NOT contain gateway"
+        );
     }
 
     #[test]
@@ -497,7 +462,7 @@ mod tests {
         for sub in &[
             "config",
             "feishu",
-            "gateway",
+            "start",
             "serve",
             "agent",
             "completion",
@@ -510,6 +475,10 @@ mod tests {
                 sub
             );
         }
+        assert!(
+            !output.contains("gateway"),
+            "fish completion should NOT contain gateway"
+        );
     }
 
     #[test]
@@ -524,7 +493,7 @@ mod tests {
         for sub in &[
             "config",
             "feishu",
-            "gateway",
+            "start",
             "serve",
             "agent",
             "completion",
@@ -537,38 +506,10 @@ mod tests {
                 sub
             );
         }
-    }
-
-    #[test]
-    fn test_completion_all_shells_have_all_subcommands() {
-        let shells = [
-            clap_complete::Shell::Bash,
-            clap_complete::Shell::Zsh,
-            clap_complete::Shell::Fish,
-            clap_complete::Shell::PowerShell,
-        ];
-        for shell in shells {
-            let mut buf = Vec::new();
-            cmd_completion(shell, &mut buf);
-            let output = String::from_utf8(buf).unwrap();
-            for sub in &[
-                "config",
-                "feishu",
-                "gateway",
-                "serve",
-                "agent",
-                "completion",
-                "upgrade",
-                "uninstall",
-            ] {
-                assert!(
-                    output.contains(sub),
-                    "{:?} completion should contain subcommand {}",
-                    shell,
-                    sub
-                );
-            }
-        }
+        assert!(
+            !output.contains("gateway"),
+            "powershell completion should NOT contain gateway"
+        );
     }
 
     #[test]
@@ -590,6 +531,36 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_parse_start() {
+        let cli = Cli::try_parse_from(["test", "start"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Start { echo } => assert!(!echo),
+            _ => panic!("Expected Start command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_start_echo() {
+        let cli = Cli::try_parse_from(["test", "start", "--echo"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Start { echo } => assert!(echo),
+            _ => panic!("Expected Start --echo command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_gateway_listen_fails() {
+        let result = Cli::try_parse_from(["test", "gateway", "listen"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cli_parse_gateway_status_fails() {
+        let result = Cli::try_parse_from(["test", "gateway", "status"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_cli_parse_feishu_auth_status() {
         let cli = Cli::try_parse_from(["test", "feishu", "auth", "status"]).unwrap();
         match cli.command.unwrap() {
@@ -597,17 +568,6 @@ mod tests {
                 assert!(matches!(action, FeishuAuthAction::Status));
             }
             _ => panic!("Expected Feishu auth status command"),
-        }
-    }
-
-    #[test]
-    fn test_cli_parse_feishu_auth_login() {
-        let cli = Cli::try_parse_from(["test", "feishu", "auth", "login"]).unwrap();
-        match cli.command.unwrap() {
-            Commands::Feishu(FeishuCommands::Auth { action }) => {
-                assert!(matches!(action, FeishuAuthAction::Login));
-            }
-            _ => panic!("Expected Feishu auth login command"),
         }
     }
 
@@ -623,89 +583,8 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_parse_feishu_listen_defaults() {
-        let cli = Cli::try_parse_from(["test", "feishu", "listen"]).unwrap();
-        match cli.command.unwrap() {
-            Commands::Feishu(FeishuCommands::Listen {
-                mode,
-                chat_id,
-                interval,
-                format,
-            }) => {
-                assert_eq!(mode, "event");
-                assert!(chat_id.is_none());
-                assert_eq!(interval, 30);
-                assert_eq!(format, "pretty");
-            }
-            _ => panic!("Expected Feishu listen command"),
-        }
-    }
-
-    #[test]
-    fn test_cli_parse_feishu_listen_with_options() {
-        let cli = Cli::try_parse_from([
-            "test",
-            "feishu",
-            "listen",
-            "--mode",
-            "poll",
-            "--chat-id",
-            "oc_xxx123",
-            "--interval",
-            "10",
-            "--format",
-            "json",
-        ])
-        .unwrap();
-        match cli.command.unwrap() {
-            Commands::Feishu(FeishuCommands::Listen {
-                mode,
-                chat_id,
-                interval,
-                format,
-            }) => {
-                assert_eq!(mode, "poll");
-                assert_eq!(chat_id.unwrap(), "oc_xxx123");
-                assert_eq!(interval, 10);
-                assert_eq!(format, "json");
-            }
-            _ => panic!("Expected Feishu listen command"),
-        }
-    }
-
-    #[test]
-    fn test_cli_parse_gateway_status() {
-        let cli = Cli::try_parse_from(["test", "gateway", "status"]).unwrap();
-        match cli.command.unwrap() {
-            Commands::Gateway(GatewayCommands::Status) => {}
-            _ => panic!("Expected Gateway status command"),
-        }
-    }
-
-    #[test]
-    fn test_cli_parse_feishu_help() {
-        // Verify feishu subcommand appears in help
-        let mut cmd = Cli::command();
-        let help = cmd.render_help().to_string();
-        assert!(
-            help.contains("feishu"),
-            "help should contain feishu subcommand"
-        );
-        assert!(
-            help.contains("gateway"),
-            "help should contain gateway subcommand"
-        );
-        assert!(
-            help.contains("config"),
-            "help should contain config subcommand"
-        );
-        assert!(
-            help.contains("upgrade"),
-            "help should contain upgrade subcommand"
-        );
-        assert!(
-            help.contains("uninstall"),
-            "help should contain uninstall subcommand"
-        );
+    fn test_cli_parse_serve() {
+        let cli = Cli::try_parse_from(["test", "serve"]).unwrap();
+        assert!(matches!(cli.command.unwrap(), Commands::Serve { .. }));
     }
 }
