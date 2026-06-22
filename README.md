@@ -1,4 +1,13 @@
-# haimen
+<p align="center">
+  <img src="docs/public/logo.svg" alt="haimen logo" width="300" />
+</p>
+
+<p align="center">
+  <a href="https://github.com/shenjingnan/haimen/actions/workflows/ci.yml"><img src="https://github.com/shenjingnan/haimen/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://codecov.io/gh/shenjingnan/haimen"><img src="https://img.shields.io/codecov/c/github/shenjingnan/haimen" alt="Codecov"></a>
+  <a href="https://crates.io/crates/haimen"><img src="https://img.shields.io/crates/v/haimen.svg?color=brightgreen" alt="crates.io"></a>
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-brightgreen.svg" alt="License: MIT"></a>
+</p>
 
 **haimen** 是一个 AI 网关基建 CLI 工具，集成飞书（Feishu/Lark），支持在终端接收和处理飞书消息。
 
@@ -108,12 +117,12 @@ COMMANDS:
 
 ### listen 命令
 
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `--mode` | 监听模式: `event` 或 `poll` | `event` |
-| `--chat-id` | 聊天 ID（poll 模式必填） | — |
-| `--interval` | 轮询间隔（秒） | 30 |
-| `--format` | 输出格式: `pretty` 或 `json` | `pretty` |
+| 参数         | 说明                         | 默认值   |
+| ------------ | ---------------------------- | -------- |
+| `--mode`     | 监听模式: `event` 或 `poll`  | `event`  |
+| `--chat-id`  | 聊天 ID（poll 模式必填）     | —        |
+| `--interval` | 轮询间隔（秒）               | 30       |
+| `--format`   | 输出格式: `pretty` 或 `json` | `pretty` |
 
 ## 项目结构
 
@@ -157,16 +166,16 @@ COMMANDS:
 
 ## 依赖说明
 
-| 分类 | Crate | 用途 |
-|------|-------|------|
-| 核心 | clap | CLI 参数解析 |
-| 核心 | tokio | 异步运行时 |
-| 核心 | serde / serde_json / toml | 序列化 |
-| 核心 | chrono | 日期时间处理 |
-| 核心 | tracing / tracing-subscriber | 日志 |
-| 核心 | thiserror / anyhow | 错误处理 |
-| 核心 | futures-util | 异步流处理 |
-| 外部 | lark-cli | 飞书 API 桥接（需预先安装） |
+| 分类 | Crate                        | 用途                        |
+| ---- | ---------------------------- | --------------------------- |
+| 核心 | clap                         | CLI 参数解析                |
+| 核心 | tokio                        | 异步运行时                  |
+| 核心 | serde / serde_json / toml    | 序列化                      |
+| 核心 | chrono                       | 日期时间处理                |
+| 核心 | tracing / tracing-subscriber | 日志                        |
+| 核心 | thiserror / anyhow           | 错误处理                    |
+| 核心 | futures-util                 | 异步流处理                  |
+| 外部 | lark-cli                     | 飞书 API 桥接（需预先安装） |
 
 ## 配置
 
