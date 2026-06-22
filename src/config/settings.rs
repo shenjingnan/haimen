@@ -52,67 +52,74 @@ pub fn resolve_env_ref(value: &str) -> Result<String, String> {
     }
 }
 
-/// 飞书配置
+/// Lark 连接器配置
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct FeishuConfig {
+pub struct LarkConfig {
+    /// 是否启用
+    #[serde(default)]
+    pub enabled: bool,
     /// lark-cli 可执行文件路径（默认从 PATH 查找）
     #[serde(default = "default_lark_cli_path")]
     pub lark_cli_path: String,
-    /// 监听配置
-    #[serde(default)]
-    pub listen: FeishuListenConfig,
-}
-
-impl Default for FeishuConfig {
-    fn default() -> Self {
-        Self {
-            lark_cli_path: default_lark_cli_path(),
-            listen: FeishuListenConfig::default(),
-        }
-    }
 }
 
 fn default_lark_cli_path() -> String {
     "lark-cli".to_string()
 }
 
-/// 飞书监听配置
+/// DingTalk 连接器配置（TOML 配置层）
+///
+/// 转换到 dingtalk::config::DingTalkConfig 传递给 Channel。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct FeishuListenConfig {
-    /// 监听模式: "event"（事件订阅）或 "poll"（轮询）
-    #[serde(default = "default_listen_mode")]
-    pub mode: String,
-    /// 轮询间隔（秒）
-    #[serde(default = "default_interval_secs")]
-    pub interval_secs: u64,
+pub struct DingTalkConnectorConfig {
+    /// 是否启用
+    #[serde(default)]
+    pub enabled: bool,
+    /// 钉钉应用 Client ID
+    pub client_id: String,
+    /// 钉钉应用 Client Secret
+    pub client_secret: String,
+    /// 允许的用户 ID 白名单，"," 分隔。"*" 表示全部允许。
+    #[serde(default = "default_dingtalk_allow_from")]
+    pub allow_from: String,
+    /// 群聊中是否共享 Agent 会话
+    #[serde(default)]
+    pub share_session_in_channel: bool,
+    /// 机器人编码（可选，默认等于 client_id）
+    #[serde(default)]
+    pub robot_code: String,
 }
 
-impl Default for FeishuListenConfig {
-    fn default() -> Self {
+fn default_dingtalk_allow_from() -> String {
+    "*".to_string()
+}
+
+impl From<DingTalkConnectorConfig> for crate::connectors::dingtalk::config::DingTalkConfig {
+    fn from(cfg: DingTalkConnectorConfig) -> Self {
         Self {
-            mode: default_listen_mode(),
-            interval_secs: default_interval_secs(),
+            client_id: cfg.client_id,
+            client_secret: cfg.client_secret,
+            allow_from: cfg.allow_from,
+            share_session_in_channel: cfg.share_session_in_channel,
+            robot_code: cfg.robot_code,
         }
     }
 }
 
-fn default_listen_mode() -> String {
-    "event".to_string()
-}
-
-fn default_interval_secs() -> u64 {
-    30
+/// 所有连接器的统一容器
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ConnectorsSection {
+    pub lark: Option<LarkConfig>,
+    pub dingtalk: Option<DingTalkConnectorConfig>,
 }
 
 /// AI 网关配置
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GatewayConfig {
-    /// 是否启用 AI 处理
+    /// AI Agent 类型（如 "claude-code"）
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-    /// AI 提供商
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
+    pub agent: Option<String>,
     /// API 密钥
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
@@ -131,13 +138,6 @@ pub struct GatewayConfig {
     /// MCP 服务器配置（haimen 作为客户端连接）
     #[serde(default)]
     pub mcp_servers: HashMap<String, McpServerConfig>,
-    /// 默认 IM 通道: "lark" | "telegram" | "discord"
-    #[serde(default = "default_channel")]
-    pub channel: String,
-}
-
-fn default_channel() -> String {
-    "lark".to_string()
 }
 
 fn default_session_idle_timeout() -> u64 {
@@ -151,15 +151,13 @@ fn default_session_max_turns() -> u32 {
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
-            enabled: None,
-            provider: None,
+            agent: None,
             api_key: None,
             model: None,
             work_dir: None,
             session_idle_timeout_mins: default_session_idle_timeout(),
             session_max_turns: default_session_max_turns(),
             mcp_servers: HashMap::new(),
-            channel: default_channel(),
         }
     }
 }
@@ -204,21 +202,15 @@ pub struct AppConfig {
     /// 日志级别
     #[serde(default = "default_log_level")]
     pub log_level: String,
-    /// 自定义配置项
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub custom: Option<std::collections::HashMap<String, String>>,
-    /// 飞书配置
-    #[serde(default)]
-    pub feishu: FeishuConfig,
-    /// AI 网关配置
+    /// 网关配置
     #[serde(default)]
     pub gateway: GatewayConfig,
-    /// GitHub Webhook 配置
+    /// 连接器配置（统一容器）
+    #[serde(default)]
+    pub connectors: ConnectorsSection,
+    /// GitHub Webhook 配置（后续方案 A 移入 connectors）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github: Option<crate::connectors::github::config::GitHubConfig>,
-    /// 钉钉配置（可选，不配置时禁用钉钉通道）
-    #[serde(default)]
-    pub dingtalk: Option<crate::connectors::dingtalk::config::DingTalkConfig>,
 }
 
 fn default_log_level() -> String {
@@ -230,11 +222,9 @@ impl Default for AppConfig {
         Self {
             debug: false,
             log_level: default_log_level(),
-            custom: None,
-            feishu: FeishuConfig::default(),
             gateway: GatewayConfig::default(),
+            connectors: ConnectorsSection::default(),
             github: None,
-            dingtalk: None,
         }
     }
 }
@@ -350,24 +340,81 @@ mod tests {
             let result = load_settings().unwrap().unwrap();
             assert!(!result.debug);
             assert_eq!(result.log_level, "info");
-            assert!(result.custom.is_none());
-            assert_eq!(result.feishu.lark_cli_path, "lark-cli");
-            assert_eq!(result.feishu.listen.mode, "event");
-            assert_eq!(result.feishu.listen.interval_secs, 30);
+            assert!(result.connectors.lark.is_none());
+            assert!(result.connectors.dingtalk.is_none());
         });
     }
 
     #[test]
-    fn test_load_settings_full() {
+    fn test_load_settings_with_connectors() {
         run_with_temp_home(|home| {
             write_toml_settings(
                 home,
-                "debug = true\nlog_level = \"debug\"\n\n[custom]\nkey1 = \"value1\"\n",
+                r#"
+debug = true
+log_level = "debug"
+
+[connectors.lark]
+enabled = true
+lark_cli_path = "my-lark-cli"
+
+[connectors.dingtalk]
+enabled = false
+client_id = "test-id"
+client_secret = "${env.DINGTALK_CLIENT_SECRET}"
+"#,
             );
             let result = load_settings().unwrap().unwrap();
             assert!(result.debug);
             assert_eq!(result.log_level, "debug");
-            assert_eq!(result.custom.unwrap().get("key1").unwrap(), "value1");
+
+            let lark = result.connectors.lark.unwrap();
+            assert!(lark.enabled);
+            assert_eq!(lark.lark_cli_path, "my-lark-cli");
+
+            let dingtalk = result.connectors.dingtalk.unwrap();
+            assert!(!dingtalk.enabled);
+            assert_eq!(dingtalk.client_id, "test-id");
+            assert_eq!(dingtalk.client_secret, "${env.DINGTALK_CLIENT_SECRET}");
+        });
+    }
+
+    #[test]
+    fn test_connectors_section_all_disabled() {
+        run_with_temp_home(|home| {
+            write_toml_settings(
+                home,
+                r#"
+[connectors.lark]
+enabled = false
+
+[connectors.dingtalk]
+enabled = false
+client_id = "id"
+client_secret = "secret"
+"#,
+            );
+            let result = load_settings().unwrap().unwrap();
+            let lark = result.connectors.lark.unwrap();
+            assert!(!lark.enabled);
+            let dingtalk = result.connectors.dingtalk.unwrap();
+            assert!(!dingtalk.enabled);
+        });
+    }
+
+    #[test]
+    fn test_lark_config_default_cli_path() {
+        run_with_temp_home(|home| {
+            write_toml_settings(
+                home,
+                r#"
+[connectors.lark]
+enabled = true
+"#,
+            );
+            let result = load_settings().unwrap().unwrap();
+            let lark = result.connectors.lark.unwrap();
+            assert_eq!(lark.lark_cli_path, "lark-cli");
         });
     }
 
@@ -376,9 +423,9 @@ mod tests {
         let config = AppConfig::default();
         assert!(!config.debug);
         assert_eq!(config.log_level, "info");
-        assert!(config.custom.is_none());
-        assert_eq!(config.feishu.lark_cli_path, "lark-cli");
-        assert_eq!(config.feishu.listen.mode, "event");
+        assert!(config.connectors.lark.is_none());
+        assert!(config.connectors.dingtalk.is_none());
+        assert!(config.gateway.agent.is_none());
     }
 
     #[test]
@@ -386,11 +433,18 @@ mod tests {
         let config = AppConfig {
             debug: true,
             log_level: "warn".to_string(),
-            custom: Some(std::collections::HashMap::new()),
-            feishu: FeishuConfig::default(),
-            gateway: GatewayConfig::default(),
+            gateway: GatewayConfig {
+                agent: Some("claude-code".to_string()),
+                ..Default::default()
+            },
+            connectors: ConnectorsSection {
+                lark: Some(LarkConfig {
+                    enabled: true,
+                    lark_cli_path: "my-lark".to_string(),
+                }),
+                dingtalk: None,
+            },
             github: None,
-            dingtalk: None,
         };
         let toml_str = toml::to_string(&config).unwrap();
         let deserialized: AppConfig = toml::from_str(&toml_str).unwrap();
@@ -398,63 +452,18 @@ mod tests {
     }
 
     #[test]
-    fn test_load_settings_with_dingtalk() {
-        run_with_temp_home(|home| {
-            let settings_dir = home.join(".haimen");
-            std::fs::create_dir_all(&settings_dir).unwrap();
-            std::fs::write(
-                settings_dir.join("settings.toml"),
-                r#"
-                    [dingtalk]
-                    client_id = "dingxxxxxxxxxxxxxxx"
-                    client_secret = "${env.DINGTALK_CLIENT_SECRET}"
-
-                    [gateway]
-                    channel = "dingtalk"
-                "#,
-            )
-            .unwrap();
-
-            let config = load_settings().unwrap().unwrap();
-            let dt = config.dingtalk.expect("dingtalk config should exist");
-            assert_eq!(dt.client_id, "dingxxxxxxxxxxxxxxx");
-            assert_eq!(dt.client_secret, "${env.DINGTALK_CLIENT_SECRET}");
-        });
+    fn test_gateway_config_default() {
+        let config = GatewayConfig::default();
+        assert!(config.agent.is_none());
+        assert_eq!(config.session_idle_timeout_mins, 30);
+        assert_eq!(config.session_max_turns, 20);
     }
 
     #[test]
-    fn test_load_settings_without_dingtalk() {
-        run_with_temp_home(|home| {
-            let settings_dir = home.join(".haimen");
-            std::fs::create_dir_all(&settings_dir).unwrap();
-            std::fs::write(settings_dir.join("settings.toml"), r#"debug = true"#).unwrap();
-
-            let config = load_settings().unwrap().unwrap();
-            assert!(config.dingtalk.is_none());
-        });
-    }
-
-    #[test]
-    fn test_load_settings_channel_matches_config() {
-        run_with_temp_home(|home| {
-            let settings_dir = home.join(".haimen");
-            std::fs::create_dir_all(&settings_dir).unwrap();
-            std::fs::write(
-                settings_dir.join("settings.toml"),
-                r#"
-                    [dingtalk]
-                    client_id = "id"
-                    client_secret = "secret"
-
-                    [gateway]
-                    channel = "dingtalk"
-                "#,
-            )
-            .unwrap();
-
-            let config = load_settings().unwrap().unwrap();
-            assert_eq!(config.gateway.channel, "dingtalk");
-            assert!(config.dingtalk.is_some());
-        });
+    fn test_gateway_config_serde_roundtrip() {
+        let config = GatewayConfig::default();
+        let toml_str = toml::to_string(&config).unwrap();
+        let deserialized: GatewayConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(config, deserialized);
     }
 }
