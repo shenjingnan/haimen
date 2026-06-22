@@ -1,3 +1,5 @@
+# 海门 - Haimen
+
 <p align="center">
   <img src="docs/public/logo.svg" alt="haimen logo" width="300" />
 </p>
