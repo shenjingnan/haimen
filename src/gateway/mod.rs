@@ -5,12 +5,14 @@ pub mod provider;
 pub mod session;
 pub mod webhook;
 
+use futures_util::StreamExt;
+use tokio_util::sync::CancellationToken;
+
 use crate::agents::claude_code::agent::ClaudeAgent;
 use crate::config::settings::load_settings;
 use crate::connectors::dingtalk::channel::DingTalkChannel;
 use crate::gateway::channel::MessageChannel;
 use crate::gateway::provider::AgentProvider;
-use futures_util::StreamExt;
 use haimen_lark::LarkChannel;
 
 /// 构建后的连接器列表类型
@@ -65,8 +67,8 @@ pub fn build_agent(
 /// 1. 构建连接器
 /// 2. 构建 Agent
 /// 3. 各连接器健康检查（并行，失败的跳过）
-/// 4. 各连接器 listen（并行，失败的跳过）
-/// 5. 运行多连接器事件循环
+/// 4. 创建 CancellationToken + 启动信号监听
+/// 5. 运行多连接器事件循环（pump task + mpsc 架构）
 pub async fn start_all() -> Result<(), String> {
     let config = load_settings().ok().flatten().unwrap_or_default();
 
@@ -105,12 +107,10 @@ pub async fn start_all() -> Result<(), String> {
         return Ok(());
     }
 
-    // 对健康的连接器执行 listen，收集成功的 stream
+    // 对健康的连接器构建通道实例（直接传入 run_unified_gateway，不再在此处 listen）
     let config = load_settings().ok().flatten().unwrap_or_default();
 
     let mut channels: ConnectorVec = Vec::new();
-    let mut streams = Vec::new();
-
     for name in &healthy {
         let ch = match name.as_str() {
             "lark" => {
@@ -131,23 +131,7 @@ pub async fn start_all() -> Result<(), String> {
             }
             other => return Err(format!("不支持的连接器: {}", other)),
         };
-
-        match ch.listen().await {
-            Ok(stream) => {
-                let cn = name.clone();
-                let tagged = stream.map(move |msg| (cn.clone(), msg));
-                streams.push(tagged);
-                channels.push((name.clone(), ch));
-            }
-            Err(e) => {
-                tracing::warn!(connector = %name, error = %e, "listen 失败，跳过");
-            }
-        }
-    }
-
-    if streams.is_empty() {
-        tracing::warn!("没有连接器成功启动消息流");
-        return Ok(());
+        channels.push((name.clone(), ch));
     }
 
     agent.check_available().await?;
@@ -160,7 +144,44 @@ pub async fn start_all() -> Result<(), String> {
             .collect::<Vec<&str>>()
     );
 
-    chat_loop::run_unified_gateway(channels, &*agent, &config.gateway).await
+    // 创建 CancellationToken 并启动信号监听
+    let cancel = CancellationToken::new();
+    let signal_cancel = cancel.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        tracing::info!("收到关闭信号，正在停止网关...");
+        signal_cancel.cancel();
+    });
+
+    let result = chat_loop::run_unified_gateway(channels, &*agent, &config.gateway, cancel).await;
+
+    tracing::info!("网关已停止");
+    result
+}
+
+/// 等待 SIGINT（Ctrl+C）或 SIGTERM 用于优雅关闭
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("无法安装 Ctrl+C 处理器");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("无法安装 SIGTERM 处理器")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("收到 Ctrl+C，正在关闭..."),
+        _ = terminate => tracing::info!("收到 SIGTERM，正在关闭..."),
+    }
 }
 
 /// 启动网关监听（单连接器模式，取第一个启用的连接器）

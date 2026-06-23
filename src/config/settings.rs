@@ -138,6 +138,10 @@ pub struct GatewayConfig {
     /// MCP 服务器配置（haimen 作为客户端连接）
     #[serde(default)]
     pub mcp_servers: HashMap<String, McpServerConfig>,
+    /// Agent 处理超时秒数，超过此时间未返回则放弃并继续处理下一条消息
+    /// 默认 300 秒（5 分钟）
+    #[serde(default = "default_agent_timeout")]
+    pub agent_timeout_secs: u64,
 }
 
 fn default_session_idle_timeout() -> u64 {
@@ -146,6 +150,10 @@ fn default_session_idle_timeout() -> u64 {
 
 fn default_session_max_turns() -> u32 {
     20
+}
+
+fn default_agent_timeout() -> u64 {
+    300
 }
 
 impl Default for GatewayConfig {
@@ -158,6 +166,7 @@ impl Default for GatewayConfig {
             session_idle_timeout_mins: default_session_idle_timeout(),
             session_max_turns: default_session_max_turns(),
             mcp_servers: HashMap::new(),
+            agent_timeout_secs: default_agent_timeout(),
         }
     }
 }
@@ -465,5 +474,22 @@ enabled = true
         let toml_str = toml::to_string(&config).unwrap();
         let deserialized: GatewayConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(config, deserialized);
+    }
+
+    #[test]
+    fn test_agent_timeout_default() {
+        let config = GatewayConfig::default();
+        assert_eq!(config.agent_timeout_secs, 300);
+    }
+
+    #[test]
+    fn test_agent_timeout_serde_roundtrip() {
+        let config = GatewayConfig {
+            agent_timeout_secs: 600,
+            ..Default::default()
+        };
+        let toml_str = toml::to_string(&config).unwrap();
+        let deserialized: GatewayConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(deserialized.agent_timeout_secs, 600);
     }
 }
