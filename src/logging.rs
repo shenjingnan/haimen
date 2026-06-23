@@ -35,6 +35,22 @@ pub fn init_logging() {
         .with(file_layer)
         .with(stderr_layer)
         .try_init();
+
+    // 全局 panic hook：捕获所有 tokio::spawn 任务的 panic 并记录到日志
+    std::panic::set_hook(Box::new(|panic_info| {
+        let msg = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            format!("{:?}", panic_info.payload())
+        };
+        let location = panic_info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<未知位置>".to_string());
+        tracing::error!(panic = %msg, location = %location, "线程崩溃");
+    }));
 }
 
 /// 创建文件日志 writer（可测试）

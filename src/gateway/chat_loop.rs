@@ -1,8 +1,13 @@
+use std::time::Duration;
+
 use futures_util::StreamExt;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing;
 
 use crate::config::settings::GatewayConfig;
 use crate::gateway::channel::MessageChannel;
+use crate::gateway::model::Message;
 use crate::gateway::provider::AgentProvider;
 use crate::gateway::session::{SessionKey, SessionManager};
 
@@ -157,10 +162,18 @@ where
 /// 合并多个连接器的消息流，统一调度 Agent 处理。
 /// 每条消息按 connector_name 路由回正确的连接器回复。
 /// Session key 加 connector_name 前缀，防止跨连接器 conversation_id 碰撞。
+///
+/// 通过 pump task + mpsc 架构实现 channel 崩溃隔离：
+/// - 每个 channel 的 listen stream 运行在独立的 tokio::spawn 任务中
+/// - 通过 mpsc::unbounded_channel 桥接到主事件循环
+/// - 单个 pump task 的 panic 不会影响其他连接器
+/// - CancellationToken 支持优雅关闭
+/// - agent.process() 带超时保护，防止单次调用阻塞整个网关
 pub async fn run_unified_gateway(
     channels: Vec<(String, Box<dyn MessageChannel>)>,
     agent: &dyn AgentProvider,
     config: &GatewayConfig,
+    cancel: CancellationToken,
 ) -> Result<(), String> {
     if channels.is_empty() {
         tracing::warn!("没有可用的连接器");
@@ -178,17 +191,9 @@ pub async fn run_unified_gateway(
     });
     let mut session_mgr = SessionManager::new(idle_timeout, max_turns);
 
-    // 2. 启动所有连接器的消息流，标记 connector_name
-    let mut tagged_streams = Vec::new();
-    for (name, channel) in &channels {
-        let stream = channel
-            .listen()
-            .await
-            .map_err(|e| format!("连接器 '{}' listen 失败: {}", name, e))?;
-        let cn = name.clone();
-        let tagged = stream.map(move |msg| (cn.clone(), msg));
-        tagged_streams.push(tagged);
-    }
+    // 2. 创建全局 mpsc 通道（替代 select_all）
+    let (global_tx, mut global_rx) = mpsc::unbounded_channel::<(String, Message)>();
+    let timeout_duration = Duration::from_secs(config.agent_timeout_secs);
 
     let channel_names: Vec<&str> = channels.iter().map(|(n, _)| n.as_str()).collect();
     tracing::info!(
@@ -196,15 +201,80 @@ pub async fn run_unified_gateway(
         agent = %agent.name(),
         idle_timeout_mins = idle_timeout,
         max_turns = max_turns,
+        agent_timeout_secs = config.agent_timeout_secs,
         "多连接器网关已启动"
     );
 
-    // 3. 合并流
-    let mut merged = futures_util::stream::select_all(tagged_streams);
+    // 3. 为每个连接器创建 pump task（带 listen 中断保护）
+    let mut pump_count = 0usize;
 
-    // 4. 事件循环
-    while let Some((connector_name, message)) = merged.next().await {
-        // 用 connector_name:conversation_id 作为 session key，防止跨连接器碰撞
+    for (name, channel) in &channels {
+        let cn = name.clone();
+
+        // 用 select! 使 listen() 过程也响应关闭信号
+        let stream = tokio::select! {
+            result = channel.listen() => {
+                match result {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(connector = %cn, error = %e, "连接器 listen 失败，跳过");
+                        continue;
+                    }
+                }
+            }
+            _ = cancel.cancelled() => {
+                tracing::info!(connector = %cn, "网关关闭，跳过连接器");
+                continue;
+            }
+        };
+
+        pump_count += 1;
+        let tx = global_tx.clone();
+        let task_cancel = cancel.clone();
+
+        tokio::spawn(async move {
+            tokio::pin!(stream);
+            // cancelled future pin 一次，避免循环中反复创建
+            let cancel_wait = task_cancel.cancelled();
+            tokio::pin!(cancel_wait);
+
+            loop {
+                tokio::select! {
+                    _ = cancel_wait.as_mut() => {
+                        tracing::info!(connector = %cn, "连接器已停止");
+                        break;
+                    }
+                    msg = stream.next() => {
+                        match msg {
+                            Some(msg) => {
+                                if tx.send((cn.clone(), msg)).is_err() {
+                                    // main loop 已退出
+                                    break;
+                                }
+                            }
+                            None => {
+                                tracing::warn!(connector = %cn, "连接器消息流已结束");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // 4. 释放 sender 所有权，让 recv() 在所有 pump task 退出后正确返回 None
+    drop(global_tx);
+
+    if pump_count == 0 {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        return Err("没有连接器成功启动消息流".to_string());
+    }
+
+    // 5. 主事件循环（agent 超时 + 关闭感知）
+    while let Some((connector_name, message)) = global_rx.recv().await {
         let chat_id: SessionKey = format!("{}:{}", connector_name, message.conversation_id);
 
         // 找到对应的连接器用于回复
@@ -243,17 +313,17 @@ pub async fn run_unified_gateway(
         // 会话管理
         let (need_new_session, existing_session_id) = session_mgr.get_or_create(&chat_id);
 
-        // 调用 Agent 处理
-        let result = if need_new_session {
-            agent.process(&message.content, None).await
+        // 调用 Agent 处理（带超时）
+        let process_fut = if need_new_session {
+            agent.process(&message.content, None)
         } else {
-            agent
-                .process(&message.content, existing_session_id.as_deref())
-                .await
+            agent.process(&message.content, existing_session_id.as_deref())
         };
 
+        let result = tokio::time::timeout(timeout_duration, process_fut).await;
+
         match result {
-            Ok((response, new_session_id)) => {
+            Ok(Ok((response, new_session_id))) => {
                 if need_new_session {
                     session_mgr.create_session(&chat_id, &new_session_id, &work_dir);
                 }
@@ -274,13 +344,17 @@ pub async fn run_unified_gateway(
                     )
                     .await;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
+                // Resume 失败时自动降级为新会话重试（带超时保护）
                 if !need_new_session {
                     tracing::warn!(chat_id = %chat_id, error = %e, "Resume 失败，降级为新会话重试");
                     session_mgr.remove_session(&chat_id);
 
-                    match agent.process(&message.content, None).await {
-                        Ok((response, new_session_id)) => {
+                    let retry_fut = agent.process(&message.content, None);
+                    let retry_result = tokio::time::timeout(timeout_duration, retry_fut).await;
+
+                    match retry_result {
+                        Ok(Ok((response, new_session_id))) => {
                             session_mgr.create_session(&chat_id, &new_session_id, &work_dir);
                             tracing::info!(chat_id = %chat_id, "降级重试成功");
                             let _ = channel
@@ -290,10 +364,22 @@ pub async fn run_unified_gateway(
                                 )
                                 .await;
                         }
-                        Err(e2) => {
+                        Ok(Err(e2)) => {
                             tracing::error!(chat_id = %chat_id, error = %e2, "降级重试也失败");
                             let _ = channel
                                 .send(&message.conversation_id, &format!("❌ 处理失败: {}", e2))
+                                .await;
+                        }
+                        Err(_) => {
+                            tracing::error!(chat_id = %chat_id, timeout_secs = config.agent_timeout_secs, "降级重试超时");
+                            let _ = channel
+                                .send(
+                                    &message.conversation_id,
+                                    &format!(
+                                        "❌ 处理超时（超过 {} 秒），请重试",
+                                        config.agent_timeout_secs
+                                    ),
+                                )
                                 .await;
                         }
                     }
@@ -304,10 +390,33 @@ pub async fn run_unified_gateway(
                         .await;
                 }
             }
+            Err(_elapsed) => {
+                // 超时处理：通知用户并继续处理下一条消息
+                tracing::error!(
+                    connector = %connector_name,
+                    timeout_secs = config.agent_timeout_secs,
+                    "Agent 处理超时"
+                );
+                let _ = channel
+                    .send(
+                        &message.conversation_id,
+                        &format!(
+                            "❌ 处理超时（超过 {} 秒），请重试",
+                            config.agent_timeout_secs
+                        ),
+                    )
+                    .await;
+            }
         }
     }
 
-    Err("所有消息流意外结束".to_string())
+    // 所有 pump task 退出后，区分正常关闭和异常断开
+    if cancel.is_cancelled() {
+        tracing::info!("网关已正常关闭");
+        Ok(())
+    } else {
+        Err("所有连接器消息流已结束".to_string())
+    }
 }
 
 /// 运行 Echo 循环（Channel 调试模式）
