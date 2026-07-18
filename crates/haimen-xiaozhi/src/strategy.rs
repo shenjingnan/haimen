@@ -16,6 +16,15 @@ use async_trait::async_trait;
 use crate::types::{AudioFrame, AudioParams};
 
 /// WebSocket 响应策略：决定录音结束后如何生成回放音频
+///
+/// # 流式 ASR 支持
+///
+/// 实现 [`supports_streaming_asr`] 返回 `true` 的策略可以启用流式 ASR 管道：
+/// - [`on_recording_start`] — 在录音开始时被调用，用于启动 ASR 管道
+/// - [`on_audio_frame`] — 每收到一帧 Opus 数据时被调用，策略可在此处解码并喂给 ASR
+/// - [`generate_response`] — 录音结束时调用，对于流式策略此时 ASR 结果已就绪
+///
+/// 默认实现（Echo、TTS 等）的钩子均为 no-op，不受影响。
 #[async_trait]
 pub trait ResponseStrategy: Send + Sync {
     /// 策略名称（用于日志和诊断）
@@ -40,6 +49,8 @@ pub trait ResponseStrategy: Send + Sync {
     /// * `audio_buffer` — 设备录音阶段缓冲的音频帧
     ///   - [`EchoStrategy`] 使用这些帧原样回传
     ///   - `TtsStrategy` 将忽略此参数，改从 TTS 生成
+    ///   - 流式 ASR 策略（如 `AsrLlmTtsStrategy`）也将忽略此参数，
+    ///     因为音频已在 [`on_audio_frame`] 中实时处理
     /// * `session_id` — 当前 WebSocket 会话 ID，用于日志和状态关联
     ///
     /// # 返回
@@ -51,6 +62,34 @@ pub trait ResponseStrategy: Send + Sync {
         audio_buffer: Vec<AudioFrame>,
         session_id: &str,
     ) -> Result<Vec<AudioFrame>, String>;
+
+    // ────────── 流式 ASR 钩子（可选覆盖） ──────────
+
+    /// 策略是否支持流式 ASR（录音期间实时识别）
+    ///
+    /// 返回 `true` 时，[`on_recording_start`] 和 [`on_audio_frame`] 将在录音期间被调用。
+    /// 默认返回 `false`。
+    fn supports_streaming_asr(&self) -> bool {
+        false
+    }
+
+    /// 录音开始时调用（仅当 [`supports_streaming_asr`] 返回 `true` 时）
+    ///
+    /// 流式策略应在此方法中启动 ASR WebSocket 管道。
+    /// 默认实现为 no-op。
+    async fn on_recording_start(&self, _session_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// 每收到一帧 Opus 数据时调用（仅当 [`supports_streaming_asr`] 返回 `true` 时）
+    ///
+    /// 流式策略应在此方法中解码 Opus 帧并喂入 ASR 管道。
+    /// 注意：即使支持流式 ASR，音频仍会缓冲在 `audio_buffer` 中，
+    /// 供 [`generate_response`] 在需要时使用（如作为后备）。
+    /// 默认实现为 no-op。
+    async fn on_audio_frame(&self, _frame: &AudioFrame) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -208,5 +247,45 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), buffer);
+    }
+
+    // ─── 流式 ASR 钩子默认行为（no-op） ──────────────────
+
+    #[test]
+    fn test_t10_streaming_defaults() {
+        let strategy = EchoStrategy;
+        assert!(
+            !strategy.supports_streaming_asr(),
+            "Echo 策略应不支持流式 ASR"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_t11_on_recording_start_noop() {
+        let strategy = EchoStrategy;
+        let result = strategy.on_recording_start("test-session").await;
+        assert!(result.is_ok(), "默认 on_recording_start 应为 Ok(())");
+    }
+
+    #[tokio::test]
+    async fn test_t12_on_audio_frame_noop() {
+        let strategy = EchoStrategy;
+        let frame = make_frame(0, &[0x01, 0x02]);
+        let result = strategy.on_audio_frame(&frame).await;
+        assert!(result.is_ok(), "默认 on_audio_frame 应为 Ok(())");
+    }
+
+    /// 通过 trait object 调用流式钩子确保分发正确
+    #[tokio::test]
+    async fn test_t13_streaming_hooks_via_trait_object() {
+        let strategy: Arc<dyn ResponseStrategy> = Arc::new(EchoStrategy);
+        assert!(!strategy.supports_streaming_asr());
+
+        let result = strategy.on_recording_start("test-session").await;
+        assert!(result.is_ok());
+
+        let frame = make_frame(0, &[0x01]);
+        let result = strategy.on_audio_frame(&frame).await;
+        assert!(result.is_ok());
     }
 }

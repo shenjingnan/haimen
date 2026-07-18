@@ -34,15 +34,36 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use haimen_xiaozhi::{AudioFrame, AudioParams, ResponseStrategy};
 use opus2::{Channels, Decoder};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use univoice::asr::{
-    AsrProvider, AudioInput, BaseProviderOption, DEFAULT_CHUNK_SIZE, DoubaoAsr, DoubaoAsrMode,
-    DoubaoAsrOption, adapt_audio_input,
+    AsrProvider, AudioInput, AudioStream, BaseProviderOption, DEFAULT_CHUNK_SIZE, DoubaoAsr,
+    DoubaoAsrMode, DoubaoAsrOption, adapt_audio_input,
 };
 use univoice::tts::provider::{DoubaoTts, DoubaoTtsOption};
 use univoice::tts::{BaseTtsOption, TtsProvider, TtsRequest};
 
 use crate::gateway::provider::AgentProvider;
 use crate::xiaozhi_tts::pcm_to_opus_frames;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 流式 ASR 管道状态
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 流式 ASR 管道内部状态
+///
+/// 录音期间实时将 Opus 帧解码为 PCM 并喂入 Doubao ASR，
+/// 实现 ASR 网络延迟与录音时间的重叠。
+struct AsrPipelineState {
+    /// 发送端：将解码后的 PCM 块喂入 ASR 的音频流
+    pcm_tx: mpsc::Sender<Vec<u8>>,
+    /// ASR 后台任务 JoinHandle，返回完整识别文本
+    asr_handle: tokio::task::JoinHandle<Result<String, String>>,
+    /// Opus 解码器（会话级复用，逐帧解码）
+    decoder: Decoder,
+    /// 每帧采样数（60ms @ 16kHz = 960 samples）
+    frame_samples: usize,
+}
 
 /// ASR → LLM → TTS 响应策略：将设备录制的语音识别为文字，
 /// 送 AI Agent 处理，再将回复合成为语音回传
@@ -63,6 +84,8 @@ pub struct AsrLlmTtsStrategy {
     agent: Arc<dyn AgentProvider>,
     /// LLM 会话 ID，用于多轮对话上下文连续
     llm_session_id: Mutex<Option<String>>,
+    /// 流式 ASR 管道状态（录音期间启用，录音结束时消耗）
+    streaming_state: Mutex<Option<AsrPipelineState>>,
 }
 
 impl AsrLlmTtsStrategy {
@@ -93,6 +116,7 @@ impl AsrLlmTtsStrategy {
             cluster,
             agent,
             llm_session_id: Mutex::new(None),
+            streaming_state: Mutex::new(None),
         }
     }
 
@@ -115,6 +139,37 @@ impl AsrLlmTtsStrategy {
             _ => "seed-tts-2.0".into(),
         }
     }
+
+    /// 尝试获取流式 ASR 管道的识别结果
+    ///
+    /// 如果流式 ASR 管道已启动且尚未被消耗：
+    /// 1. 关闭 mpsc Sender（通知 ASR 音频流结束）
+    /// 2. 等待后台任务完成，返回完整识别文本
+    /// 3. 如果任何步骤失败，记录警告并返回 `None`（便于回退到批处理 ASR）
+    async fn try_get_streaming_asr_text(&self) -> Option<String> {
+        let state = {
+            let mut guard = self.streaming_state.lock().ok()?;
+            guard.take()?
+        };
+
+        // 关闭 Sender → Receiver 端收到 None → 流结束 → 发送末帧
+        drop(state.pcm_tx);
+
+        match state.asr_handle.await {
+            Ok(Ok(text)) => {
+                tracing::info!("流式 ASR 成功，识别文本长度: {}", text.len());
+                Some(text)
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("流式 ASR 失败: {}, 回退到批处理模式", e);
+                None
+            }
+            Err(e) => {
+                tracing::warn!("流式 ASR 任务异常: {}, 回退到批处理模式", e);
+                None
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -133,94 +188,277 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         }
     }
 
-    /// 生成 ASR → LLM → TTS 响应
+    // ────────── 流式 ASR 支持 ──────────
+
+    fn supports_streaming_asr(&self) -> bool {
+        true
+    }
+
+    /// 录音开始时启动流式 ASR 管道
     ///
-    /// 1. Opus 帧解码 (16kHz) → PCM
-    /// 2. Doubao ASR 识别 → 文本
-    /// 3. AgentProvider 处理 → LLM 回复文本
-    /// 4. Doubao TTS 合成 (24kHz) → PCM
-    /// 5. PCM → Opus 编码 (24kHz, 60ms)
-    /// 6. 封装 AudioFrame → 返回
-    async fn generate_response(
-        &self,
-        audio_buffer: Vec<AudioFrame>,
-        session_id: &str,
-    ) -> Result<Vec<AudioFrame>, String> {
-        // ── Step 0: 空缓冲区检查 ──
-        if audio_buffer.is_empty() {
-            tracing::warn!(
-                session_id = %session_id,
-                "ASR-LLM-TTS: 音频缓冲区为空，跳过处理",
-            );
-            return Ok(Vec::new());
-        }
-
-        // ── Step 1: Opus → PCM 解码 (16kHz, 60ms 帧) ──
+    /// 创建 Opus 解码器 + mpsc channel，后台启动 Doubao ASR `listen_stream`，
+    /// 等待 `on_audio_frame` 推入解码后的 PCM 数据。
+    async fn on_recording_start(&self, session_id: &str) -> Result<(), String> {
         tracing::info!(
             session_id = %session_id,
-            frame_count = audio_buffer.len(),
-            "ASR-LLM-TTS: 开始 Opus 解码",
+            "流式 ASR: 启动双向流式管道",
         );
 
-        let pcm_16k = decode_opus_frames_to_pcm(&audio_buffer, 16000, 60)
-            .map_err(|e| format!("Opus 解码失败: {}", e))?;
+        let app_key = self.app_key.clone();
+        let access_token = self.access_token.clone();
 
-        let duration_ms = if pcm_16k.is_empty() {
-            0
-        } else {
-            pcm_16k.len() as u64 * 1000 / (16000 * 2)
-        };
-
-        tracing::info!(
-            session_id = %session_id,
-            pcm_bytes = pcm_16k.len(),
-            duration_ms = duration_ms,
-            "ASR-LLM-TTS: Opus 解码完成",
-        );
-
-        if pcm_16k.is_empty() {
-            tracing::warn!(
-                session_id = %session_id,
-                "ASR-LLM-TTS: 解码后 PCM 为空",
-            );
-            return Ok(Vec::new());
-        }
-
-        // ── Step 2: Doubao ASR 语音识别 ──
-        tracing::info!(
-            session_id = %session_id,
-            "ASR-LLM-TTS: 开始语音识别",
-        );
+        // 创建 mpsc channel：接收端作为 AudioStream 喂给 ASR
+        let (pcm_tx, pcm_rx) = mpsc::channel::<Vec<u8>>(32);
+        let audio_stream: AudioStream = Box::pin(ReceiverStream::new(pcm_rx));
 
         let asr = DoubaoAsr::new(DoubaoAsrOption {
             base: BaseProviderOption {
                 language: Some("zh-CN".into()),
                 ..Default::default()
             },
-            app_key: Some(self.app_key.clone()),
-            access_key: Some(self.access_token.clone()),
+            app_key: Some(app_key),
+            access_key: Some(access_token),
             mode: DoubaoAsrMode::Streaming,
             ..Default::default()
         });
 
-        let audio_stream = adapt_audio_input(AudioInput::Data(pcm_16k), DEFAULT_CHUNK_SIZE);
+        // 后台任务：消费 PCM 流，收集 ASR 识别结果
+        let asr_handle: tokio::task::JoinHandle<Result<String, String>> =
+            tokio::spawn(async move {
+                let mut stream = asr
+                    .listen_stream(audio_stream)
+                    .await
+                    .map_err(|e| format!("流式 ASR 启动失败: {}", e))?;
 
-        let user_text = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            asr_listen_to_text(&asr, audio_stream),
-        )
-        .await
-        .map_err(|_| "ASR 识别超时 (30s)".to_string())?
-        .map_err(|e| format!("ASR 识别失败: {}", e))?;
+                let mut full_text = String::new();
+                let mut chunk_count = 0;
 
-        if user_text.is_empty() {
-            tracing::warn!(
-                session_id = %session_id,
-                "ASR-LLM-TTS: 识别结果为空（可能为静音或无有效语音）",
-            );
-            return Ok(Vec::new());
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(chunk) => {
+                            chunk_count += 1;
+                            let tag = if chunk.is_final { "最终" } else { "中间" };
+                            let display_text = if chunk.text.is_empty() {
+                                "(空)".to_string()
+                            } else {
+                                chunk.text.clone()
+                            };
+                            tracing::info!(
+                                "🎤 [ASR {}] #{}: \"{}\"",
+                                tag,
+                                chunk_count,
+                                display_text,
+                            );
+
+                            if chunk.is_final && !chunk.text.is_empty() {
+                                full_text.push_str(&chunk.text);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("🎤 [ASR 错误] {}", e);
+                        }
+                    }
+                }
+
+                tracing::info!(
+                    "🎤 [ASR 完成] 共收到 {} 个结果块，完整文本长度: {}",
+                    chunk_count,
+                    full_text.len(),
+                );
+
+                if full_text.is_empty() {
+                    Err("ASR 识别结果为空（可能为静音或无有效语音）".to_string())
+                } else {
+                    Ok(full_text)
+                }
+            });
+
+        // 创建会话级 Opus 解码器
+        let sample_rate: u32 = 16000;
+        let frame_duration_ms: u32 = 60;
+        let frame_samples: usize = (sample_rate as u64 * frame_duration_ms as u64 / 1000) as usize;
+
+        let decoder = Decoder::new(sample_rate, Channels::Mono)
+            .map_err(|e| format!("创建 Opus 解码器失败: {}", e))?;
+
+        let state = AsrPipelineState {
+            pcm_tx,
+            asr_handle,
+            decoder,
+            frame_samples,
+        };
+
+        let mut guard = self
+            .streaming_state
+            .lock()
+            .map_err(|e| format!("锁获取失败: {}", e))?;
+        *guard = Some(state);
+
+        tracing::info!(
+            session_id = %session_id,
+            "流式 ASR: 管道已就绪",
+        );
+
+        Ok(())
+    }
+
+    /// 每收到一帧 Opus 数据时，实时解码并喂入 ASR 管道
+    async fn on_audio_frame(&self, frame: &AudioFrame) -> Result<(), String> {
+        if frame.data.is_empty() {
+            return Ok(());
         }
 
+        // 在锁内完成解码，提取 pcm_bytes 和 pcm_tx 后释放锁
+        let (pcm_bytes, pcm_tx) = {
+            let mut guard = self
+                .streaming_state
+                .lock()
+                .map_err(|e| format!("锁获取失败: {}", e))?;
+            let state = guard
+                .as_mut()
+                .ok_or_else(|| "流式 ASR 未启动".to_string())?;
+
+            let mut pcm_buf = vec![0i16; state.frame_samples];
+            let decoded_samples = state
+                .decoder
+                .decode(&frame.data, &mut pcm_buf, false)
+                .map_err(|e| format!("Opus 解码错误: {}", e))?;
+
+            // i16 → little-endian bytes
+            let mut pcm_bytes = Vec::with_capacity(decoded_samples * 2);
+            for sample in &pcm_buf[..decoded_samples] {
+                pcm_bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+
+            (pcm_bytes, state.pcm_tx.clone())
+        }; // MutexGuard 在此处释放
+
+        pcm_tx
+            .send(pcm_bytes)
+            .await
+            .map_err(|_| "ASR 管道已关闭".to_string())?;
+
+        Ok(())
+    }
+
+    /// 生成 ASR → LLM → TTS 响应
+    ///
+    /// 获取用户语音识别文本有两个途径：
+    /// - **流式 ASR**（优先）：录音期间已实时识别，直接取结果
+    /// - **批处理 ASR**（回退）：对缓冲区音频进行 Opus 解码后再识别
+    ///
+    /// 获取文本后执行 Agent → TTS → 编码回传（两路径共用）。
+    async fn generate_response(
+        &self,
+        audio_buffer: Vec<AudioFrame>,
+        session_id: &str,
+    ) -> Result<Vec<AudioFrame>, String> {
+        // ════════════════════════════════════════════════════════════════
+        // Phase 1: 获取用户语音识别文本
+        // ════════════════════════════════════════════════════════════════
+
+        let user_text = 'text: {
+            // ── 尝试流式 ASR（录音期间已完成识别） ──
+            if let Some(text) = self.try_get_streaming_asr_text().await {
+                if !text.is_empty() {
+                    tracing::info!(
+                        session_id = %session_id,
+                        text_len = text.len(),
+                        "ASR-LLM-TTS: 流式 ASR 识别完成",
+                    );
+                    break 'text text;
+                }
+            }
+
+            // ── 回退：批处理 ASR（缓冲区解码后再识别） ──
+
+            // Step 0: 空缓冲区检查
+            if audio_buffer.is_empty() {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "ASR-LLM-TTS: 音频缓冲区为空，跳过处理",
+                );
+                return Ok(Vec::new());
+            }
+
+            // Step 1: Opus → PCM 解码 (16kHz, 60ms 帧)
+            tracing::info!(
+                session_id = %session_id,
+                frame_count = audio_buffer.len(),
+                "ASR-LLM-TTS: 批处理 Opus 解码开始",
+            );
+
+            let pcm_16k = decode_opus_frames_to_pcm(&audio_buffer, 16000, 60)
+                .map_err(|e| format!("Opus 解码失败: {}", e))?;
+
+            let duration_ms = if pcm_16k.is_empty() {
+                0
+            } else {
+                pcm_16k.len() as u64 * 1000 / (16000 * 2)
+            };
+
+            tracing::info!(
+                session_id = %session_id,
+                pcm_bytes = pcm_16k.len(),
+                duration_ms = duration_ms,
+                "ASR-LLM-TTS: 批处理 Opus 解码完成",
+            );
+
+            if pcm_16k.is_empty() {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "ASR-LLM-TTS: 解码后 PCM 为空",
+                );
+                return Ok(Vec::new());
+            }
+
+            // Step 2: Doubao ASR 语音识别
+            tracing::info!(
+                session_id = %session_id,
+                "ASR-LLM-TTS: 批处理 ASR 开始",
+            );
+
+            let asr = DoubaoAsr::new(DoubaoAsrOption {
+                base: BaseProviderOption {
+                    language: Some("zh-CN".into()),
+                    ..Default::default()
+                },
+                app_key: Some(self.app_key.clone()),
+                access_key: Some(self.access_token.clone()),
+                mode: DoubaoAsrMode::Streaming,
+                ..Default::default()
+            });
+
+            let audio_stream = adapt_audio_input(AudioInput::Data(pcm_16k), DEFAULT_CHUNK_SIZE);
+
+            let text = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                asr_listen_to_text(&asr, audio_stream),
+            )
+            .await
+            .map_err(|_| "ASR 识别超时 (30s)".to_string())?
+            .map_err(|e| format!("ASR 识别失败: {}", e))?;
+
+            if text.is_empty() {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "ASR-LLM-TTS: 批处理识别结果为空",
+                );
+                return Ok(Vec::new());
+            }
+
+            tracing::info!(
+                session_id = %session_id,
+                text_len = text.len(),
+                "ASR-LLM-TTS: 批处理 ASR 完成",
+            );
+
+            text
+        };
+
+        // ════════════════════════════════════════════════════════════════
+        // Phase 2: AI Agent 处理（流式与批处理共用）
+        // ════════════════════════════════════════════════════════════════
         tracing::info!(
             session_id = %session_id,
             text = %user_text,
@@ -795,5 +1033,45 @@ mod tests {
         let result = agent.process("你好", None).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "模拟 Agent 失败");
+    }
+
+    // ─── 流式 ASR 支持测试 ────────────────────────────
+
+    #[test]
+    fn test_t25_supports_streaming_asr() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        assert!(
+            strategy.supports_streaming_asr(),
+            "AsrLlmTtsStrategy 应支持流式 ASR"
+        );
+    }
+
+    #[test]
+    fn test_t26_streaming_state_initial_none() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        let guard = strategy.streaming_state.lock().unwrap();
+        assert!(guard.is_none(), "初始 streaming_state 应为 None");
+    }
+
+    #[tokio::test]
+    async fn test_t27_try_get_streaming_asr_text_when_idle() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        let result = strategy.try_get_streaming_asr_text().await;
+        assert!(result.is_none(), "未启动流式 ASR 时应返回 None");
+    }
+
+    #[test]
+    fn test_t28_streaming_state_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<AsrLlmTtsStrategy>();
+    }
+
+    #[test]
+    fn test_t29_with_resource_id_preserves_state() {
+        let strategy = make_strategy(Arc::new(MockAgent)).with_resource_id("test-resource".into());
+        assert_eq!(strategy.resource_id, Some("test-resource".into()));
+        // streaming_state 不应受 with_resource_id 影响
+        let guard = strategy.streaming_state.lock().unwrap();
+        assert!(guard.is_none());
     }
 }

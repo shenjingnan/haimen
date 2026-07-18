@@ -258,6 +258,22 @@ async fn handle_listen(
             session.cumulated_timestamp = 0;
             session.recording_deadline = Some(Instant::now() + Duration::from_secs(5));
             session.state = SessionState::Recording;
+
+            // 如果策略支持流式 ASR，通知其录音开始
+            if session.strategy.supports_streaming_asr() {
+                if let Err(e) = session
+                    .strategy
+                    .on_recording_start(&session.session_id)
+                    .await
+                {
+                    tracing::warn!(
+                        device_id = %session.device_id,
+                        session_id = %session.session_id,
+                        error = %e,
+                        "Streaming ASR on_recording_start 失败，将继续使用批处理模式",
+                    );
+                }
+            }
         }
         ListenState::Stop => {
             tracing::debug!(
@@ -331,10 +347,23 @@ async fn buffer_audio(data: &[u8], socket: &mut WebSocket, session: &mut Session
                     (ts, data)
                 }
             };
-            session.audio_buffer.push(AudioFrame {
+            let frame = AudioFrame {
                 timestamp,
                 data: payload,
-            });
+            };
+
+            // 如果策略支持流式 ASR，将帧实时喂入 ASR 管道
+            if session.strategy.supports_streaming_asr() {
+                if let Err(e) = session.strategy.on_audio_frame(&frame).await {
+                    tracing::warn!(
+                        device_id = %session.device_id,
+                        error = %e,
+                        "Streaming ASR on_audio_frame 失败，将继续缓冲音频",
+                    );
+                }
+            }
+
+            session.audio_buffer.push(frame);
         }
         Err(ProtocolError::UnknownProtocol) => {
             let _ = send_json(
