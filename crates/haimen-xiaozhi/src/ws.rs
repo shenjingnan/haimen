@@ -555,6 +555,9 @@ async fn strategy_playback(socket: &mut WebSocket, session: &mut Session) {
 ///
 /// 与 [`playback_frames`] 功能相同（含中断处理），但帧是边生成边到达的。
 ///
+/// 包含预缓冲机制：在开始播放前先收集一定数量的帧，
+/// 确保播放启动后帧供给平滑，避免因帧到达延迟导致的卡顿。
+///
 /// # 参数
 ///
 /// * `socket` — WebSocket 连接
@@ -568,6 +571,58 @@ async fn playback_frames_stream(
     mut gen_handle: tokio::task::JoinHandle<Result<(), String>>,
 ) {
     session.state = SessionState::Playing;
+
+    // ── Phase 1: 预缓冲 ─────────────────────────────────────────
+    // 在开始播放前先收集若干帧，给 TTS 生成足够的 head start
+    // 10 帧 × 60ms = 600ms 预缓冲，在设备播放完这 600ms 内容之前
+    // TTS 有充足时间生成后续音频
+
+    const PREBUFFER_COUNT: usize = 10;
+    let mut prebuffer: Vec<AudioFrame> = Vec::with_capacity(PREBUFFER_COUNT);
+    let mut gen_done = false;
+
+    while prebuffer.len() < PREBUFFER_COUNT {
+        tokio::select! {
+            frame = frame_rx.recv() => {
+                match frame {
+                    Some(frame) => prebuffer.push(frame),
+                    None => {
+                        // 生成任务已经结束，不管预缓冲了多少帧都直接播放
+                        break;
+                    }
+                }
+            }
+            result = &mut gen_handle => {
+                gen_done = true;
+                match result {
+                    Ok(Ok(())) => {
+                        // 生成正常完成
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Streaming generation error during prebuffer",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Streaming generation task panicked during prebuffer",
+                        );
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    if prebuffer.is_empty() {
+        tracing::warn!("Prebuffer is empty, skipping playback");
+        session.state = SessionState::Ready;
+        return;
+    }
+
+    // ── Phase 2: 开始播放 + 发送预缓冲帧 ───────────────────────
 
     // 发送 TTS::Start
     if send_json(
@@ -587,15 +642,36 @@ async fn playback_frames_stream(
     }
 
     let mut frame_count: usize = 0;
-    let mut gen_done = false;
+
+    // 预缓冲帧全部立即发送（免延迟）
+    for frame in &prebuffer {
+        let encoded = encode_protocol2(&frame.data, frame.timestamp);
+        if socket.send(Message::Binary(encoded.into())).await.is_err() {
+            tracing::warn!("Streaming playback: connection lost during prebuffer send");
+            session.state = SessionState::Ready;
+            return;
+        }
+        frame_count += 1;
+    }
+
+    tracing::debug!(
+        device_id = %session.device_id,
+        prebuffer = prebuffer.len(),
+        "Prebuffer sent, starting steady-state playback",
+    );
+
+    // ── Phase 3: 稳态播放 ──────────────────────────────────────
+    // 预缓冲帧已发出，设备有 600ms 的音频可播放。
+    // 后续帧按 60ms 间隔逐个发送，保持与设备播放节奏同步。
+    // 因为有预缓冲做 head start，即使个别帧迟到几毫秒也不会卡顿。
 
     loop {
-        // 同时等待：帧到达、生成完成、中断信号
         tokio::select! {
             frame = frame_rx.recv(), if !gen_done => {
                 match frame {
                     Some(frame) => {
                         frame_count += 1;
+
                         let encoded = encode_protocol2(&frame.data, frame.timestamp);
                         if socket.send(Message::Binary(encoded.into())).await.is_err() {
                             tracing::warn!("Streaming playback: connection lost");
@@ -603,55 +679,41 @@ async fn playback_frames_stream(
                             return;
                         }
 
-                        // 前 5 帧免延迟（预缓冲优化）
-                        if frame_count < 5 {
-                            continue;
-                        }
-
-                        // 60ms 帧间隔 + 中断监听
+                        // 60ms 帧间隔 + 中断监听（与批处理模式一致）
                         if interruptible_sleep(socket, session).await {
+                            session.state = SessionState::Ready;
                             return;
                         }
                     }
                     None => {
                         gen_done = true;
-                        // channel 已关闭（可能生成完成或出错），继续等待可能的错误
                     }
                 }
             }
             result = &mut gen_handle, if !gen_done => {
                 gen_done = true;
                 match result {
-                    Ok(Ok(())) => {
-                        // 生成正常完成
-                    }
+                    Ok(Ok(())) => {}
                     Ok(Err(e)) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Streaming generation error (non-fatal, draining frames)",
-                        );
+                        tracing::warn!(error = %e, "Streaming generation error (draining)");
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Streaming generation task panicked",
-                        );
+                        tracing::warn!(error = %e, "Streaming generation panicked");
                     }
                 }
             }
-            // 即使 gen 已完成，也要继续 drain 剩余的帧
-            // 所以 frame_rx.recv 再次被 select 时需要 gen_done=true
         }
 
         if gen_done {
-            // Drain 剩余的帧
+            // Drain 剩余帧（仍在 channel 中的已完成帧）
             while let Some(frame) = frame_rx.recv().await {
                 frame_count += 1;
                 let encoded = encode_protocol2(&frame.data, frame.timestamp);
                 if socket.send(Message::Binary(encoded.into())).await.is_err() {
                     break;
                 }
-                if frame_count >= 5 && interruptible_sleep(socket, session).await {
+                if interruptible_sleep(socket, session).await {
+                    session.state = SessionState::Ready;
                     return;
                 }
             }
@@ -659,7 +721,7 @@ async fn playback_frames_stream(
         }
     }
 
-    // 所有帧已发送，发送 TTS::Stop
+    // 发送 TTS::Stop
     let _ = send_json(
         socket,
         &ServerMessage::Tts {
@@ -677,6 +739,19 @@ async fn playback_frames_stream(
         strategy = session.strategy.name(),
         "Streaming playback completed",
     );
+}
+
+// ─── 工具函数 ──────────────────────────────────────────────
+
+/// 通过 WebSocket 发送 JSON 格式的 ServerMessage
+async fn send_json(socket: &mut WebSocket, msg: &ServerMessage) -> Result<(), ()> {
+    let text = serde_json::to_string(msg).map_err(|e| {
+        tracing::error!(error = %e, "Failed to serialize ServerMessage");
+    })?;
+    socket.send(Message::Text(text.into())).await.map_err(|e| {
+        tracing::warn!(error = %e, "Failed to send WebSocket message");
+    })?;
+    Ok(())
 }
 
 /// 等待 60ms 帧间隔，同时监听设备中断信号
@@ -717,17 +792,4 @@ async fn interruptible_sleep(socket: &mut WebSocket, session: &mut Session) -> b
             false
         }
     }
-}
-
-// ─── 工具函数 ──────────────────────────────────────────────
-
-/// 通过 WebSocket 发送 JSON 格式的 ServerMessage
-async fn send_json(socket: &mut WebSocket, msg: &ServerMessage) -> Result<(), ()> {
-    let text = serde_json::to_string(msg).map_err(|e| {
-        tracing::error!(error = %e, "Failed to serialize ServerMessage");
-    })?;
-    socket.send(Message::Text(text.into())).await.map_err(|e| {
-        tracing::warn!(error = %e, "Failed to send WebSocket message");
-    })?;
-    Ok(())
 }
