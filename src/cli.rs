@@ -54,6 +54,12 @@ pub enum Commands {
         /// ASR-TTS 模式：将设备语音识别为文字后重新合成语音回传
         #[arg(long)]
         xiaozhi_asr_tts: bool,
+        /// ASR-LLM-TTS 模式：语音识别 → AI 处理 → 语音合成
+        #[arg(long)]
+        xiaozhi_llm: bool,
+        /// LLM 提供者（仅 --xiaozhi-llm 有效）
+        #[arg(long, default_value = "claude-code")]
+        xiaozhi_llm_provider: String,
     },
     /// 生成 Shell 补全脚本
     #[command(hide = true)]
@@ -337,6 +343,8 @@ pub async fn run(cli: Cli) -> Result<(), String> {
             xiaozhi_tts_text,
             xiaozhi_tts_voice,
             xiaozhi_asr_tts,
+            xiaozhi_llm,
+            xiaozhi_llm_provider,
         }) => {
             let settings = crate::config::settings::load_settings()
                 .ok()
@@ -354,14 +362,23 @@ pub async fn run(cli: Cli) -> Result<(), String> {
 
             let app_key = || -> String {
                 std::env::var("DOUBAO_APP_KEY")
-                    .expect("TTS/ASR-TTS 模式需要设置 DOUBAO_APP_KEY 环境变量")
+                    .expect("TTS/ASR-TTS/LLM 模式需要设置 DOUBAO_APP_KEY 环境变量")
             };
             let access_token = || -> String {
                 std::env::var("DOUBAO_ACCESS_TOKEN")
-                    .expect("TTS/ASR-TTS 模式需要设置 DOUBAO_ACCESS_TOKEN 环境变量")
+                    .expect("TTS/ASR-TTS/LLM 模式需要设置 DOUBAO_ACCESS_TOKEN 环境变量")
             };
 
-            let xiaozhi_strategy: Arc<dyn haimen_xiaozhi::ResponseStrategy> = if xiaozhi_asr_tts {
+            let xiaozhi_strategy: Arc<dyn haimen_xiaozhi::ResponseStrategy> = if xiaozhi_llm {
+                let llm_agent: Arc<dyn crate::gateway::provider::AgentProvider> =
+                    create_agent(Some(xiaozhi_llm_provider.clone())).map(Arc::from)?;
+                Arc::new(crate::xiaozhi_asr_llm_tts::AsrLlmTtsStrategy::new(
+                    app_key(),
+                    access_token(),
+                    xiaozhi_tts_voice,
+                    llm_agent,
+                ))
+            } else if xiaozhi_asr_tts {
                 Arc::new(crate::xiaozhi_asr_tts::AsrTtsStrategy::new(
                     app_key(),
                     access_token(),
