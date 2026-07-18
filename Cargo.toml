@@ -68,6 +68,9 @@ tempfile = "3"
 # UUID
 uuid = { version = "1", features = ["v4"] }
 
+# Opus 音频编码
+opus2 = { version = "0.4", features = ["bundled"] }
+
 
 [dependencies]
 clap = { workspace = true }
@@ -99,6 +102,8 @@ tokio-stream = { workspace = true }
 haimen-core = { path = "crates/haimen-core" }
 haimen-lark = { path = "crates/haimen-lark" }
 haimen-xiaozhi = { path = "crates/haimen-xiaozhi" }
+univoice = { path = "../univoice", features = ["opus-encoder"] }
+opus2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -1,8 +1,9 @@
 //! WebSocket 连接管理 — 处理小智硬件设备的全双工通信
 //!
 //! 管理设备 WebSocket 连接的整个生命周期，包括 HELLO 握手、
-//! 音频数据缓冲和回声回放。
+//! 音频数据缓冲和回声回放（通过可替换的 [`ResponseStrategy`] 策略）。
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -13,6 +14,7 @@ use axum::{
 use uuid::Uuid;
 
 use crate::protocol::{AudioProtocol, ProtocolError, detect_and_parse, encode_protocol2};
+use crate::strategy::ResponseStrategy;
 use crate::types::{
     AudioFrame, AudioParams, ClientMessage, ListenState, ServerMessage, SessionState, TtsState,
 };
@@ -29,21 +31,27 @@ struct Session {
     cumulated_timestamp: u32,
     /// 录音截止时刻（5 秒超时用），None 表示未在录音
     recording_deadline: Option<Instant>,
+    /// 响应策略：决定录音结束后如何生成回放音频
+    strategy: Arc<dyn ResponseStrategy>,
 }
 
 // ─── 公开 API ──────────────────────────────────────────────
 
 /// 处理 WebSocket 升级请求
 ///
-/// 从 HTTP 头中提取 `Device-Id`，传递给连接处理函数。
-pub async fn handle_ws_upgrade(ws: WebSocketUpgrade, headers: HeaderMap) -> Response {
+/// 从 HTTP 头中提取 `Device-Id`，连同响应策略一起传递给连接处理函数。
+pub async fn handle_ws_upgrade(
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+    strategy: Arc<dyn ResponseStrategy>,
+) -> Response {
     let device_id = headers
         .get("device-id")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown")
         .to_string();
 
-    ws.on_upgrade(move |socket| handle_ws_connection(socket, device_id))
+    ws.on_upgrade(move |socket| handle_ws_connection(socket, device_id, strategy))
 }
 
 // ─── 连接主循环 ────────────────────────────────────────────
@@ -51,7 +59,11 @@ pub async fn handle_ws_upgrade(ws: WebSocketUpgrade, headers: HeaderMap) -> Resp
 /// WebSocket 连接主循环
 ///
 /// 流程：HELLO 握手（30 秒超时）→ 消息循环 → 连接关闭
-async fn handle_ws_connection(mut socket: WebSocket, device_id: String) {
+async fn handle_ws_connection(
+    mut socket: WebSocket,
+    device_id: String,
+    strategy: Arc<dyn ResponseStrategy>,
+) {
     let mut session = Session {
         device_id,
         session_id: String::new(),
@@ -60,6 +72,7 @@ async fn handle_ws_connection(mut socket: WebSocket, device_id: String) {
         audio_buffer: Vec::new(),
         cumulated_timestamp: 0,
         recording_deadline: None,
+        strategy,
     };
 
     // ── HELLO 握手（30 秒超时） ──
@@ -77,11 +90,13 @@ async fn handle_ws_connection(mut socket: WebSocket, device_id: String) {
                         session.audio_params = audio_params;
                         session.session_id = Uuid::new_v4().to_string();
 
+                        let server_params =
+                            session.strategy.hello_audio_params(&session.audio_params);
                         let hello = ServerMessage::Hello {
                             version,
                             transport,
                             session_id: session.session_id.clone(),
-                            audio_params: session.audio_params.clone(),
+                            audio_params: server_params,
                         };
                         if send_json(&mut socket, &hello).await.is_err() {
                             return;
@@ -126,10 +141,11 @@ async fn handle_ws_connection(mut socket: WebSocket, device_id: String) {
                 _ = tokio::time::sleep_until(tokio_deadline) => {
                     tracing::info!(
                         device_id = %session.device_id,
-                        "Recording 5s timeout, triggering echo playback",
+                        strategy = session.strategy.name(),
+                        "Recording 5s timeout, triggering strategy playback",
                     );
                     session.recording_deadline = None;
-                    echo_playback(&mut socket, &mut session).await;
+                    strategy_playback(&mut socket, &mut session).await;
                     continue;
                 }
             }
@@ -246,10 +262,10 @@ async fn handle_listen(
         ListenState::Stop => {
             tracing::debug!(
                 device_id = %session.device_id,
-                "Listen::Stop — recording stopped, starting echo playback",
+                "Listen::Stop — recording stopped, starting strategy playback",
             );
             session.recording_deadline = None;
-            echo_playback(socket, session).await;
+            strategy_playback(socket, session).await;
         }
     }
 }
@@ -340,28 +356,30 @@ async fn buffer_audio(data: &[u8], socket: &mut WebSocket, session: &mut Session
     }
 }
 
-// ─── 回声回放 ──────────────────────────────────────────────
+// ─── 通用回放 ──────────────────────────────────────────────
 
-/// 回声回放：将缓冲的音频帧发送回设备
+/// 通用回放：将音频帧发送到设备
+///
+/// 与具体策略无关，任何策略产生的 AudioFrame 都通过此函数发送。
 ///
 /// ## 流程
-/// 1. 发送 `TTS::Start` 通知设备开始播放
-/// 2. 前 5 帧免延迟发送（预缓冲优化）
-/// 3. 后续帧间隔 60ms，通过 `tokio::select!` 监听中断
-/// 4. 发送 `TTS::Stop`，清除缓冲区，状态恢复为 `Ready`
+/// 1. 会话状态切换为 `Playing`
+/// 2. 发送 `TTS::Start` 通知设备开始播放
+/// 3. 前 5 帧免延迟发送（预缓冲优化）
+/// 4. 后续帧间隔 60ms，通过 `tokio::select!` 监听中断
+/// 5. 发送 `TTS::Stop`，状态恢复为 `Ready`
 ///
 /// ## 中断处理
 /// - `Listen::Start` 或 `Abort`：立即停止播放，发送 `TTS::Stop`
 /// - 连接关闭：立即退出
-async fn echo_playback(socket: &mut WebSocket, session: &mut Session) {
-    session.recording_deadline = None;
+async fn playback_frames(socket: &mut WebSocket, session: &mut Session, frames: Vec<AudioFrame>) {
+    session.state = SessionState::Playing;
 
-    if session.audio_buffer.is_empty() {
-        tracing::debug!("Echo playback skipped: empty audio buffer");
+    if frames.is_empty() {
+        tracing::debug!("Playback skipped: empty frames");
+        session.state = SessionState::Ready;
         return;
     }
-
-    session.state = SessionState::Playing;
 
     // 发送 TTS::Start
     if send_json(
@@ -376,12 +394,10 @@ async fn echo_playback(socket: &mut WebSocket, session: &mut Session) {
     .is_err()
     {
         tracing::warn!("Failed to send TTS::Start, aborting playback");
-        session.audio_buffer.clear();
         session.state = SessionState::Ready;
         return;
     }
 
-    let frames: Vec<AudioFrame> = session.audio_buffer.drain(..).collect();
     let total = frames.len();
 
     for (i, frame) in frames.iter().enumerate() {
@@ -454,8 +470,38 @@ async fn echo_playback(socket: &mut WebSocket, session: &mut Session) {
     tracing::debug!(
         device_id = %session.device_id,
         frame_count = total,
-        "Echo playback completed",
+        strategy = session.strategy.name(),
+        "Playback completed",
     );
+}
+
+/// 策略回放：通过当前策略生成音频帧并发送给设备
+///
+/// 1. 取出缓冲的音频帧
+/// 2. 调用策略的 `generate_response` 生成回放帧
+/// 3. 使用 `playback_frames` 发送
+async fn strategy_playback(socket: &mut WebSocket, session: &mut Session) {
+    session.recording_deadline = None;
+    let buffer = std::mem::take(&mut session.audio_buffer);
+
+    match session
+        .strategy
+        .generate_response(buffer, &session.session_id)
+        .await
+    {
+        Ok(frames) => {
+            playback_frames(socket, session, frames).await;
+        }
+        Err(e) => {
+            tracing::warn!(
+                device_id = %session.device_id,
+                strategy = session.strategy.name(),
+                error = %e,
+                "Strategy failed to generate response",
+            );
+            session.state = SessionState::Ready;
+        }
+    }
 }
 
 // ─── 工具函数 ──────────────────────────────────────────────

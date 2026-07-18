@@ -15,7 +15,12 @@ pub struct ServeConfig {
 ///
 /// - `config`: 服务器地址配置
 /// - `webhook_state`: 可选的 Webhook 处理器
-pub async fn start(config: ServeConfig, webhook_state: Option<WebhookState>) -> Result<(), String> {
+/// - `xiaozhi_strategy`: xiaozhi WebSocket 响应策略
+pub async fn start(
+    config: ServeConfig,
+    webhook_state: Option<WebhookState>,
+    xiaozhi_strategy: std::sync::Arc<dyn haimen_xiaozhi::ResponseStrategy>,
+) -> Result<(), String> {
     use haimen_xiaozhi;
 
     // 构建路由（WebhookState 分支需要用 .with_state() 传递 state）
@@ -29,6 +34,7 @@ pub async fn start(config: ServeConfig, webhook_state: Option<WebhookState>) -> 
                     axum::routing::post(api::webhook::handle_github_webhook),
                 )
                 .with_state(state),
+            xiaozhi_strategy,
         )
         .fallback(r#static::handle)
     } else {
@@ -36,6 +42,7 @@ pub async fn start(config: ServeConfig, webhook_state: Option<WebhookState>) -> 
             axum::Router::new()
                 .route("/health", axum::routing::get(health_handler))
                 .route("/api/v1/system/info", axum::routing::get(api::system::info)),
+            xiaozhi_strategy,
         )
         .fallback(r#static::handle)
     };
