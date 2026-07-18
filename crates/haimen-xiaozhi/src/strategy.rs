@@ -12,6 +12,7 @@
 //! 例如 Phase 2 将新增 `TtsStrategy`，忽略设备音频，改为 TTS → PCM → Opus 下发。
 
 use async_trait::async_trait;
+use tokio::sync::mpsc;
 
 use crate::types::{AudioFrame, AudioParams};
 
@@ -88,6 +89,48 @@ pub trait ResponseStrategy: Send + Sync {
     /// 供 [`generate_response`] 在需要时使用（如作为后备）。
     /// 默认实现为 no-op。
     async fn on_audio_frame(&self, _frame: &AudioFrame) -> Result<(), String> {
+        Ok(())
+    }
+
+    // ────────── 流式回放（边合成边播放） ──────────
+
+    /// 策略是否支持流式回放（边合成边播放）
+    ///
+    /// 返回 `true` 时，[`generate_response_stream`] 将替代 [`generate_response`] 被调用，
+    /// 通过 `frame_tx` 逐帧发送生成的音频，ws.rs 收到帧后立即发给设备。
+    /// 默认返回 `false`。
+    fn supports_streaming_playback(&self) -> bool {
+        false
+    }
+
+    /// 流式生成音频帧并发送到回放管道
+    ///
+    /// 与 [`generate_response`] 不同，此方法不返回所有帧，而是通过 `frame_tx`
+    /// 逐帧发送生成的音频。调用方在 `frame_tx` 的 Receiver 端逐帧读取并发送给设备。
+    ///
+    /// # 参数
+    ///
+    /// * `audio_buffer` — 设备录音阶段缓冲的音频帧
+    /// * `session_id` — 当前 WebSocket 会话 ID
+    /// * `frame_tx` — 音频帧发送端，实现边合成边播放
+    ///
+    /// # 约定
+    ///
+    /// - 方法返回时，`frame_tx` 已被 drop（Receiver 端收到 None）
+    /// - 返回前应确保所有必要的帧已发送完毕
+    /// - 默认实现调用 [`generate_response`] 后逐帧发送
+    async fn generate_response_stream(
+        &self,
+        audio_buffer: Vec<AudioFrame>,
+        session_id: &str,
+        frame_tx: mpsc::Sender<AudioFrame>,
+    ) -> Result<(), String> {
+        let frames = self.generate_response(audio_buffer, session_id).await?;
+        for frame in frames {
+            if frame_tx.send(frame).await.is_err() {
+                break;
+            }
+        }
         Ok(())
     }
 }

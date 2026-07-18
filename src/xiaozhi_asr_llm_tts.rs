@@ -170,6 +170,72 @@ impl AsrLlmTtsStrategy {
             }
         }
     }
+
+    /// 获取用户语音识别文本（流式 ASR 优先，批处理 ASR 回退）
+    ///
+    /// 返回 `Ok(Some(text))` 表示识别成功，`Ok(None)` 表示空音频/静音。
+    async fn resolve_user_text(
+        &self,
+        audio_buffer: &[AudioFrame],
+        session_id: &str,
+    ) -> Result<Option<String>, String> {
+        // ── 尝试流式 ASR（录音期间已完成识别） ──
+        if let Some(text) = self.try_get_streaming_asr_text().await {
+            if !text.is_empty() {
+                tracing::info!(
+                    session_id = %session_id,
+                    text_len = text.len(),
+                    "流式 ASR 识别完成",
+                );
+                return Ok(Some(text));
+            }
+        }
+
+        // ── 回退：批处理 ASR ──
+        if audio_buffer.is_empty() {
+            return Ok(None);
+        }
+
+        let pcm_16k = decode_opus_frames_to_pcm(audio_buffer, 16000, 60)
+            .map_err(|e| format!("Opus 解码失败: {}", e))?;
+
+        if pcm_16k.is_empty() {
+            return Ok(None);
+        }
+
+        let asr = DoubaoAsr::new(DoubaoAsrOption {
+            base: BaseProviderOption {
+                language: Some("zh-CN".into()),
+                ..Default::default()
+            },
+            app_key: Some(self.app_key.clone()),
+            access_key: Some(self.access_token.clone()),
+            mode: DoubaoAsrMode::Streaming,
+            ..Default::default()
+        });
+
+        let audio_stream = adapt_audio_input(AudioInput::Data(pcm_16k), DEFAULT_CHUNK_SIZE);
+
+        let text = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            asr_listen_to_text(&asr, audio_stream),
+        )
+        .await
+        .map_err(|_| "ASR 识别超时 (30s)".to_string())?
+        .map_err(|e| format!("ASR 识别失败: {}", e))?;
+
+        if text.is_empty() {
+            return Ok(None);
+        }
+
+        tracing::info!(
+            session_id = %session_id,
+            text_len = text.len(),
+            "批处理 ASR 识别完成",
+        );
+
+        Ok(Some(text))
+    }
 }
 
 #[async_trait]
@@ -341,6 +407,143 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         Ok(())
     }
 
+    // ────────── 流式回放支持 ──────────
+
+    fn supports_streaming_playback(&self) -> bool {
+        true
+    }
+
+    /// 流式生成 ASR → LLM → TTS 响应并逐帧发送
+    ///
+    /// 相较 [`generate_response`]：
+    /// - Agent 使用 `process_stream` 流式输出
+    /// - TTS 使用 `speak_stream` 边合成边返回音频
+    /// - 每块音频立即编码为 Opus 帧并通过 `frame_tx` 发送
+    async fn generate_response_stream(
+        &self,
+        audio_buffer: Vec<AudioFrame>,
+        session_id: &str,
+        frame_tx: tokio::sync::mpsc::Sender<AudioFrame>,
+    ) -> Result<(), String> {
+        // ════════════════════════════════════════════════════════════════
+        // Phase 1: 获取用户语音识别文本
+        // ════════════════════════════════════════════════════════════════
+
+        let user_text = match self.resolve_user_text(&audio_buffer, session_id).await? {
+            Some(text) => text,
+            None => {
+                return Ok(());
+            }
+        };
+
+        tracing::info!(
+            session_id = %session_id,
+            text_len = user_text.len(),
+            "TTS-STREAM: ASR 识别完成",
+        );
+
+        // ════════════════════════════════════════════════════════════════
+        // Phase 2: AI Agent 流式处理
+        // ════════════════════════════════════════════════════════════════
+
+        // 读取当前 LLM 会话 ID
+        let current_llm_session = self
+            .llm_session_id
+            .lock()
+            .map_err(|e| format!("LLM session_id 锁获取失败: {}", e))?
+            .clone();
+
+        let (text_stream, new_llm_session_id) = self
+            .agent
+            .process_stream(&user_text, current_llm_session.as_deref())
+            .await
+            .map_err(|e| format!("AI Agent 流式处理失败: {}", e))?;
+
+        // 立即更新 LLM 会话 ID（用于多轮对话）
+        if let Ok(mut session) = self.llm_session_id.lock() {
+            *session = Some(new_llm_session_id);
+        }
+
+        tracing::info!(
+            session_id = %session_id,
+            agent = self.agent.name(),
+            "TTS-STREAM: Agent 流式输出已启动",
+        );
+
+        // ════════════════════════════════════════════════════════════════
+        // Phase 3: 流式 TTS 合成 → Opus 编码 → 逐帧发送
+        // ════════════════════════════════════════════════════════════════
+
+        let resource_id = self.resolve_resource_id();
+        let voice = self.voice.clone().map(Into::into);
+
+        tracing::info!(
+            session_id = %session_id,
+            voice = ?voice,
+            resource_id = %resource_id,
+            "TTS-STREAM: 开始流式语音合成",
+        );
+
+        let tts = DoubaoTts::new(DoubaoTtsOption {
+            base: BaseTtsOption {
+                format: Some("pcm".into()),
+                voice,
+                ..Default::default()
+            },
+            app_id: Some(self.app_key.clone()),
+            access_token: Some(self.access_token.clone()),
+            resource_id: Some(resource_id),
+            ..Default::default()
+        });
+
+        let mut audio_stream = tts
+            .speak_stream(text_stream)
+            .await
+            .map_err(|e| format!("流式 TTS 启动失败: {}", e))?;
+
+        let mut timestamp: u32 = 0;
+        let mut total_audio_bytes: usize = 0;
+
+        while let Some(result) = audio_stream.next().await {
+            match result {
+                Ok(chunk) => {
+                    total_audio_bytes += chunk.audio_chunk.len();
+
+                    // 将 PCM 音频块编码为 Opus 帧（24kHz, 60ms）
+                    let opus_frames = pcm_to_opus_frames(&chunk.audio_chunk, 24000, 60)
+                        .map_err(|e| format!("Opus 编码失败: {}", e))?;
+
+                    for opus in opus_frames {
+                        let frame = AudioFrame {
+                            timestamp,
+                            data: opus,
+                        };
+                        if frame_tx.send(frame).await.is_err() {
+                            // 接收端已关闭（如播放被中断），安全退出
+                            tracing::info!(
+                                session_id = %session_id,
+                                "TTS-STREAM: 回放管道已关闭，停止生成",
+                            );
+                            return Ok(());
+                        }
+                        timestamp = timestamp.wrapping_add(60);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("流式 TTS 音频块错误: {}", e);
+                }
+            }
+        }
+
+        tracing::info!(
+            session_id = %session_id,
+            total_audio_bytes = total_audio_bytes,
+            "TTS-STREAM: 流式合成完成",
+        );
+
+        Ok(())
+    }
+
     /// 生成 ASR → LLM → TTS 响应
     ///
     /// 获取用户语音识别文本有两个途径：
@@ -357,103 +560,11 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         // Phase 1: 获取用户语音识别文本
         // ════════════════════════════════════════════════════════════════
 
-        let user_text = 'text: {
-            // ── 尝试流式 ASR（录音期间已完成识别） ──
-            if let Some(text) = self.try_get_streaming_asr_text().await {
-                if !text.is_empty() {
-                    tracing::info!(
-                        session_id = %session_id,
-                        text_len = text.len(),
-                        "ASR-LLM-TTS: 流式 ASR 识别完成",
-                    );
-                    break 'text text;
-                }
-            }
-
-            // ── 回退：批处理 ASR（缓冲区解码后再识别） ──
-
-            // Step 0: 空缓冲区检查
-            if audio_buffer.is_empty() {
-                tracing::warn!(
-                    session_id = %session_id,
-                    "ASR-LLM-TTS: 音频缓冲区为空，跳过处理",
-                );
+        let user_text = match self.resolve_user_text(&audio_buffer, session_id).await? {
+            Some(text) => text,
+            None => {
                 return Ok(Vec::new());
             }
-
-            // Step 1: Opus → PCM 解码 (16kHz, 60ms 帧)
-            tracing::info!(
-                session_id = %session_id,
-                frame_count = audio_buffer.len(),
-                "ASR-LLM-TTS: 批处理 Opus 解码开始",
-            );
-
-            let pcm_16k = decode_opus_frames_to_pcm(&audio_buffer, 16000, 60)
-                .map_err(|e| format!("Opus 解码失败: {}", e))?;
-
-            let duration_ms = if pcm_16k.is_empty() {
-                0
-            } else {
-                pcm_16k.len() as u64 * 1000 / (16000 * 2)
-            };
-
-            tracing::info!(
-                session_id = %session_id,
-                pcm_bytes = pcm_16k.len(),
-                duration_ms = duration_ms,
-                "ASR-LLM-TTS: 批处理 Opus 解码完成",
-            );
-
-            if pcm_16k.is_empty() {
-                tracing::warn!(
-                    session_id = %session_id,
-                    "ASR-LLM-TTS: 解码后 PCM 为空",
-                );
-                return Ok(Vec::new());
-            }
-
-            // Step 2: Doubao ASR 语音识别
-            tracing::info!(
-                session_id = %session_id,
-                "ASR-LLM-TTS: 批处理 ASR 开始",
-            );
-
-            let asr = DoubaoAsr::new(DoubaoAsrOption {
-                base: BaseProviderOption {
-                    language: Some("zh-CN".into()),
-                    ..Default::default()
-                },
-                app_key: Some(self.app_key.clone()),
-                access_key: Some(self.access_token.clone()),
-                mode: DoubaoAsrMode::Streaming,
-                ..Default::default()
-            });
-
-            let audio_stream = adapt_audio_input(AudioInput::Data(pcm_16k), DEFAULT_CHUNK_SIZE);
-
-            let text = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                asr_listen_to_text(&asr, audio_stream),
-            )
-            .await
-            .map_err(|_| "ASR 识别超时 (30s)".to_string())?
-            .map_err(|e| format!("ASR 识别失败: {}", e))?;
-
-            if text.is_empty() {
-                tracing::warn!(
-                    session_id = %session_id,
-                    "ASR-LLM-TTS: 批处理识别结果为空",
-                );
-                return Ok(Vec::new());
-            }
-
-            tracing::info!(
-                session_id = %session_id,
-                text_len = text.len(),
-                "ASR-LLM-TTS: 批处理 ASR 完成",
-            );
-
-            text
         };
 
         // ════════════════════════════════════════════════════════════════
@@ -1073,5 +1184,53 @@ mod tests {
         // streaming_state 不应受 with_resource_id 影响
         let guard = strategy.streaming_state.lock().unwrap();
         assert!(guard.is_none());
+    }
+
+    // ─── 流式 TTS 回放支持测试 ───────────────────────────
+
+    #[test]
+    fn test_t30_supports_streaming_playback() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        assert!(
+            strategy.supports_streaming_playback(),
+            "AsrLlmTtsStrategy 应支持流式回放",
+        );
+    }
+
+    /// 验证 generate_response_stream 对空输入的处理
+    #[tokio::test]
+    async fn test_t31_generate_response_stream_empty_buffer() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let result = strategy
+            .generate_response_stream(vec![], "test-session", tx)
+            .await;
+        // 空缓冲区不应报错，应返回 Ok(())
+        assert!(result.is_ok(), "空缓冲区应返回 Ok(())");
+    }
+
+    /// 验证 resolve_user_text 对空输入的处理
+    #[tokio::test]
+    async fn test_t32_resolve_user_text_empty() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        let result = strategy.resolve_user_text(&[], "test-session").await;
+        assert!(result.is_ok(), "空缓冲区应返回 Ok");
+        assert!(result.unwrap().is_none(), "空缓冲区应返回 None");
+    }
+
+    /// 模拟 agent 验证 process_stream 的默认行为
+    #[tokio::test]
+    async fn test_t33_mock_agent_process_stream() {
+        let agent = MockAgent;
+        let (mut stream, sid) = agent
+            .process_stream("你好", None)
+            .await
+            .expect("MockAgent process_stream 应成功");
+        let mut result = String::new();
+        while let Some(chunk) = stream.next().await {
+            result.push_str(&chunk);
+        }
+        assert_eq!(result, "你好", "process_stream 应返回 process 的结果");
+        assert_eq!(sid, "mock-session-id");
     }
 }
