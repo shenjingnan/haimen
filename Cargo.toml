@@ -102,7 +102,7 @@ tokio-stream = { workspace = true }
 haimen-core = { path = "crates/haimen-core" }
 haimen-lark = { path = "crates/haimen-lark" }
 haimen-xiaozhi = { path = "crates/haimen-xiaozhi" }
-univoice = { path = "../univoice", features = ["opus-encoder"] }
+univoice = { git = "https://github.com/shenjingnan/univoice", rev = "021113fc9f5159c7a2edf89f48f26c3edb7abc9c", features = ["opus-encoder"] }
 opus2 = { workspace = true }
 
 [dev-dependencies]
