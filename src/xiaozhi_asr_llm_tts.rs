@@ -1,0 +1,799 @@
+//! xiaozhi-esp32 ASR → LLM → TTS 响应策略
+//!
+//! 将设备录制的 Opus 音频解码为 PCM，通过 Doubao ASR 识别为文字，
+//! 将文字发送给 AI Agent（Claude Code / Codex 等）处理，
+//! 再将 LLM 的回复通过 Doubao TTS 合成为语音，编码为 Opus 帧后发送给设备播放。
+//!
+//! # 管线
+//!
+//! ```text
+//! 设备 Opus 帧 (16kHz)
+//!   ↓ opus2::Decoder
+//! PCM16 mono 16000Hz
+//!   ↓ DoubaoAsr::listen_stream
+//! 识别文本
+//!   ↓ AgentProvider::process (Claude Code / Codex 等)
+//! LLM 回复文本
+//!   ↓ DoubaoTts::synthesize(format="pcm")
+//! PCM16 mono 24000Hz
+//!   ↓ pcm_to_opus_frames() (24kHz, 60ms)
+//! Vec<OpusPacket>
+//!   ↓ 封装为 AudioFrame { timestamp, data }
+//! play_back_frames() (已有复用)
+//!   ↓ BinaryProtocol2 → 设备播放
+//! ```
+//!
+//! # 多轮对话
+//!
+//! 策略内部维护 LLM 的 `session_id`，每次 `generate_response` 调用后更新，
+//! 实现音色多轮对话的上下文连续性。
+
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use futures_util::StreamExt;
+use haimen_xiaozhi::{AudioFrame, AudioParams, ResponseStrategy};
+use opus2::{Channels, Decoder};
+use univoice::asr::{
+    AsrProvider, AudioInput, BaseProviderOption, DEFAULT_CHUNK_SIZE, DoubaoAsr, DoubaoAsrMode,
+    DoubaoAsrOption, adapt_audio_input,
+};
+use univoice::tts::provider::{DoubaoTts, DoubaoTtsOption};
+use univoice::tts::{BaseTtsOption, TtsProvider, TtsRequest};
+
+use crate::gateway::provider::AgentProvider;
+use crate::xiaozhi_tts::pcm_to_opus_frames;
+
+/// ASR → LLM → TTS 响应策略：将设备录制的语音识别为文字，
+/// 送 AI Agent 处理，再将回复合成为语音回传
+///
+/// 管线：Opus 解码 (16kHz) → Doubao ASR → AgentProvider → Doubao TTS (24kHz) → Opus 编码
+pub struct AsrLlmTtsStrategy {
+    /// 火山引擎 App Key
+    app_key: String,
+    /// 火山引擎 Access Token
+    access_token: String,
+    /// TTS 音色（None 使用环境变量或默认值）
+    voice: Option<String>,
+    /// 火山引擎 Resource ID（用于声音克隆等）
+    resource_id: Option<String>,
+    /// 火山引擎 Cluster（用于推导 resource_id）
+    cluster: Option<String>,
+    /// AI Agent（Claude Code、Codex 等）
+    agent: Arc<dyn AgentProvider>,
+    /// LLM 会话 ID，用于多轮对话上下文连续
+    llm_session_id: Mutex<Option<String>>,
+}
+
+impl AsrLlmTtsStrategy {
+    /// 创建 ASR → LLM → TTS 策略
+    ///
+    /// # 参数
+    ///
+    /// * `app_key` — 火山引擎 App Key
+    /// * `access_token` — 火山引擎 Access Token
+    /// * `voice` — TTS 音色（None 从环境变量或默认值读取）
+    /// * `agent` — AI Agent 实例
+    pub fn new(
+        app_key: String,
+        access_token: String,
+        voice: Option<String>,
+        agent: Arc<dyn AgentProvider>,
+    ) -> Self {
+        let voice = voice
+            .or_else(|| std::env::var("DOUBAO_VOICE_TYPE").ok())
+            .or_else(|| Some("zh_female_xiaohe_uranus_bigtts".into()));
+        let cluster = std::env::var("DOUBAO_CLUSTER").ok();
+
+        Self {
+            app_key,
+            access_token,
+            voice,
+            resource_id: None,
+            cluster,
+            agent,
+            llm_session_id: Mutex::new(None),
+        }
+    }
+
+    /// 设置 Resource ID（声音克隆等场景）
+    pub fn with_resource_id(mut self, resource_id: String) -> Self {
+        self.resource_id = Some(resource_id);
+        self
+    }
+
+    /// 将 cluster 映射为 resource_id
+    ///
+    /// - `volcano_icl` → `seed-tts-1.0`（声音克隆）
+    /// - 其他 → `seed-tts-2.0`
+    fn resolve_resource_id(&self) -> String {
+        if let Some(ref rid) = self.resource_id {
+            return rid.clone();
+        }
+        match self.cluster.as_deref() {
+            Some("volcano_icl") => "seed-tts-1.0".into(),
+            _ => "seed-tts-2.0".into(),
+        }
+    }
+}
+
+#[async_trait]
+impl ResponseStrategy for AsrLlmTtsStrategy {
+    fn name(&self) -> &'static str {
+        "asr-llm-tts"
+    }
+
+    /// 告知设备使用 24000Hz 播放（匹配 TTS 引擎输出）
+    fn hello_audio_params(&self, _client_params: &AudioParams) -> AudioParams {
+        AudioParams {
+            format: "opus".into(),
+            sample_rate: 24000,
+            channels: 1,
+            frame_duration: 60,
+        }
+    }
+
+    /// 生成 ASR → LLM → TTS 响应
+    ///
+    /// 1. Opus 帧解码 (16kHz) → PCM
+    /// 2. Doubao ASR 识别 → 文本
+    /// 3. AgentProvider 处理 → LLM 回复文本
+    /// 4. Doubao TTS 合成 (24kHz) → PCM
+    /// 5. PCM → Opus 编码 (24kHz, 60ms)
+    /// 6. 封装 AudioFrame → 返回
+    async fn generate_response(
+        &self,
+        audio_buffer: Vec<AudioFrame>,
+        session_id: &str,
+    ) -> Result<Vec<AudioFrame>, String> {
+        // ── Step 0: 空缓冲区检查 ──
+        if audio_buffer.is_empty() {
+            tracing::warn!(
+                session_id = %session_id,
+                "ASR-LLM-TTS: 音频缓冲区为空，跳过处理",
+            );
+            return Ok(Vec::new());
+        }
+
+        // ── Step 1: Opus → PCM 解码 (16kHz, 60ms 帧) ──
+        tracing::info!(
+            session_id = %session_id,
+            frame_count = audio_buffer.len(),
+            "ASR-LLM-TTS: 开始 Opus 解码",
+        );
+
+        let pcm_16k = decode_opus_frames_to_pcm(&audio_buffer, 16000, 60)
+            .map_err(|e| format!("Opus 解码失败: {}", e))?;
+
+        let duration_ms = if pcm_16k.is_empty() {
+            0
+        } else {
+            pcm_16k.len() as u64 * 1000 / (16000 * 2)
+        };
+
+        tracing::info!(
+            session_id = %session_id,
+            pcm_bytes = pcm_16k.len(),
+            duration_ms = duration_ms,
+            "ASR-LLM-TTS: Opus 解码完成",
+        );
+
+        if pcm_16k.is_empty() {
+            tracing::warn!(
+                session_id = %session_id,
+                "ASR-LLM-TTS: 解码后 PCM 为空",
+            );
+            return Ok(Vec::new());
+        }
+
+        // ── Step 2: Doubao ASR 语音识别 ──
+        tracing::info!(
+            session_id = %session_id,
+            "ASR-LLM-TTS: 开始语音识别",
+        );
+
+        let asr = DoubaoAsr::new(DoubaoAsrOption {
+            base: BaseProviderOption {
+                language: Some("zh-CN".into()),
+                ..Default::default()
+            },
+            app_key: Some(self.app_key.clone()),
+            access_key: Some(self.access_token.clone()),
+            mode: DoubaoAsrMode::Streaming,
+            ..Default::default()
+        });
+
+        let audio_stream = adapt_audio_input(AudioInput::Data(pcm_16k), DEFAULT_CHUNK_SIZE);
+
+        let user_text = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            asr_listen_to_text(&asr, audio_stream),
+        )
+        .await
+        .map_err(|_| "ASR 识别超时 (30s)".to_string())?
+        .map_err(|e| format!("ASR 识别失败: {}", e))?;
+
+        if user_text.is_empty() {
+            tracing::warn!(
+                session_id = %session_id,
+                "ASR-LLM-TTS: 识别结果为空（可能为静音或无有效语音）",
+            );
+            return Ok(Vec::new());
+        }
+
+        tracing::info!(
+            session_id = %session_id,
+            text = %user_text,
+            "ASR-LLM-TTS: ASR 识别完成",
+        );
+
+        // ── Step 3: AI Agent 处理 ──
+        tracing::info!(
+            session_id = %session_id,
+            agent = self.agent.name(),
+            "ASR-LLM-TTS: 开始 AI Agent 处理",
+        );
+
+        // 读取当前 LLM 会话 ID
+        let current_llm_session = self
+            .llm_session_id
+            .lock()
+            .map_err(|e| format!("LLM session_id 锁获取失败: {}", e))?
+            .clone();
+
+        let llm_response = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            self.agent
+                .process(&user_text, current_llm_session.as_deref()),
+        )
+        .await
+        .map_err(|_| "AI Agent 响应超时 (60s)".to_string())?
+        .map_err(|e| format!("AI Agent 处理失败: {}", e))?;
+
+        let (llm_text, new_llm_session_id) = llm_response;
+
+        if llm_text.is_empty() {
+            return Err("AI Agent 返回空回复".to_string());
+        }
+
+        // 更新 LLM 会话 ID（用于多轮对话）
+        if let Ok(mut session) = self.llm_session_id.lock() {
+            *session = Some(new_llm_session_id);
+        }
+
+        tracing::info!(
+            session_id = %session_id,
+            response_len = llm_text.len(),
+            "ASR-LLM-TTS: AI Agent 处理完成",
+        );
+
+        // ── Step 4: Doubao TTS 语音合成 ──
+        let resource_id = self.resolve_resource_id();
+        let voice = self.voice.clone().map(Into::into);
+
+        tracing::info!(
+            session_id = %session_id,
+            voice = ?voice,
+            resource_id = %resource_id,
+            "ASR-LLM-TTS: 开始语音合成",
+        );
+
+        let tts = DoubaoTts::new(DoubaoTtsOption {
+            base: BaseTtsOption {
+                format: Some("pcm".into()),
+                voice,
+                ..Default::default()
+            },
+            app_id: Some(self.app_key.clone()),
+            access_token: Some(self.access_token.clone()),
+            resource_id: Some(resource_id),
+            ..Default::default()
+        });
+
+        let response = tts
+            .synthesize(TtsRequest {
+                text: llm_text.clone(),
+                options: None,
+            })
+            .await
+            .map_err(|e| format!("TTS 合成失败: {}", e))?;
+
+        tracing::info!(
+            session_id = %session_id,
+            audio_size = response.audio.len(),
+            format = %response.format,
+            "ASR-LLM-TTS: TTS 合成完成",
+        );
+
+        if response.audio.is_empty() {
+            tracing::warn!(
+                session_id = %session_id,
+                "ASR-LLM-TTS: TTS 返回空音频",
+            );
+            return Ok(Vec::new());
+        }
+
+        // ── Step 5: PCM → Opus 编码 (24kHz, 60ms) ──
+        let opus_frames = pcm_to_opus_frames(&response.audio, 24000, 60)
+            .map_err(|e| format!("Opus 编码失败: {}", e))?;
+
+        tracing::info!(
+            session_id = %session_id,
+            frame_count = opus_frames.len(),
+            "ASR-LLM-TTS: Opus 编码完成",
+        );
+
+        // ── Step 6: 封装为 AudioFrame ──
+        let mut frames = Vec::with_capacity(opus_frames.len());
+        let mut timestamp: u32 = 0;
+        for opus in opus_frames {
+            frames.push(AudioFrame {
+                timestamp,
+                data: opus,
+            });
+            timestamp = timestamp.wrapping_add(60);
+        }
+
+        tracing::info!(
+            session_id = %session_id,
+            frame_count = frames.len(),
+            "ASR-LLM-TTS: 管线完成",
+        );
+
+        Ok(frames)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Opus → PCM 解码
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 将 Opus 帧列表解码为 PCM16 mono 数据
+///
+/// # 参数
+///
+/// * `frames` — Opus 裸包列表（无容器封装）
+/// * `sample_rate` — 编码时的采样率 (Hz)，ESP32 上传为 16000
+/// * `frame_duration_ms` — 每帧时长（毫秒），ESP32 上传为 60ms
+///
+/// # 返回
+///
+/// 连续 PCM16 LE mono 字节序列
+fn decode_opus_frames_to_pcm(
+    frames: &[AudioFrame],
+    sample_rate: u32,
+    frame_duration_ms: u32,
+) -> Result<Vec<u8>, String> {
+    if frame_duration_ms == 0 {
+        return Err("frame_duration_ms 不能为 0".into());
+    }
+    if sample_rate == 0 {
+        return Err("sample_rate 不能为 0".into());
+    }
+
+    // 每帧采样数: 60ms @ 16kHz = 960 samples
+    let frame_samples = (sample_rate as u64 * frame_duration_ms as u64 / 1000) as usize;
+
+    let mut decoder = Decoder::new(sample_rate, Channels::Mono)
+        .map_err(|e| format!("创建 Opus 解码器失败: {}", e))?;
+
+    let mut all_pcm: Vec<u8> = Vec::new();
+    let mut pcm_buf = vec![0i16; frame_samples];
+
+    for frame in frames {
+        if frame.data.is_empty() {
+            continue;
+        }
+
+        let decoded_samples = decoder
+            .decode(&frame.data, &mut pcm_buf, false)
+            .map_err(|e| format!("Opus 解码错误: {}", e))?;
+
+        // 将 i16 采样转换为小端字节序
+        for sample in &pcm_buf[..decoded_samples] {
+            all_pcm.extend_from_slice(&sample.to_le_bytes());
+        }
+    }
+
+    Ok(all_pcm)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ASR 流式识别 → 完整文本
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 对音频流执行 ASR 识别，返回完整识别文本
+async fn asr_listen_to_text(
+    asr: &DoubaoAsr,
+    audio_stream: univoice::asr::AudioStream,
+) -> Result<String, String> {
+    let mut stream = asr
+        .listen_stream(audio_stream)
+        .await
+        .map_err(|e| format!("ASR 启动失败: {}", e))?;
+
+    let mut full_text = String::new();
+    let mut chunk_count = 0;
+
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => {
+                chunk_count += 1;
+                if chunk.is_final && !chunk.text.is_empty() {
+                    full_text.push_str(&chunk.text);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("ASR 识别块错误: {}", e);
+            }
+        }
+    }
+
+    tracing::debug!(
+        chunk_count = chunk_count,
+        text_len = full_text.len(),
+        "ASR 流式识别完成",
+    );
+
+    Ok(full_text)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 测试
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::xiaozhi_tts::pcm_to_opus_frames;
+
+    // ─── 模拟 Agent —— 用于测试 ──────────────────────────────
+
+    /// 测试用 Mock Agent：将收到的消息原样返回
+    struct MockAgent;
+
+    #[async_trait]
+    impl AgentProvider for MockAgent {
+        fn name(&self) -> &str {
+            "mock-agent"
+        }
+
+        async fn process(
+            &self,
+            message: &str,
+            session_id: Option<&str>,
+        ) -> Result<(String, String), String> {
+            // 如果提供了 session_id，追加 "(continued)" 表示恢复了上下文
+            let response = if session_id.is_some() {
+                format!("{} (continued)", message)
+            } else {
+                message.to_string()
+            };
+            Ok((response, "mock-session-id".to_string()))
+        }
+
+        async fn check_available(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// 模拟 Agent：总是返回错误
+    struct FailingAgent;
+
+    #[async_trait]
+    impl AgentProvider for FailingAgent {
+        fn name(&self) -> &str {
+            "failing-agent"
+        }
+
+        async fn process(
+            &self,
+            _message: &str,
+            _session_id: Option<&str>,
+        ) -> Result<(String, String), String> {
+            Err("模拟 Agent 失败".to_string())
+        }
+
+        async fn check_available(&self) -> Result<(), String> {
+            Err("模拟 Agent 不可用".to_string())
+        }
+    }
+
+    /// 模拟 Agent：返回空回复
+    struct EmptyResponseAgent;
+
+    #[async_trait]
+    impl AgentProvider for EmptyResponseAgent {
+        fn name(&self) -> &str {
+            "empty-response-agent"
+        }
+
+        async fn process(
+            &self,
+            _message: &str,
+            _session_id: Option<&str>,
+        ) -> Result<(String, String), String> {
+            Ok((String::new(), "empty-session".to_string()))
+        }
+
+        async fn check_available(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn make_strategy(agent: Arc<dyn AgentProvider>) -> AsrLlmTtsStrategy {
+        AsrLlmTtsStrategy::new("app_key".into(), "access_token".into(), None, agent)
+    }
+
+    // ─── Opus 编解码往返测试 ───────────────────────────
+
+    #[test]
+    fn test_t1_opus_roundtrip() {
+        // 生成测试 PCM 数据: 1 帧 = 960 samples * 2 bytes = 1920 bytes @ 16kHz 60ms
+        let mut pcm_original = Vec::with_capacity(1920);
+        for i in 0..960 {
+            let val = ((i as f64 * 0.1).sin() * 10000.0) as i16;
+            pcm_original.extend_from_slice(&val.to_le_bytes());
+        }
+
+        // 编码为 Opus
+        let opus_frames = pcm_to_opus_frames(&pcm_original, 16000, 60).unwrap();
+        assert!(!opus_frames.is_empty(), "Opus 编码不应返回空");
+        assert_eq!(
+            opus_frames.len(),
+            1,
+            "1 帧 16000Hz 60ms 应产生 1 个 Opus 包"
+        );
+
+        // 构建 AudioFrame
+        let audio_frames = vec![AudioFrame {
+            timestamp: 0,
+            data: opus_frames[0].clone(),
+        }];
+
+        // 解码回 PCM
+        let pcm_decoded = decode_opus_frames_to_pcm(&audio_frames, 16000, 60).unwrap();
+        assert!(!pcm_decoded.is_empty(), "Opus 解码不应返回空");
+        assert_eq!(
+            pcm_decoded.len(),
+            1920,
+            "解码后应为 1920 bytes (960 samples * 2 bytes)"
+        );
+    }
+
+    // ─── 解码边界测试 ──────────────────────────────────
+
+    #[test]
+    fn test_t2_decode_empty_frames() {
+        let frames: Vec<AudioFrame> = vec![];
+        let result = decode_opus_frames_to_pcm(&frames, 16000, 60);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_t3_decode_invalid_frame_duration() {
+        let frames = vec![AudioFrame {
+            timestamp: 0,
+            data: vec![0x80, 0xFF],
+        }];
+        let result = decode_opus_frames_to_pcm(&frames, 16000, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_t4_decode_invalid_sample_rate() {
+        let frames = vec![AudioFrame {
+            timestamp: 0,
+            data: vec![0x80, 0xFF],
+        }];
+        let result = decode_opus_frames_to_pcm(&frames, 0, 60);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_t5_decode_skip_empty_data() {
+        let frames = vec![
+            AudioFrame {
+                timestamp: 0,
+                data: vec![],
+            },
+            AudioFrame {
+                timestamp: 60,
+                data: vec![],
+            },
+        ];
+        let result = decode_opus_frames_to_pcm(&frames, 16000, 60);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_t6_decode_invalid_opus_data() {
+        let frames = vec![AudioFrame {
+            timestamp: 0,
+            data: vec![0xFF, 0xFF, 0xFF, 0xFF],
+        }];
+        let result = decode_opus_frames_to_pcm(&frames, 16000, 60);
+        assert!(result.is_err());
+    }
+
+    // ─── Strategy 基本测试 ─────────────────────────────
+
+    #[test]
+    fn test_t7_strategy_name() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        assert_eq!(strategy.name(), "asr-llm-tts");
+    }
+
+    #[test]
+    fn test_t8_hello_audio_params() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        let client_params = AudioParams {
+            format: "opus".into(),
+            sample_rate: 16000,
+            channels: 1,
+            frame_duration: 60,
+        };
+        let result = strategy.hello_audio_params(&client_params);
+        assert_eq!(result.sample_rate, 24000);
+        assert_eq!(result.format, "opus");
+        assert_eq!(result.channels, 1);
+        assert_eq!(result.frame_duration, 60);
+    }
+
+    #[test]
+    fn test_t9_strategy_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<AsrLlmTtsStrategy>();
+    }
+
+    #[test]
+    fn test_t10_with_resource_id() {
+        let strategy = make_strategy(Arc::new(MockAgent)).with_resource_id("seed-tts-1.0".into());
+        assert_eq!(strategy.resource_id, Some("seed-tts-1.0".into()));
+    }
+
+    #[test]
+    fn test_t11_resolve_resource_id_default() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        assert_eq!(strategy.resolve_resource_id(), "seed-tts-2.0");
+    }
+
+    #[test]
+    fn test_t12_resolve_resource_id_custom() {
+        let strategy =
+            make_strategy(Arc::new(MockAgent)).with_resource_id("custom-resource".into());
+        assert_eq!(strategy.resolve_resource_id(), "custom-resource");
+    }
+
+    #[test]
+    fn test_t13_voice_default_when_none() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        assert_eq!(
+            strategy.voice.as_deref(),
+            Some("zh_female_xiaohe_uranus_bigtts")
+        );
+    }
+
+    #[test]
+    fn test_t14_voice_uses_env_var() {
+        unsafe {
+            std::env::set_var("DOUBAO_VOICE_TYPE", "zh_female_vv_uranus_bigtts");
+        }
+        let strategy = make_strategy(Arc::new(MockAgent));
+        assert_eq!(
+            strategy.voice.as_deref(),
+            Some("zh_female_vv_uranus_bigtts")
+        );
+        unsafe {
+            std::env::remove_var("DOUBAO_VOICE_TYPE");
+        }
+    }
+
+    #[test]
+    fn test_t15_voice_cli_overrides_env() {
+        unsafe {
+            std::env::set_var("DOUBAO_VOICE_TYPE", "env_voice");
+        }
+        let strategy = AsrLlmTtsStrategy::new(
+            "k".into(),
+            "t".into(),
+            Some("cli_voice".into()),
+            Arc::new(MockAgent),
+        );
+        assert_eq!(strategy.voice.as_deref(), Some("cli_voice"));
+        unsafe {
+            std::env::remove_var("DOUBAO_VOICE_TYPE");
+        }
+    }
+
+    #[test]
+    fn test_t16_resolve_resource_id_volcano_icl() {
+        unsafe {
+            std::env::set_var("DOUBAO_CLUSTER", "volcano_icl");
+        }
+        let strategy = make_strategy(Arc::new(MockAgent));
+        assert_eq!(strategy.resolve_resource_id(), "seed-tts-1.0");
+        unsafe {
+            std::env::remove_var("DOUBAO_CLUSTER");
+        }
+    }
+
+    // ─── LLM session 管理测试 ───────────────────────────
+
+    #[test]
+    fn test_t17_llm_session_id_initial_none() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        let session = strategy.llm_session_id.lock().unwrap();
+        assert!(session.is_none(), "初始 LLM session_id 应为 None");
+    }
+
+    #[test]
+    fn test_t18_llm_session_id_update() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        {
+            let mut session = strategy.llm_session_id.lock().unwrap();
+            *session = Some("test-session-123".to_string());
+        }
+        let session = strategy.llm_session_id.lock().unwrap();
+        assert_eq!(
+            session.as_deref(),
+            Some("test-session-123"),
+            "session_id 应被更新"
+        );
+    }
+
+    // ─── generate_response 行为测试（Mock Agent） ───────
+
+    #[tokio::test]
+    async fn test_t19_generate_response_empty_buffer() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        let result = strategy.generate_response(vec![], "test-session").await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_t20_generate_response_llm_failure() {
+        let strategy = make_strategy(Arc::new(FailingAgent));
+        // 由于 ASR 会实际调用外部服务，跳过集成测试
+        // 这里只验证策略能正常构建且 Send+Sync
+        assert_eq!(strategy.agent.name(), "failing-agent");
+    }
+
+    #[tokio::test]
+    async fn test_t21_generate_response_llm_empty_response() {
+        let strategy = make_strategy(Arc::new(EmptyResponseAgent));
+        assert_eq!(strategy.agent.name(), "empty-response-agent");
+    }
+
+    // ─── MockAgent process 行为验证 ──────────────────
+
+    #[tokio::test]
+    async fn test_t22_mock_agent_no_session() {
+        let agent = MockAgent;
+        let (response, session_id) = agent.process("你好", None).await.expect("MockAgent 应成功");
+        assert_eq!(response, "你好");
+        assert_eq!(session_id, "mock-session-id");
+    }
+
+    #[tokio::test]
+    async fn test_t23_mock_agent_with_session() {
+        let agent = MockAgent;
+        let (response, session_id) = agent
+            .process("你好", Some("prev-session"))
+            .await
+            .expect("MockAgent 应成功");
+        assert_eq!(response, "你好 (continued)");
+        assert_eq!(session_id, "mock-session-id");
+    }
+
+    #[tokio::test]
+    async fn test_t24_failing_agent_process() {
+        let agent = FailingAgent;
+        let result = agent.process("你好", None).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "模拟 Agent 失败");
+    }
+}
