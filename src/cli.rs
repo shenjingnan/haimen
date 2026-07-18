@@ -48,9 +48,12 @@ pub enum Commands {
         /// xiaozhi TTS 测试模式：指定回放文本（不指定则使用 Echo 模式）
         #[arg(long)]
         xiaozhi_tts_text: Option<String>,
-        /// xiaozhi TTS 音色（可选，仅 TTS 模式有效）
+        /// xiaozhi TTS 音色（可选，仅 TTS/ASR-TTS 模式有效）
         #[arg(long)]
         xiaozhi_tts_voice: Option<String>,
+        /// ASR-TTS 模式：将设备语音识别为文字后重新合成语音回传
+        #[arg(long)]
+        xiaozhi_asr_tts: bool,
     },
     /// 生成 Shell 补全脚本
     #[command(hide = true)]
@@ -333,6 +336,7 @@ pub async fn run(cli: Cli) -> Result<(), String> {
             port,
             xiaozhi_tts_text,
             xiaozhi_tts_voice,
+            xiaozhi_asr_tts,
         }) => {
             let settings = crate::config::settings::load_settings()
                 .ok()
@@ -348,21 +352,31 @@ pub async fn run(cli: Cli) -> Result<(), String> {
                 }
             });
 
-            let xiaozhi_strategy: Arc<dyn haimen_xiaozhi::ResponseStrategy> =
-                if let Some(text) = xiaozhi_tts_text {
-                    let app_key = std::env::var("DOUBAO_APP_KEY")
-                        .expect("TTS 模式需要设置 DOUBAO_APP_KEY 环境变量");
-                    let access_token = std::env::var("DOUBAO_ACCESS_TOKEN")
-                        .expect("TTS 模式需要设置 DOUBAO_ACCESS_TOKEN 环境变量");
-                    Arc::new(crate::xiaozhi_tts::TtsStrategy::new(
-                        text,
-                        xiaozhi_tts_voice,
-                        app_key,
-                        access_token,
-                    ))
-                } else {
-                    Arc::new(haimen_xiaozhi::EchoStrategy)
-                };
+            let app_key = || -> String {
+                std::env::var("DOUBAO_APP_KEY")
+                    .expect("TTS/ASR-TTS 模式需要设置 DOUBAO_APP_KEY 环境变量")
+            };
+            let access_token = || -> String {
+                std::env::var("DOUBAO_ACCESS_TOKEN")
+                    .expect("TTS/ASR-TTS 模式需要设置 DOUBAO_ACCESS_TOKEN 环境变量")
+            };
+
+            let xiaozhi_strategy: Arc<dyn haimen_xiaozhi::ResponseStrategy> = if xiaozhi_asr_tts {
+                Arc::new(crate::xiaozhi_asr_tts::AsrTtsStrategy::new(
+                    app_key(),
+                    access_token(),
+                    xiaozhi_tts_voice,
+                ))
+            } else if let Some(text) = xiaozhi_tts_text {
+                Arc::new(crate::xiaozhi_tts::TtsStrategy::new(
+                    text,
+                    xiaozhi_tts_voice,
+                    app_key(),
+                    access_token(),
+                ))
+            } else {
+                Arc::new(haimen_xiaozhi::EchoStrategy)
+            };
 
             let serve_config = crate::web::ServeConfig { host, port };
             crate::web::start(serve_config, webhook_state, xiaozhi_strategy).await
