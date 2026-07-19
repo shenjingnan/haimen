@@ -1,12 +1,5 @@
 [target.x86_64-pc-windows-msvc]
-# 启用静态 CRT 链接，确保生成自包含的二进制文件，无需 VC++ 运行时分发
-rustflags = ["-C", "target-feature=+crt-static"]
-
-# libopus_sys 通过 cmake crate 编译 Opus C 代码时默认使用 /MD（动态 CRT），
-# 与 Rust 的 +crt-static（静态 CRT）不匹配，导致 __imp_floor 等符号未解析。
-# cmake crate 通过 cc crate 获取 C 编译器参数，cc crate 会读取 CFLAGS_<target> 环境变量。
-# 设置 CFLAGS_x86_64_pc_windows_msvc=/MT 强制 MSVC 使用静态 CRT 编译所有 C 代码，
-# 与 Rust 的 +crt-static 保持一致，避免 LNK2001 链接错误。
-[env]
-CFLAGS_x86_64_pc_windows_msvc = "/MT"
-CXXFLAGS_x86_64_pc_windows_msvc = "/MT"
+# libopus_sys 的 cmake build 使用 /MD（动态 CRT）编译 Opus C 代码。
+# 如果使用 +crt-static，Rust 端使用静态 CRT，但 Opus 目标文件仍引用
+# __imp_floor 等动态 CRT 导入符号，导致 LNK2001/LNK1120 链接错误。
+# 不使用 +crt-static，与 libopus_sys 保持一致使用动态 CRT，通过 VC++ 运行时分发。
