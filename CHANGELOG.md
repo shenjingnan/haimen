@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/shenjingnan/haimen/compare/v0.2.1...v0.2.2) - 2026-07-19
+
+### Fixed
+
+- 修复 Windows MSVC 构建时 libopus_sys 链接 __imp_floor 未解析的问题（完整方案） ([#73](https://github.com/shenjingnan/haimen/pull/73))
+- 修复 Windows MSVC 构建时 libopus_sys 链接 __imp_floor 未解析的问题 ([#71](https://github.com/shenjingnan/haimen/pull/71))
+
 ## [0.2.1](https://github.com/shenjingnan/haimen/compare/v0.2.0...v0.2.1) - 2026-07-19
 
 ### Fixed
