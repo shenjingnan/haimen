@@ -99,9 +99,9 @@ tokio-util = { workspace = true }
 tokio-stream = { workspace = true }
 
 # Workspace crate 依赖
-haimen-core = { path = "crates/haimen-core" }
-haimen-lark = { path = "crates/haimen-lark" }
-haimen-xiaozhi = { path = "crates/haimen-xiaozhi" }
+haimen-core = { path = "crates/haimen-core", version = "0.1.0" }
+haimen-lark = { path = "crates/haimen-lark", version = "0.1.0" }
+haimen-xiaozhi = { path = "crates/haimen-xiaozhi", version = "0.1.1" }
 univoice = { git = "https://github.com/shenjingnan/univoice", rev = "021113fc9f5159c7a2edf89f48f26c3edb7abc9c", features = ["opus-encoder"] }
 opus2 = { workspace = true }
 
