@@ -128,13 +128,26 @@ async fn handle_ws_connection(
 
     // ── 消息循环 ──
     loop {
-        // 录音状态下，用 select! 竞争消息和 5 秒超时
+        // 录音状态下，用 select! 竞争消息、VAD 完成信号和安全超时
         let msg = if session.state == SessionState::Recording {
-            // 使用 Recording 启动时保存的截止时刻，确保 5 秒固定时长
             let deadline = session
                 .recording_deadline
-                .unwrap_or_else(|| Instant::now() + Duration::from_secs(5));
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
             let tokio_deadline = tokio::time::Instant::from_std(deadline);
+
+            // 获取 VAD 完成信号（如果策略支持流式 ASR + VAD）
+            let vad_completion = session.strategy.vad_completion();
+            let has_vad = vad_completion.is_some();
+
+            // VAD 等待 future（需在 select! 前 pin 住）
+            let vad_fut = async move {
+                if let Some(notify) = vad_completion {
+                    notify.notified().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::pin!(vad_fut);
 
             tokio::select! {
                 msg = socket.recv() => msg,
@@ -142,7 +155,17 @@ async fn handle_ws_connection(
                     tracing::info!(
                         device_id = %session.device_id,
                         strategy = session.strategy.name(),
-                        "Recording 5s timeout, triggering strategy playback",
+                        "Recording safety timeout (30s), triggering strategy playback",
+                    );
+                    session.recording_deadline = None;
+                    strategy_playback(&mut socket, &mut session).await;
+                    continue;
+                }
+                _ = &mut vad_fut, if has_vad => {
+                    tracing::info!(
+                        device_id = %session.device_id,
+                        strategy = session.strategy.name(),
+                        "VAD detected end of speech, triggering strategy playback",
                     );
                     session.recording_deadline = None;
                     strategy_playback(&mut socket, &mut session).await;
@@ -256,7 +279,7 @@ async fn handle_listen(
             );
             session.audio_buffer.clear();
             session.cumulated_timestamp = 0;
-            session.recording_deadline = Some(Instant::now() + Duration::from_secs(5));
+            session.recording_deadline = None;
             session.state = SessionState::Recording;
 
             // 如果策略支持流式 ASR，通知其录音开始
