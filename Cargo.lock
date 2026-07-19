@@ -2915,7 +2915,8 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 [[package]]
 name = "univoice"
 version = "0.1.0"
-source = "git+https://github.com/shenjingnan/univoice?rev=021113fc9f5159c7a2edf89f48f26c3edb7abc9c#021113fc9f5159c7a2edf89f48f26c3edb7abc9c"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05b127501708669c233f3669d7031056c45acb63612beebc09d166a406957b74"
 dependencies = [
  "anyhow",
  "async-stream",
