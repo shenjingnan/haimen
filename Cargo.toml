@@ -54,7 +54,7 @@ futures-util = "0.3"
 async-trait = "0.1"
 
 # MCP 协议
-rmcp = { version = "1.7.0", features = ["client", "transport-child-process"] }
+rmcp = { version = "2.2.0", features = ["client", "transport-child-process"] }
 hmac = "0.13.0"
 sha2 = "0.11.0"
 hex = "0.4.3"
@@ -67,6 +67,9 @@ tempfile = "3"
 
 # UUID
 uuid = { version = "1", features = ["v4"] }
+
+# Opus 音频编码
+opus2 = { version = "0.4", features = ["bundled"] }
 
 
 [dependencies]
@@ -99,6 +102,8 @@ tokio-stream = { workspace = true }
 haimen-core = { path = "crates/haimen-core", version = "0.1.0" }
 haimen-lark = { path = "crates/haimen-lark", version = "0.1.0" }
 haimen-xiaozhi = { path = "crates/haimen-xiaozhi", version = "0.1.1" }
+univoice = { git = "https://github.com/shenjingnan/univoice", rev = "021113fc9f5159c7a2edf89f48f26c3edb7abc9c", features = ["opus-encoder"] }
+opus2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

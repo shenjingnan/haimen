@@ -27,14 +27,30 @@ pub fn init_logging() {
         .with_target(true)
         .with_filter(EnvFilter::new("info"));
 
-    // stderr 日志层 — 受 RUST_LOG 控制，默认 warn
+    // stderr 日志层 — 受 RUST_LOG 控制，默认 info（方便开发调试）
     let stderr_layer = fmt::layer()
-        .with_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")));
+        .with_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")));
 
     let _ = Registry::default()
         .with(file_layer)
         .with(stderr_layer)
         .try_init();
+
+    // 全局 panic hook：捕获所有 tokio::spawn 任务的 panic 并记录到日志
+    std::panic::set_hook(Box::new(|panic_info| {
+        let msg = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            format!("{:?}", panic_info.payload())
+        };
+        let location = panic_info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<未知位置>".to_string());
+        tracing::error!(panic = %msg, location = %location, "线程崩溃");
+    }));
 }
 
 /// 创建文件日志 writer（可测试）

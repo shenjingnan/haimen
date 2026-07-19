@@ -159,10 +159,8 @@ pub fn extract_text_from_result(result: &CallToolResult) -> String {
     let mut texts = Vec::new();
 
     for content in &result.content {
-        // Content = Annotated<RawContent>
-        let raw_value = serde_json::to_value(&content.raw).unwrap_or_default();
-        if let Some(text) = raw_value.get("text").and_then(|v| v.as_str()) {
-            texts.push(text.to_string());
+        if let Some(text_content) = content.as_text() {
+            texts.push(text_content.text.clone());
         }
     }
 

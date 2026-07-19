@@ -8,6 +8,9 @@ pub mod datetime;
 pub mod gateway;
 pub mod logging;
 pub mod web;
+pub mod xiaozhi_asr_llm_tts;
+pub mod xiaozhi_asr_tts;
+pub mod xiaozhi_tts;
 
 #[cfg(test)]
 pub(crate) mod test_util {
