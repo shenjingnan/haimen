@@ -10,3 +10,12 @@ git_tag_enable = true
 git_tag_name = "v{{ version }}"
 changelog_update = true
 changelog_path = "CHANGELOG.md"
+
+[[package]]
+name = "haimen-core"
+
+[[package]]
+name = "haimen-lark"
+
+[[package]]
+name = "haimen-xiaozhi"
