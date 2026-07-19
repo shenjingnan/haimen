@@ -12,7 +12,8 @@
 //! 例如 Phase 2 将新增 `TtsStrategy`，忽略设备音频，改为 TTS → PCM → Opus 下发。
 
 use async_trait::async_trait;
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::types::{AudioFrame, AudioParams};
 
@@ -132,6 +133,18 @@ pub trait ResponseStrategy: Send + Sync {
             }
         }
         Ok(())
+    }
+
+    // ────────── VAD 端点检测（语音结束信号） ──────────
+
+    /// 返回 VAD 端点通知器
+    ///
+    /// 当 ASR 通过 VAD 检测到用户已说完话时，返回的 Notify 会被触发。
+    /// ws.rs 收到此信号后可提前结束录音，立即进入回放处理阶段。
+    ///
+    /// 返回 `None` 表示不支持 VAD 信号（将依赖安全超时或 Listen::Stop 结束录音）。
+    fn vad_completion(&self) -> Option<Arc<Notify>> {
+        None
     }
 }
 

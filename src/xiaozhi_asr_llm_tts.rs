@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use haimen_xiaozhi::{AudioFrame, AudioParams, ResponseStrategy};
 use opus2::{Channels, Decoder};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use univoice::asr::{
     AsrProvider, AudioInput, AudioStream, BaseProviderOption, DEFAULT_CHUNK_SIZE, DoubaoAsr,
@@ -86,6 +86,8 @@ pub struct AsrLlmTtsStrategy {
     llm_session_id: Mutex<Option<String>>,
     /// 流式 ASR 管道状态（录音期间启用，录音结束时消耗）
     streaming_state: Mutex<Option<AsrPipelineState>>,
+    /// VAD 端点通知器：ASR 检测到用户说完时触发
+    vad_notify: Arc<Notify>,
 }
 
 impl AsrLlmTtsStrategy {
@@ -117,6 +119,7 @@ impl AsrLlmTtsStrategy {
             agent,
             llm_session_id: Mutex::new(None),
             streaming_state: Mutex::new(None),
+            vad_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -284,9 +287,20 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             },
             app_key: Some(app_key),
             access_key: Some(access_token),
-            mode: DoubaoAsrMode::Streaming,
+            // 使用 Async 模式（双向流式优化版）才能支持 VAD 提前判停
+            mode: DoubaoAsrMode::Async,
+            sample_rate: 16000,
+            bits: 16,
+            channel: 1,
+            // 启用二遍识别：VAD 判停后使用 nostream 二次识别，输出 definite: true
+            enable_nonstream: Some(true),
+            // VAD 静音判停阈值：用户停止说话 800ms 后触发
+            end_window_size: Some(800),
             ..Default::default()
         });
+
+        // 复制 VAD 通知器，传入后台任务
+        let vad_notify = self.vad_notify.clone();
 
         // 后台任务：消费 PCM 流，收集 ASR 识别结果
         let asr_handle: tokio::task::JoinHandle<Result<String, String>> =
@@ -298,12 +312,26 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
 
                 let mut full_text = String::new();
                 let mut chunk_count = 0;
+                let mut vad_triggered = false;
 
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(chunk) => {
                             chunk_count += 1;
-                            let tag = if chunk.is_final { "最终" } else { "中间" };
+
+                            // 检测 VAD 端点：segment.confidence >= 0.99 表示 definite utterance
+                            let is_vad_endpoint = chunk
+                                .segment
+                                .as_ref()
+                                .and_then(|s| s.confidence)
+                                .map(|c| c >= 0.99)
+                                .unwrap_or(false);
+
+                            let tag = match (chunk.is_final, is_vad_endpoint) {
+                                (true, _) => "最终",
+                                (false, true) => "VAD",
+                                (false, false) => "中间",
+                            };
                             let display_text = if chunk.text.is_empty() {
                                 "(空)".to_string()
                             } else {
@@ -315,6 +343,13 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                                 chunk_count,
                                 display_text,
                             );
+
+                            // VAD 端点触发 → 通知 ws.rs 结束录音
+                            if is_vad_endpoint && !vad_triggered {
+                                vad_triggered = true;
+                                tracing::info!("🎤 [VAD] 检测到语音结束，通知 ws.rs 开始处理",);
+                                vad_notify.notify_one();
+                            }
 
                             if chunk.is_final && !chunk.text.is_empty() {
                                 full_text.push_str(&chunk.text);
@@ -335,6 +370,8 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 if full_text.is_empty() {
                     Err("ASR 识别结果为空（可能为静音或无有效语音）".to_string())
                 } else {
+                    // VAD 检测到有效语音，通知 ws.rs 结束录音
+                    vad_notify.notify_one();
                     Ok(full_text)
                 }
             });
@@ -411,6 +448,12 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
 
     fn supports_streaming_playback(&self) -> bool {
         true
+    }
+
+    // ────────── VAD 端点检测 ──────────
+
+    fn vad_completion(&self) -> Option<Arc<Notify>> {
+        Some(self.vad_notify.clone())
     }
 
     /// 流式生成 ASR → LLM → TTS 响应并逐帧发送
