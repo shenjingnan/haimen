@@ -1,0 +1,5 @@
+[target.x86_64-pc-windows-msvc]
+# 启用静态 CRT 链接，与 libopus_sys (opus2/univoice) 的 CMake 构建保持一致
+# 避免 __imp_floor 等符号在 MSVC 链接时未解析（LNK2001）
+# 同时生成自包含的二进制文件，无需 VC++ 运行时分发
+rustflags = ["-C", "target-feature=+crt-static"]
