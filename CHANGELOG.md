@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.2](https://github.com/shenjingnan/haimen/compare/v0.2.1...v0.2.2) - 2026-07-19
+
+### Fixed
+
+- 移除 +crt-static 以匹配 libopus_sys 的动态 CRT 使用方式
+- release-plz 使用 PAT_TOKEN 创建 PR 以自动触发 CI workflow
+- 使用 CFLAGS_x86_64_pc_windows_msvc=/MT 替代 CMAKE_MSVC_RUNTIME_LIBRARY 修复 Windows MSVC __imp_floor 链接问题
+- 修复 Windows MSVC 构建时 libopus_sys 链接 __imp_floor 未解析的问题（完整方案） ([#73](https://github.com/shenjingnan/haimen/pull/73))
+- 修复 Windows MSVC 构建时 libopus_sys 链接 __imp_floor 未解析的问题 ([#71](https://github.com/shenjingnan/haimen/pull/71))
+
 ## [0.2.1](https://github.com/shenjingnan/haimen/compare/v0.2.0...v0.2.1) - 2026-07-19
 
 ### Fixed
