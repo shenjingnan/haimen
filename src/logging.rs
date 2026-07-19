@@ -27,9 +27,9 @@ pub fn init_logging() {
         .with_target(true)
         .with_filter(EnvFilter::new("info"));
 
-    // stderr 日志层 — 受 RUST_LOG 控制，默认 warn
+    // stderr 日志层 — 受 RUST_LOG 控制，默认 info（方便开发调试）
     let stderr_layer = fmt::layer()
-        .with_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")));
+        .with_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")));
 
     let _ = Registry::default()
         .with(file_layer)

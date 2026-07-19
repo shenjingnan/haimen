@@ -200,7 +200,7 @@ impl ResponseStrategy for TtsStrategy {
 /// # 返回
 ///
 /// 每个元素为一个裸 Opus 包（无 OGG 容器封装）
-fn pcm_to_opus_frames(
+pub(crate) fn pcm_to_opus_frames(
     pcm: &[u8],
     sample_rate: u32,
     frame_duration_ms: u32,

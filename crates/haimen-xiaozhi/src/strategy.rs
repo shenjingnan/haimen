@@ -12,10 +12,21 @@
 //! 例如 Phase 2 将新增 `TtsStrategy`，忽略设备音频，改为 TTS → PCM → Opus 下发。
 
 use async_trait::async_trait;
+use std::sync::Arc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::types::{AudioFrame, AudioParams};
 
 /// WebSocket 响应策略：决定录音结束后如何生成回放音频
+///
+/// # 流式 ASR 支持
+///
+/// 实现 [`supports_streaming_asr`] 返回 `true` 的策略可以启用流式 ASR 管道：
+/// - [`on_recording_start`] — 在录音开始时被调用，用于启动 ASR 管道
+/// - [`on_audio_frame`] — 每收到一帧 Opus 数据时被调用，策略可在此处解码并喂给 ASR
+/// - [`generate_response`] — 录音结束时调用，对于流式策略此时 ASR 结果已就绪
+///
+/// 默认实现（Echo、TTS 等）的钩子均为 no-op，不受影响。
 #[async_trait]
 pub trait ResponseStrategy: Send + Sync {
     /// 策略名称（用于日志和诊断）
@@ -40,6 +51,8 @@ pub trait ResponseStrategy: Send + Sync {
     /// * `audio_buffer` — 设备录音阶段缓冲的音频帧
     ///   - [`EchoStrategy`] 使用这些帧原样回传
     ///   - `TtsStrategy` 将忽略此参数，改从 TTS 生成
+    ///   - 流式 ASR 策略（如 `AsrLlmTtsStrategy`）也将忽略此参数，
+    ///     因为音频已在 [`on_audio_frame`] 中实时处理
     /// * `session_id` — 当前 WebSocket 会话 ID，用于日志和状态关联
     ///
     /// # 返回
@@ -51,6 +64,88 @@ pub trait ResponseStrategy: Send + Sync {
         audio_buffer: Vec<AudioFrame>,
         session_id: &str,
     ) -> Result<Vec<AudioFrame>, String>;
+
+    // ────────── 流式 ASR 钩子（可选覆盖） ──────────
+
+    /// 策略是否支持流式 ASR（录音期间实时识别）
+    ///
+    /// 返回 `true` 时，[`on_recording_start`] 和 [`on_audio_frame`] 将在录音期间被调用。
+    /// 默认返回 `false`。
+    fn supports_streaming_asr(&self) -> bool {
+        false
+    }
+
+    /// 录音开始时调用（仅当 [`supports_streaming_asr`] 返回 `true` 时）
+    ///
+    /// 流式策略应在此方法中启动 ASR WebSocket 管道。
+    /// 默认实现为 no-op。
+    async fn on_recording_start(&self, _session_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// 每收到一帧 Opus 数据时调用（仅当 [`supports_streaming_asr`] 返回 `true` 时）
+    ///
+    /// 流式策略应在此方法中解码 Opus 帧并喂入 ASR 管道。
+    /// 注意：即使支持流式 ASR，音频仍会缓冲在 `audio_buffer` 中，
+    /// 供 [`generate_response`] 在需要时使用（如作为后备）。
+    /// 默认实现为 no-op。
+    async fn on_audio_frame(&self, _frame: &AudioFrame) -> Result<(), String> {
+        Ok(())
+    }
+
+    // ────────── 流式回放（边合成边播放） ──────────
+
+    /// 策略是否支持流式回放（边合成边播放）
+    ///
+    /// 返回 `true` 时，[`generate_response_stream`] 将替代 [`generate_response`] 被调用，
+    /// 通过 `frame_tx` 逐帧发送生成的音频，ws.rs 收到帧后立即发给设备。
+    /// 默认返回 `false`。
+    fn supports_streaming_playback(&self) -> bool {
+        false
+    }
+
+    /// 流式生成音频帧并发送到回放管道
+    ///
+    /// 与 [`generate_response`] 不同，此方法不返回所有帧，而是通过 `frame_tx`
+    /// 逐帧发送生成的音频。调用方在 `frame_tx` 的 Receiver 端逐帧读取并发送给设备。
+    ///
+    /// # 参数
+    ///
+    /// * `audio_buffer` — 设备录音阶段缓冲的音频帧
+    /// * `session_id` — 当前 WebSocket 会话 ID
+    /// * `frame_tx` — 音频帧发送端，实现边合成边播放
+    ///
+    /// # 约定
+    ///
+    /// - 方法返回时，`frame_tx` 已被 drop（Receiver 端收到 None）
+    /// - 返回前应确保所有必要的帧已发送完毕
+    /// - 默认实现调用 [`generate_response`] 后逐帧发送
+    async fn generate_response_stream(
+        &self,
+        audio_buffer: Vec<AudioFrame>,
+        session_id: &str,
+        frame_tx: mpsc::Sender<AudioFrame>,
+    ) -> Result<(), String> {
+        let frames = self.generate_response(audio_buffer, session_id).await?;
+        for frame in frames {
+            if frame_tx.send(frame).await.is_err() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    // ────────── VAD 端点检测（语音结束信号） ──────────
+
+    /// 返回 VAD 端点通知器
+    ///
+    /// 当 ASR 通过 VAD 检测到用户已说完话时，返回的 Notify 会被触发。
+    /// ws.rs 收到此信号后可提前结束录音，立即进入回放处理阶段。
+    ///
+    /// 返回 `None` 表示不支持 VAD 信号（将依赖安全超时或 Listen::Stop 结束录音）。
+    fn vad_completion(&self) -> Option<Arc<Notify>> {
+        None
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -208,5 +303,45 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), buffer);
+    }
+
+    // ─── 流式 ASR 钩子默认行为（no-op） ──────────────────
+
+    #[test]
+    fn test_t10_streaming_defaults() {
+        let strategy = EchoStrategy;
+        assert!(
+            !strategy.supports_streaming_asr(),
+            "Echo 策略应不支持流式 ASR"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_t11_on_recording_start_noop() {
+        let strategy = EchoStrategy;
+        let result = strategy.on_recording_start("test-session").await;
+        assert!(result.is_ok(), "默认 on_recording_start 应为 Ok(())");
+    }
+
+    #[tokio::test]
+    async fn test_t12_on_audio_frame_noop() {
+        let strategy = EchoStrategy;
+        let frame = make_frame(0, &[0x01, 0x02]);
+        let result = strategy.on_audio_frame(&frame).await;
+        assert!(result.is_ok(), "默认 on_audio_frame 应为 Ok(())");
+    }
+
+    /// 通过 trait object 调用流式钩子确保分发正确
+    #[tokio::test]
+    async fn test_t13_streaming_hooks_via_trait_object() {
+        let strategy: Arc<dyn ResponseStrategy> = Arc::new(EchoStrategy);
+        assert!(!strategy.supports_streaming_asr());
+
+        let result = strategy.on_recording_start("test-session").await;
+        assert!(result.is_ok());
+
+        let frame = make_frame(0, &[0x01]);
+        let result = strategy.on_audio_frame(&frame).await;
+        assert!(result.is_ok());
     }
 }

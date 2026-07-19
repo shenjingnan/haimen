@@ -128,13 +128,26 @@ async fn handle_ws_connection(
 
     // ── 消息循环 ──
     loop {
-        // 录音状态下，用 select! 竞争消息和 5 秒超时
+        // 录音状态下，用 select! 竞争消息、VAD 完成信号和安全超时
         let msg = if session.state == SessionState::Recording {
-            // 使用 Recording 启动时保存的截止时刻，确保 5 秒固定时长
             let deadline = session
                 .recording_deadline
-                .unwrap_or_else(|| Instant::now() + Duration::from_secs(5));
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
             let tokio_deadline = tokio::time::Instant::from_std(deadline);
+
+            // 获取 VAD 完成信号（如果策略支持流式 ASR + VAD）
+            let vad_completion = session.strategy.vad_completion();
+            let has_vad = vad_completion.is_some();
+
+            // VAD 等待 future（需在 select! 前 pin 住）
+            let vad_fut = async move {
+                if let Some(notify) = vad_completion {
+                    notify.notified().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::pin!(vad_fut);
 
             tokio::select! {
                 msg = socket.recv() => msg,
@@ -142,7 +155,17 @@ async fn handle_ws_connection(
                     tracing::info!(
                         device_id = %session.device_id,
                         strategy = session.strategy.name(),
-                        "Recording 5s timeout, triggering strategy playback",
+                        "Recording safety timeout (30s), triggering strategy playback",
+                    );
+                    session.recording_deadline = None;
+                    strategy_playback(&mut socket, &mut session).await;
+                    continue;
+                }
+                _ = &mut vad_fut, if has_vad => {
+                    tracing::info!(
+                        device_id = %session.device_id,
+                        strategy = session.strategy.name(),
+                        "VAD detected end of speech, triggering strategy playback",
                     );
                     session.recording_deadline = None;
                     strategy_playback(&mut socket, &mut session).await;
@@ -256,8 +279,24 @@ async fn handle_listen(
             );
             session.audio_buffer.clear();
             session.cumulated_timestamp = 0;
-            session.recording_deadline = Some(Instant::now() + Duration::from_secs(5));
+            session.recording_deadline = None;
             session.state = SessionState::Recording;
+
+            // 如果策略支持流式 ASR，通知其录音开始
+            if session.strategy.supports_streaming_asr() {
+                if let Err(e) = session
+                    .strategy
+                    .on_recording_start(&session.session_id)
+                    .await
+                {
+                    tracing::warn!(
+                        device_id = %session.device_id,
+                        session_id = %session.session_id,
+                        error = %e,
+                        "Streaming ASR on_recording_start 失败，将继续使用批处理模式",
+                    );
+                }
+            }
         }
         ListenState::Stop => {
             tracing::debug!(
@@ -331,10 +370,23 @@ async fn buffer_audio(data: &[u8], socket: &mut WebSocket, session: &mut Session
                     (ts, data)
                 }
             };
-            session.audio_buffer.push(AudioFrame {
+            let frame = AudioFrame {
                 timestamp,
                 data: payload,
-            });
+            };
+
+            // 如果策略支持流式 ASR，将帧实时喂入 ASR 管道
+            if session.strategy.supports_streaming_asr() {
+                if let Err(e) = session.strategy.on_audio_frame(&frame).await {
+                    tracing::warn!(
+                        device_id = %session.device_id,
+                        error = %e,
+                        "Streaming ASR on_audio_frame 失败，将继续缓冲音频",
+                    );
+                }
+            }
+
+            session.audio_buffer.push(frame);
         }
         Err(ProtocolError::UnknownProtocol) => {
             let _ = send_json(
@@ -477,31 +529,239 @@ async fn playback_frames(socket: &mut WebSocket, session: &mut Session, frames: 
 
 /// 策略回放：通过当前策略生成音频帧并发送给设备
 ///
-/// 1. 取出缓冲的音频帧
-/// 2. 调用策略的 `generate_response` 生成回放帧
-/// 3. 使用 `playback_frames` 发送
+/// 根据策略能力自动选择：
+/// - 流式回放（边合成边播放）→ [`generate_response_stream`] + [`playback_frames_stream`]
+/// - 批处理回放 → [`generate_response`] + [`playback_frames`]
 async fn strategy_playback(socket: &mut WebSocket, session: &mut Session) {
     session.recording_deadline = None;
     let buffer = std::mem::take(&mut session.audio_buffer);
 
-    match session
-        .strategy
-        .generate_response(buffer, &session.session_id)
-        .await
-    {
-        Ok(frames) => {
-            playback_frames(socket, session, frames).await;
-        }
-        Err(e) => {
-            tracing::warn!(
-                device_id = %session.device_id,
-                strategy = session.strategy.name(),
-                error = %e,
-                "Strategy failed to generate response",
-            );
-            session.state = SessionState::Ready;
+    if session.strategy.supports_streaming_playback() {
+        // ── 流式回放路径 ──
+        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<AudioFrame>(16);
+        let strategy = session.strategy.clone();
+        let session_id = session.session_id.clone();
+
+        // 后台生成音频帧
+        let gen_handle: tokio::task::JoinHandle<Result<(), String>> = tokio::spawn(async move {
+            strategy
+                .generate_response_stream(buffer, &session_id, frame_tx)
+                .await
+        });
+
+        // 逐帧播放
+        playback_frames_stream(socket, session, frame_rx, gen_handle).await;
+    } else {
+        // ── 批处理回放路径 ──
+        match session
+            .strategy
+            .generate_response(buffer, &session.session_id)
+            .await
+        {
+            Ok(frames) => {
+                playback_frames(socket, session, frames).await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    device_id = %session.device_id,
+                    strategy = session.strategy.name(),
+                    error = %e,
+                    "Strategy failed to generate response",
+                );
+                session.state = SessionState::Ready;
+            }
         }
     }
+}
+
+/// 流式回放：从 channel 逐帧读取音频帧并发送给设备
+///
+/// 与 [`playback_frames`] 功能相同（含中断处理），但帧是边生成边到达的。
+///
+/// 包含预缓冲机制：在开始播放前先收集一定数量的帧，
+/// 确保播放启动后帧供给平滑，避免因帧到达延迟导致的卡顿。
+///
+/// # 参数
+///
+/// * `socket` — WebSocket 连接
+/// * `session` — 当前会话
+/// * `frame_rx` — 接收端，音频帧逐个到达
+/// * `gen_handle` — 后台生成任务，用于等待生成完成和检测错误
+async fn playback_frames_stream(
+    socket: &mut WebSocket,
+    session: &mut Session,
+    mut frame_rx: tokio::sync::mpsc::Receiver<AudioFrame>,
+    mut gen_handle: tokio::task::JoinHandle<Result<(), String>>,
+) {
+    session.state = SessionState::Playing;
+
+    // ── Phase 1: 预缓冲 ─────────────────────────────────────────
+    // 在开始播放前先收集若干帧，给 TTS 生成足够的 head start
+    // 10 帧 × 60ms = 600ms 预缓冲，在设备播放完这 600ms 内容之前
+    // TTS 有充足时间生成后续音频
+
+    const PREBUFFER_COUNT: usize = 10;
+    let mut prebuffer: Vec<AudioFrame> = Vec::with_capacity(PREBUFFER_COUNT);
+    let mut gen_done = false;
+
+    while prebuffer.len() < PREBUFFER_COUNT {
+        tokio::select! {
+            frame = frame_rx.recv() => {
+                match frame {
+                    Some(frame) => prebuffer.push(frame),
+                    None => {
+                        // 生成任务已经结束，不管预缓冲了多少帧都直接播放
+                        break;
+                    }
+                }
+            }
+            result = &mut gen_handle => {
+                gen_done = true;
+                match result {
+                    Ok(Ok(())) => {
+                        // 生成正常完成
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Streaming generation error during prebuffer",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Streaming generation task panicked during prebuffer",
+                        );
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    if prebuffer.is_empty() {
+        tracing::warn!("Prebuffer is empty, skipping playback");
+        session.state = SessionState::Ready;
+        return;
+    }
+
+    // ── Phase 2: 开始播放 + 发送预缓冲帧 ───────────────────────
+
+    // 发送 TTS::Start
+    if send_json(
+        socket,
+        &ServerMessage::Tts {
+            session_id: session.session_id.clone(),
+            state: TtsState::Start,
+            text: None,
+        },
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!("Failed to send TTS::Start, aborting streaming playback");
+        session.state = SessionState::Ready;
+        return;
+    }
+
+    let mut frame_count: usize = 0;
+
+    // 预缓冲帧全部立即发送（免延迟）
+    for frame in &prebuffer {
+        let encoded = encode_protocol2(&frame.data, frame.timestamp);
+        if socket.send(Message::Binary(encoded.into())).await.is_err() {
+            tracing::warn!("Streaming playback: connection lost during prebuffer send");
+            session.state = SessionState::Ready;
+            return;
+        }
+        frame_count += 1;
+    }
+
+    tracing::debug!(
+        device_id = %session.device_id,
+        prebuffer = prebuffer.len(),
+        "Prebuffer sent, starting steady-state playback",
+    );
+
+    // ── Phase 3: 稳态播放 ──────────────────────────────────────
+    // 预缓冲帧已发出，设备有 600ms 的音频可播放。
+    // 后续帧按 60ms 间隔逐个发送，保持与设备播放节奏同步。
+    // 因为有预缓冲做 head start，即使个别帧迟到几毫秒也不会卡顿。
+
+    loop {
+        tokio::select! {
+            frame = frame_rx.recv(), if !gen_done => {
+                match frame {
+                    Some(frame) => {
+                        frame_count += 1;
+
+                        let encoded = encode_protocol2(&frame.data, frame.timestamp);
+                        if socket.send(Message::Binary(encoded.into())).await.is_err() {
+                            tracing::warn!("Streaming playback: connection lost");
+                            session.state = SessionState::Ready;
+                            return;
+                        }
+
+                        // 60ms 帧间隔 + 中断监听（与批处理模式一致）
+                        if interruptible_sleep(socket, session).await {
+                            session.state = SessionState::Ready;
+                            return;
+                        }
+                    }
+                    None => {
+                        gen_done = true;
+                    }
+                }
+            }
+            result = &mut gen_handle, if !gen_done => {
+                gen_done = true;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "Streaming generation error (draining)");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Streaming generation panicked");
+                    }
+                }
+            }
+        }
+
+        if gen_done {
+            // Drain 剩余帧（仍在 channel 中的已完成帧）
+            while let Some(frame) = frame_rx.recv().await {
+                frame_count += 1;
+                let encoded = encode_protocol2(&frame.data, frame.timestamp);
+                if socket.send(Message::Binary(encoded.into())).await.is_err() {
+                    break;
+                }
+                if interruptible_sleep(socket, session).await {
+                    session.state = SessionState::Ready;
+                    return;
+                }
+            }
+            break;
+        }
+    }
+
+    // 发送 TTS::Stop
+    let _ = send_json(
+        socket,
+        &ServerMessage::Tts {
+            session_id: session.session_id.clone(),
+            state: TtsState::Stop,
+            text: None,
+        },
+    )
+    .await;
+
+    session.state = SessionState::Ready;
+    tracing::debug!(
+        device_id = %session.device_id,
+        frame_count = frame_count,
+        strategy = session.strategy.name(),
+        "Streaming playback completed",
+    );
 }
 
 // ─── 工具函数 ──────────────────────────────────────────────
@@ -515,4 +775,44 @@ async fn send_json(socket: &mut WebSocket, msg: &ServerMessage) -> Result<(), ()
         tracing::warn!(error = %e, "Failed to send WebSocket message");
     })?;
     Ok(())
+}
+
+/// 等待 60ms 帧间隔，同时监听设备中断信号
+///
+/// 返回 `true` 表示需要中断播放
+async fn interruptible_sleep(socket: &mut WebSocket, session: &mut Session) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_millis(60)) => {
+            false // 正常等待，继续播放
+        }
+        msg = socket.recv() => {
+            match msg {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(cmd) = serde_json::from_str::<ClientMessage>(&text) {
+                        if matches!(cmd, ClientMessage::Listen { state: ListenState::Start, .. } | ClientMessage::Abort) {
+                            tracing::debug!("Playback interrupted by client command");
+                            let _ = send_json(
+                                socket,
+                                &ServerMessage::Tts {
+                                    session_id: session.session_id.clone(),
+                                    state: TtsState::Stop,
+                                    text: None,
+                                },
+                            )
+                            .await;
+                            session.state = SessionState::Ready;
+                            return true;
+                        }
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+                    tracing::debug!("Connection closed during playback");
+                    session.state = SessionState::Ready;
+                    return true;
+                }
+                _ => {}
+            }
+            false
+        }
+    }
 }
