@@ -239,40 +239,13 @@ impl AsrLlmTtsStrategy {
 
         Ok(Some(text))
     }
-}
 
-#[async_trait]
-impl ResponseStrategy for AsrLlmTtsStrategy {
-    fn name(&self) -> &'static str {
-        "asr-llm-tts"
-    }
-
-    /// 告知设备使用 24000Hz 播放（匹配 TTS 引擎输出）
-    fn hello_audio_params(&self, _client_params: &AudioParams) -> AudioParams {
-        AudioParams {
-            format: "opus".into(),
-            sample_rate: 24000,
-            channels: 1,
-            frame_duration: 60,
-        }
-    }
-
-    // ────────── 流式 ASR 支持 ──────────
-
-    fn supports_streaming_asr(&self) -> bool {
-        true
-    }
-
-    /// 录音开始时启动流式 ASR 管道
+    /// 初始化流式 ASR 管道（惰性创建）
     ///
-    /// 创建 Opus 解码器 + mpsc channel，后台启动 Doubao ASR `listen_stream`，
-    /// 等待 `on_audio_frame` 推入解码后的 PCM 数据。
-    async fn on_recording_start(&self, session_id: &str) -> Result<(), String> {
-        tracing::info!(
-            session_id = %session_id,
-            "流式 ASR: 启动双向流式管道",
-        );
-
+    /// 创建 mpsc channel + Doubao ASR 实例 + Opus 解码器，
+    /// 后台启动 `listen_stream` 消费 PCM 流并收集识别结果。
+    /// 管道状态存入 `streaming_state` 供 `on_audio_frame` 喂入音频。
+    async fn init_asr_pipeline(&self) -> Result<(), String> {
         let app_key = self.app_key.clone();
         let access_token = self.access_token.clone();
 
@@ -287,22 +260,17 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             },
             app_key: Some(app_key),
             access_key: Some(access_token),
-            // 使用 Async 模式（双向流式优化版）才能支持 VAD 提前判停
             mode: DoubaoAsrMode::Async,
             sample_rate: 16000,
             bits: 16,
             channel: 1,
-            // 启用二遍识别：VAD 判停后使用 nostream 二次识别，输出 definite: true
             enable_nonstream: Some(true),
-            // VAD 静音判停阈值：用户停止说话 800ms 后触发
             end_window_size: Some(800),
             ..Default::default()
         });
 
-        // 复制 VAD 通知器，传入后台任务
         let vad_notify = self.vad_notify.clone();
 
-        // 后台任务：消费 PCM 流，收集 ASR 识别结果
         let asr_handle: tokio::task::JoinHandle<Result<String, String>> =
             tokio::spawn(async move {
                 let mut stream = asr
@@ -319,7 +287,6 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                         Ok(chunk) => {
                             chunk_count += 1;
 
-                            // 检测 VAD 端点：segment.confidence >= 0.99 表示 definite utterance
                             let is_vad_endpoint = chunk
                                 .segment
                                 .as_ref()
@@ -344,7 +311,6 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                                 display_text,
                             );
 
-                            // VAD 端点触发 → 通知 ws.rs 结束录音
                             if is_vad_endpoint && !vad_triggered {
                                 vad_triggered = true;
                                 tracing::info!("🎤 [VAD] 检测到语音结束，通知 ws.rs 开始处理",);
@@ -370,13 +336,10 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 if full_text.is_empty() {
                     Err("ASR 识别结果为空（可能为静音或无有效语音）".to_string())
                 } else {
-                    // VAD 检测到有效语音，通知 ws.rs 结束录音
-                    vad_notify.notify_one();
                     Ok(full_text)
                 }
             });
 
-        // 创建会话级 Opus 解码器
         let sample_rate: u32 = 16000;
         let frame_duration_ms: u32 = 60;
         let frame_samples: usize = (sample_rate as u64 * frame_duration_ms as u64 / 1000) as usize;
@@ -397,18 +360,72 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             .map_err(|e| format!("锁获取失败: {}", e))?;
         *guard = Some(state);
 
+        tracing::info!("流式 ASR: 管道已就绪（惰性初始化）");
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ResponseStrategy for AsrLlmTtsStrategy {
+    fn name(&self) -> &'static str {
+        "asr-llm-tts"
+    }
+
+    /// 告知设备使用 24000Hz 播放（匹配 TTS 引擎输出）
+    fn hello_audio_params(&self, _client_params: &AudioParams) -> AudioParams {
+        AudioParams {
+            format: "opus".into(),
+            sample_rate: 24000,
+            channels: 1,
+            frame_duration: 60,
+        }
+    }
+
+    // ────────── 流式 ASR 支持 ──────────
+
+    fn supports_streaming_asr(&self) -> bool {
+        true
+    }
+
+    /// 录音开始时清空管道状态
+    ///
+    /// ASR 管道不会在此处创建，而是延迟到 `on_audio_frame` 收到第一帧音频时
+    /// 通过 `init_asr_pipeline` 惰性初始化。这样可以避免在用户尚未说话时
+    /// 建立 ASR 连接导致服务端对空音频返回误判的 VAD 端点。
+    async fn on_recording_start(&self, session_id: &str) -> Result<(), String> {
         tracing::info!(
             session_id = %session_id,
-            "流式 ASR: 管道已就绪",
+            "流式 ASR: 清空管道状态（惰性初始化）",
         );
+
+        let mut guard = self
+            .streaming_state
+            .lock()
+            .map_err(|e| format!("锁获取失败: {}", e))?;
+        *guard = None;
 
         Ok(())
     }
 
     /// 每收到一帧 Opus 数据时，实时解码并喂入 ASR 管道
+    ///
+    /// 如果 ASR 管道尚未初始化（惰性），第一帧音频到达时会自动创建。
+    /// 这样确保 ASR WebSocket 连接只在用户真正说话时建立。
     async fn on_audio_frame(&self, frame: &AudioFrame) -> Result<(), String> {
         if frame.data.is_empty() {
             return Ok(());
+        }
+
+        // 惰性初始化：第一帧音频到达时才创建 ASR 管道
+        let needs_init = self
+            .streaming_state
+            .lock()
+            .map_err(|e| format!("锁获取失败: {}", e))?
+            .is_none();
+        if needs_init {
+            tracing::info!("流式 ASR: 第一帧音频到达，惰性初始化管道");
+            self.init_asr_pipeline().await?;
         }
 
         // 在锁内完成解码，提取 pcm_bytes 和 pcm_tx 后释放锁
