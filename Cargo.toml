@@ -14,6 +14,16 @@ rust-version = "1.85"
 description = "AI 网关基建 CLI"
 license = "MIT"
 repository = "https://github.com/shenjingnan/haimen"
+include = [
+    "/src/**/*",
+    "/crates/**/*",
+    "/build.rs",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE*",
+    "/README.md",
+    "/web-ui/dist/**/*",
+]
 
 [workspace.dependencies]
 # CLI 框架
