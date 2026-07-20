@@ -5,14 +5,18 @@ pub mod provider;
 pub mod session;
 pub mod webhook;
 
+use std::sync::Arc;
+
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::agents::claude_code::agent::ClaudeAgent;
 use crate::config::settings::load_settings;
 use crate::connectors::dingtalk::channel::DingTalkChannel;
+use crate::connectors::github::GitHubConnector;
 use crate::gateway::channel::MessageChannel;
 use crate::gateway::provider::AgentProvider;
+use crate::gateway::webhook::WebhookState;
 use haimen_lark::LarkChannel;
 
 /// 构建后的连接器列表类型
@@ -61,102 +65,211 @@ pub fn build_agent(
     }
 }
 
-/// 统一入口：启动所有启用的连接器 + Agent
+/// 根据配置和环境变量构造 xiaozhi WebSocket 响应策略
+///
+/// 默认使用 ASR-LLM-TTS 模式（语音识别 → Claude Code 处理 → 语音合成）。
+/// 需要设置 `DOUBAO_APP_KEY` 和 `DOUBAO_ACCESS_TOKEN` 环境变量。
+/// 环境变量缺失时跳过 xiaozhi 路由（不挂载）。
+fn build_xiaozhi_strategy() -> Option<Arc<dyn haimen_xiaozhi::ResponseStrategy>> {
+    let (app_key, access_token) = match (
+        std::env::var("DOUBAO_APP_KEY"),
+        std::env::var("DOUBAO_ACCESS_TOKEN"),
+    ) {
+        (Ok(key), Ok(token)) => (key, token),
+        _ => {
+            tracing::info!("未设置 DOUBAO_APP_KEY / DOUBAO_ACCESS_TOKEN，xiaozhi WebSocket 不启动");
+            return None;
+        }
+    };
+
+    let llm_agent: Arc<dyn AgentProvider> = Arc::new(ClaudeAgent);
+    Some(Arc::new(
+        crate::xiaozhi_asr_llm_tts::AsrLlmTtsStrategy::new(
+            app_key,
+            access_token,
+            None, // 默认音色
+            llm_agent,
+        ),
+    ))
+}
+
+/// 统一入口：启动所有启用的连接器 + Agent + HTTP 服务器
+///
+/// 启动后一切就绪：
+/// - IM 连接器（飞书/Lark、钉钉等）监听消息
+/// - HTTP 服务器提供 Web 控制台 + xiaozhi WebSocket + GitHub Webhook
+/// - AI Agent 就绪等待处理
 ///
 /// 流程：
-/// 1. 构建连接器
-/// 2. 构建 Agent
-/// 3. 各连接器健康检查（并行，失败的跳过）
-/// 4. 创建 CancellationToken + 启动信号监听
-/// 5. 运行多连接器事件循环（pump task + mpsc 架构）
+/// 1. 构建连接器和 Agent
+/// 2. 各连接器健康检查（并行，失败的跳过）
+/// 3. 创建 CancellationToken + 启动信号监听
+/// 4. 启动 HTTP 服务器（后台任务）
+/// 5. 运行多连接器事件循环
 pub async fn start_all() -> Result<(), String> {
     let config = load_settings().ok().flatten().unwrap_or_default();
 
     let all_connectors = build_connectors(&config)?;
-    let agent = build_agent(&config)?;
+    let has_connectors = !all_connectors.is_empty();
 
-    if all_connectors.is_empty() {
-        tracing::info!("没有启用的连接器");
+    // 即使没有连接器，只要 HTTP 服务器启用就继续
+    if !has_connectors && !config.http.enabled {
+        tracing::info!("没有启用的连接器，也没有启用 HTTP 服务器");
         return Ok(());
     }
-
-    // 并行健康检查，收集健康的连接器名
-    let healthy: Vec<String> =
-        futures_util::future::join_all(all_connectors.iter().map(|(name, ch)| {
-            let name = name.clone();
-            async move {
-                match ch.health_check().await {
-                    Ok(_) => {
-                        tracing::info!(connector = %name, "健康检查通过");
-                        Some(name)
-                    }
-                    Err(e) => {
-                        tracing::warn!(connector = %name, error = %e, "健康检查失败，跳过");
-                        None
-                    }
-                }
-            }
-        }))
-        .await
-        .into_iter()
-        .flatten()
-        .collect();
-
-    if healthy.is_empty() {
-        tracing::warn!("所有连接器健康检查均失败，无法启动网关");
-        return Ok(());
-    }
-
-    // 对健康的连接器构建通道实例（直接传入 run_unified_gateway，不再在此处 listen）
-    let config = load_settings().ok().flatten().unwrap_or_default();
-
-    let mut channels: ConnectorVec = Vec::new();
-    for name in &healthy {
-        let ch = match name.as_str() {
-            "lark" => {
-                let cfg = config
-                    .connectors
-                    .lark
-                    .as_ref()
-                    .ok_or_else(|| "Lark 配置不存在".to_string())?;
-                Box::new(LarkChannel::new(&cfg.lark_cli_path)) as Box<dyn MessageChannel>
-            }
-            "dingtalk" => {
-                let cfg = config
-                    .connectors
-                    .dingtalk
-                    .clone()
-                    .ok_or_else(|| "DingTalk 配置不存在".to_string())?;
-                Box::new(DingTalkChannel::new(cfg.into())) as Box<dyn MessageChannel>
-            }
-            other => return Err(format!("不支持的连接器: {}", other)),
-        };
-        channels.push((name.clone(), ch));
-    }
-
-    agent.check_available().await?;
-
-    tracing::info!(
-        "网关已启动，活跃连接器: {:?}",
-        channels
-            .iter()
-            .map(|(n, _)| n.as_str())
-            .collect::<Vec<&str>>()
-    );
 
     // 创建 CancellationToken 并启动信号监听
     let cancel = CancellationToken::new();
     let signal_cancel = cancel.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
-        tracing::info!("收到关闭信号，正在停止网关...");
+        tracing::info!("收到关闭信号，正在停止所有服务...");
         signal_cancel.cancel();
     });
 
-    let result = chat_loop::run_unified_gateway(channels, &*agent, &config.gateway, cancel).await;
+    // 启动 HTTP 服务器（xiaozhi + GitHub Webhook + Web 控制台）
+    let http_handle = if config.http.enabled {
+        let http_cancel = cancel.clone();
+        let serve_config = crate::web::ServeConfig {
+            host: config.http.host.clone(),
+            port: config.http.port,
+        };
 
-    tracing::info!("网关已停止");
-    result
+        // GitHub Webhook（可选）
+        let webhook_state = config.github.clone().map(|cfg| {
+            let gh_agent: Arc<dyn AgentProvider> = Arc::new(ClaudeAgent);
+            let connector = GitHubConnector::new(cfg, gh_agent);
+            WebhookState {
+                github: Some(Arc::new(connector)),
+            }
+        });
+
+        let xiaozhi_strategy = build_xiaozhi_strategy();
+
+        tracing::info!(
+            "HTTP 服务器启动于 {}:{}{}",
+            serve_config.host,
+            serve_config.port,
+            if xiaozhi_strategy.is_some() {
+                "（含 xiaozhi 语音通道）"
+            } else {
+                ""
+            }
+        );
+
+        let handle = tokio::spawn(async move {
+            let result =
+                crate::web::start(serve_config, webhook_state, xiaozhi_strategy, http_cancel).await;
+            if let Err(ref e) = result {
+                tracing::error!(error = %e, "HTTP 服务器退出");
+            }
+            result
+        });
+
+        Some(handle)
+    } else {
+        None
+    };
+
+    // 运行网关（仅当有连接器时）
+    if has_connectors {
+        let agent = build_agent(&config)?;
+
+        // 并行健康检查，收集健康的连接器名
+        let healthy: Vec<String> =
+            futures_util::future::join_all(all_connectors.iter().map(|(name, ch)| {
+                let name = name.clone();
+                async move {
+                    match ch.health_check().await {
+                        Ok(_) => {
+                            tracing::info!(connector = %name, "健康检查通过");
+                            Some(name)
+                        }
+                        Err(e) => {
+                            tracing::warn!(connector = %name, error = %e, "健康检查失败，跳过");
+                            None
+                        }
+                    }
+                }
+            }))
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+
+        if healthy.is_empty() {
+            tracing::warn!("所有连接器健康检查均失败，无法启动网关");
+            // HTTP 服务器仍在运行，等待信号
+            cancel.cancelled().await;
+            if let Some(handle) = http_handle {
+                let _ = handle.await;
+            }
+            return Ok(());
+        }
+
+        // 对健康的连接器构建通道实例
+        let config = load_settings().ok().flatten().unwrap_or_default();
+
+        let mut channels: ConnectorVec = Vec::new();
+        for name in &healthy {
+            let ch = match name.as_str() {
+                "lark" => {
+                    let cfg = config
+                        .connectors
+                        .lark
+                        .as_ref()
+                        .ok_or_else(|| "Lark 配置不存在".to_string())?;
+                    Box::new(LarkChannel::new(&cfg.lark_cli_path)) as Box<dyn MessageChannel>
+                }
+                "dingtalk" => {
+                    let cfg = config
+                        .connectors
+                        .dingtalk
+                        .clone()
+                        .ok_or_else(|| "DingTalk 配置不存在".to_string())?;
+                    Box::new(DingTalkChannel::new(cfg.into())) as Box<dyn MessageChannel>
+                }
+                other => return Err(format!("不支持的连接器: {}", other)),
+            };
+            channels.push((name.clone(), ch));
+        }
+
+        agent.check_available().await?;
+
+        tracing::info!(
+            "haimen 已启动 — 连接器: {:?}, HTTP: {}, Agent: {}",
+            channels
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<&str>>(),
+            if config.http.enabled { "是" } else { "否" },
+            agent.name(),
+        );
+
+        let result =
+            chat_loop::run_unified_gateway(channels, &*agent, &config.gateway, cancel.clone())
+                .await;
+
+        // 网关已停止，触发 HTTP 服务器关闭
+        cancel.cancel();
+
+        if let Some(handle) = http_handle {
+            let _ = handle.await;
+        }
+
+        tracing::info!("所有服务已停止");
+        result
+    } else {
+        // 没有连接器，仅 HTTP 服务器运行，等待信号
+        tracing::info!("haimen 已启动 — HTTP 服务器运行中（xiaozhi + Web 控制台）");
+        cancel.cancelled().await;
+
+        if let Some(handle) = http_handle {
+            let _ = handle.await;
+        }
+
+        Ok(())
+    }
 }
 
 /// 等待 SIGINT（Ctrl+C）或 SIGTERM 用于优雅关闭
