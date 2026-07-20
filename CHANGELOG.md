@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/shenjingnan/haimen/compare/v0.3.0...v0.4.0) - 2026-07-20
+
+### Added
+
+- *(build)* cargo build 时自动构建 Web UI 前端并嵌入二进制 ([#88](https://github.com/shenjingnan/haimen/pull/88))
+- *(start)* haimen start 自动启动 HTTP 服务器（Web 控制台 + xiaozhi + GitHub Webhook） ([#86](https://github.com/shenjingnan/haimen/pull/86))
+
 ## [0.3.0](https://github.com/shenjingnan/haimen/compare/v0.2.2...v0.3.0) - 2026-07-20
 
 ### Added
