@@ -2,6 +2,9 @@ pub mod api;
 pub mod r#static;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+
+use tokio_util::sync::CancellationToken;
 
 use crate::gateway::webhook::WebhookState;
 
@@ -14,37 +17,39 @@ pub struct ServeConfig {
 /// 启动 HTTP 服务器
 ///
 /// - `config`: 服务器地址配置
-/// - `webhook_state`: 可选的 Webhook 处理器
-/// - `xiaozhi_strategy`: xiaozhi WebSocket 响应策略
+/// - `webhook_state`: 可选的 Webhook 处理器（GitHub Webhook）
+/// - `xiaozhi_strategy`: 可选的 xiaozhi WebSocket 响应策略，为 None 时不挂载 xiaozhi 路由
+/// - `cancel`: 共享取消令牌，收到取消信号时触发优雅关闭
 pub async fn start(
     config: ServeConfig,
     webhook_state: Option<WebhookState>,
-    xiaozhi_strategy: std::sync::Arc<dyn haimen_xiaozhi::ResponseStrategy>,
+    xiaozhi_strategy: Option<Arc<dyn haimen_xiaozhi::ResponseStrategy>>,
+    cancel: CancellationToken,
 ) -> Result<(), String> {
     use haimen_xiaozhi;
 
     // 构建路由（WebhookState 分支需要用 .with_state() 传递 state）
     let app = if let Some(state) = webhook_state {
-        haimen_xiaozhi::add_routes(
-            axum::Router::new()
-                .route("/health", axum::routing::get(health_handler))
-                .route("/api/v1/system/info", axum::routing::get(api::system::info))
-                .route(
-                    "/webhook/github",
-                    axum::routing::post(api::webhook::handle_github_webhook),
-                )
-                .with_state(state),
-            xiaozhi_strategy,
-        )
-        .fallback(r#static::handle)
+        let mut r = axum::Router::new()
+            .route("/health", axum::routing::get(health_handler))
+            .route("/api/v1/system/info", axum::routing::get(api::system::info))
+            .route(
+                "/webhook/github",
+                axum::routing::post(api::webhook::handle_github_webhook),
+            )
+            .with_state(state);
+        if let Some(strategy) = xiaozhi_strategy {
+            r = haimen_xiaozhi::add_routes(r, strategy);
+        }
+        r.fallback(r#static::handle)
     } else {
-        haimen_xiaozhi::add_routes(
-            axum::Router::new()
-                .route("/health", axum::routing::get(health_handler))
-                .route("/api/v1/system/info", axum::routing::get(api::system::info)),
-            xiaozhi_strategy,
-        )
-        .fallback(r#static::handle)
+        let mut r = axum::Router::new()
+            .route("/health", axum::routing::get(health_handler))
+            .route("/api/v1/system/info", axum::routing::get(api::system::info));
+        if let Some(strategy) = xiaozhi_strategy {
+            r = haimen_xiaozhi::add_routes(r, strategy);
+        }
+        r.fallback(r#static::handle)
     };
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
@@ -57,10 +62,25 @@ pub async fn start(
         .await
         .map_err(|e| format!("绑定地址失败: {}", e))?;
 
+    // 优雅关闭：优先等待共享取消令牌，同时也响应 SIGINT/SIGTERM
+    let graceful = graceful_shutdown(cancel);
+
     axum::serve(listener, app.into_make_service())
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(graceful)
         .await
         .map_err(|e| format!("服务器错误: {}", e))
+}
+
+/// 组合信号 + CancellationToken 的优雅关闭 Future
+async fn graceful_shutdown(cancel: CancellationToken) {
+    tokio::select! {
+        _ = shutdown_signal() => {
+            tracing::info!("收到关闭信号，HTTP 服务器正在关闭...");
+        }
+        _ = cancel.cancelled() => {
+            tracing::info!("网关已停止，HTTP 服务器正在关闭...");
+        }
+    }
 }
 
 /// 健康检查：返回 JSON

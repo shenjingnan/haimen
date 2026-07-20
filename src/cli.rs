@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::config;
 use clap::{CommandFactory, Parser, Subcommand};
 use haimen_lark as feishu;
+use tokio_util::sync::CancellationToken;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -401,7 +402,13 @@ pub async fn run(cli: Cli) -> Result<(), String> {
             };
 
             let serve_config = crate::web::ServeConfig { host, port };
-            crate::web::start(serve_config, webhook_state, xiaozhi_strategy).await
+            crate::web::start(
+                serve_config,
+                webhook_state,
+                Some(xiaozhi_strategy),
+                CancellationToken::new(),
+            )
+            .await
         }
         Some(Commands::Completion { shell }) => {
             cmd_completion(shell, &mut std::io::stdout());
@@ -448,6 +455,19 @@ mod tests {
         assert!(
             val.get("connectors").is_some(),
             "config should contain connectors section"
+        );
+        assert!(
+            val.get("http").is_some(),
+            "config should contain http section"
+        );
+        assert_eq!(val["http"]["enabled"], serde_json::Value::Bool(true));
+        assert_eq!(
+            val["http"]["host"],
+            serde_json::Value::String("0.0.0.0".to_string())
+        );
+        assert_eq!(
+            val["http"]["port"],
+            serde_json::Value::Number(serde_json::Number::from(9527))
         );
     }
 

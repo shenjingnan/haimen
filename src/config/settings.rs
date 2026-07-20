@@ -202,6 +202,42 @@ fn default_mcp_type() -> String {
     "stdio".to_string()
 }
 
+/// HTTP 服务器配置（`haimen start` 自动启动 Web 控制台 + xiaozhi + GitHub Webhook）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HttpServerConfig {
+    /// 是否启用 HTTP 服务器
+    #[serde(default = "default_http_enabled")]
+    pub enabled: bool,
+    /// 监听地址
+    #[serde(default = "default_http_host")]
+    pub host: String,
+    /// 监听端口
+    #[serde(default = "default_http_port")]
+    pub port: u16,
+}
+
+fn default_http_enabled() -> bool {
+    true
+}
+
+fn default_http_host() -> String {
+    "0.0.0.0".to_string()
+}
+
+fn default_http_port() -> u16 {
+    9527
+}
+
+impl Default for HttpServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_http_enabled(),
+            host: default_http_host(),
+            port: default_http_port(),
+        }
+    }
+}
+
 /// 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppConfig {
@@ -217,6 +253,9 @@ pub struct AppConfig {
     /// 连接器配置（统一容器）
     #[serde(default)]
     pub connectors: ConnectorsSection,
+    /// HTTP 服务器配置（`haimen start` 自动启动）
+    #[serde(default)]
+    pub http: HttpServerConfig,
     /// GitHub Webhook 配置（后续方案 A 移入 connectors）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github: Option<crate::connectors::github::config::GitHubConfig>,
@@ -233,6 +272,7 @@ impl Default for AppConfig {
             log_level: default_log_level(),
             gateway: GatewayConfig::default(),
             connectors: ConnectorsSection::default(),
+            http: HttpServerConfig::default(),
             github: None,
         }
     }
@@ -351,6 +391,8 @@ mod tests {
             assert_eq!(result.log_level, "info");
             assert!(result.connectors.lark.is_none());
             assert!(result.connectors.dingtalk.is_none());
+            assert!(result.http.enabled);
+            assert_eq!(result.http.port, 9527);
         });
     }
 
@@ -435,6 +477,7 @@ enabled = true
         assert!(config.connectors.lark.is_none());
         assert!(config.connectors.dingtalk.is_none());
         assert!(config.gateway.agent.is_none());
+        assert!(config.http.enabled);
     }
 
     #[test]
@@ -452,6 +495,11 @@ enabled = true
                     lark_cli_path: "my-lark".to_string(),
                 }),
                 dingtalk: None,
+            },
+            http: HttpServerConfig {
+                enabled: true,
+                host: "127.0.0.1".to_string(),
+                port: 8080,
             },
             github: None,
         };
