@@ -40,7 +40,7 @@ pub enum Commands {
     /// 启动 HTTP Web 服务器（xiaozhi WebSocket + GitHub Webhook）
     Serve {
         /// 监听地址
-        #[arg(long, default_value = "127.0.0.1")]
+        #[arg(long, default_value = "0.0.0.0")]
         host: String,
         /// 监听端口
         #[arg(long, default_value_t = 9527)]
