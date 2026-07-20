@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.3.0](https://github.com/shenjingnan/haimen/compare/v0.2.2...v0.3.0) - 2026-07-20
+
+### Added
+
+- *(serve)* 将 serve 默认模式改为 LLM 模式，Echo 模式需 --xiaozhi-echo 参数 ([#84](https://github.com/shenjingnan/haimen/pull/84))
+
+### Fixed
+
+- 将 serve 命令默认监听地址从 127.0.0.1 改为 0.0.0.0 ([#75](https://github.com/shenjingnan/haimen/pull/75))
+
+### Other
+
+- *(deps)* bump thiserror from 2.0.18 to 2.0.19 ([#78](https://github.com/shenjingnan/haimen/pull/78))
+- *(deps)* bump univoice from 0.1.0 to 0.1.2 ([#82](https://github.com/shenjingnan/haimen/pull/82))
+- *(deps)* bump tokio from 1.52.3 to 1.53.0 ([#83](https://github.com/shenjingnan/haimen/pull/83))
+- *(deps)* bump anyhow from 1.0.103 to 1.0.104 ([#81](https://github.com/shenjingnan/haimen/pull/81))
+- *(deps)* bump clap from 4.6.1 to 4.6.2 ([#80](https://github.com/shenjingnan/haimen/pull/80))
+- *(deps)* bump serde_json from 1.0.150 to 1.0.151 ([#79](https://github.com/shenjingnan/haimen/pull/79))
+- *(deps)* bump async-trait from 0.1.89 to 0.1.91 ([#77](https://github.com/shenjingnan/haimen/pull/77))
+- *(deps)* bump toml from 1.1.2+spec-1.1.0 to 1.1.3+spec-1.1.0 ([#76](https://github.com/shenjingnan/haimen/pull/76))
+
 ## [0.2.2](https://github.com/shenjingnan/haimen/compare/v0.2.1...v0.2.2) - 2026-07-19
 
 ### Fixed
