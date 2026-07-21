@@ -10,21 +10,19 @@ fn test_cli_config_output() {
 }
 
 #[test]
-fn test_cli_feishu_auth_status() {
-    let cli = Cli::try_parse_from(["test", "feishu", "auth", "status"]).unwrap();
-    assert!(matches!(
-        cli.command.unwrap(),
-        cli::Commands::Feishu(cli::FeishuCommands::Auth { .. })
-    ));
-}
+fn test_cli_feishu_subcommand_removed() {
+    // feishu 子命令已被移除，用户应直接使用 lark-cli
+    let result = Cli::try_parse_from(["test", "feishu", "auth", "status"]);
+    assert!(
+        result.is_err(),
+        "feishu subcommand should have been removed"
+    );
 
-#[test]
-fn test_cli_feishu_listen() {
-    let cli = Cli::try_parse_from(["test", "feishu", "listen"]).unwrap();
-    assert!(matches!(
-        cli.command.unwrap(),
-        cli::Commands::Feishu(cli::FeishuCommands::Listen { .. })
-    ));
+    let result = Cli::try_parse_from(["test", "feishu", "listen"]);
+    assert!(
+        result.is_err(),
+        "feishu subcommand should have been removed"
+    );
 }
 
 #[test]
