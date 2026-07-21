@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -38,18 +40,25 @@ impl Default for DingTalkConfig {
 pub struct DingTalkChannel {
     bridge: DwsBridge,
     config: DingTalkConfig,
+    /// 消息 ID 去重缓存
+    seen_msgs: Arc<Mutex<HashSet<String>>>,
 }
 
 impl DingTalkChannel {
     pub fn new(config: DingTalkConfig) -> Self {
         let bridge = DwsBridge::new(&config.dws_path);
-        Self { bridge, config }
+        Self {
+            bridge,
+            config,
+            seen_msgs: Arc::new(Mutex::new(HashSet::new())),
+        }
     }
 
     pub fn new_with_path(dws_path: impl Into<String>) -> Self {
         Self {
             bridge: DwsBridge::new(dws_path),
             config: DingTalkConfig::default(),
+            seen_msgs: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -209,9 +218,25 @@ impl MessageChannel for DingTalkChannel {
             .try_build_event_stream("user_im_message_receive_at", share_session)
             .await;
 
-        // 收集所有可用流并合并
+        // 尝试启动单聊消息监听（可选事件，失败只警告）
+        let o2o_stream = self
+            .try_build_event_stream("user_im_message_receive_o2o", share_session)
+            .await;
+
+        // 构建事件源描述（先判断，后消费）
+        let mut sources = vec!["group"];
         let mut streams: Vec<Pin<Box<dyn Stream<Item = Message> + Send>>> = vec![group_stream];
+        if at_stream.is_some() {
+            sources.push("at");
+        }
+        if o2o_stream.is_some() {
+            sources.push("o2o");
+        }
+
         if let Some(s) = at_stream {
+            streams.push(s);
+        }
+        if let Some(s) = o2o_stream {
             streams.push(s);
         }
 
@@ -221,9 +246,22 @@ impl MessageChannel for DingTalkChannel {
             Box::pin(futures_util::stream::select_all(streams))
         };
 
-        tracing::info!("钉钉监听已启动，事件源: {}", "group, at");
+        tracing::info!(sources = %sources.join(", "), "钉钉监听已启动");
 
-        Ok(merged)
+        // 添加跨流去重：同一 msg_id 只处理一次
+        let seen = Arc::clone(&self.seen_msgs);
+        Ok(Box::pin(merged.filter_map(move |msg| {
+            let mut cache = seen.lock().unwrap();
+            if cache.contains(&msg.id) {
+                futures_util::future::ready(None)
+            } else {
+                cache.insert(msg.id.clone());
+                if cache.len() > 4096 {
+                    cache.clear();
+                }
+                futures_util::future::ready(Some(msg))
+            }
+        })))
     }
 
     async fn send(&self, conversation_id: &str, message: &str) -> Result<(), String> {
