@@ -2,7 +2,7 @@
 //!
 //! # 行为
 //!
-//! - 如果 `web-ui/` 目录不存在：跳过（无前端需要构建）
+//! - 如果 `web-ui/` 目录不存在：创建空的 `web-ui/dist/` 以防止 rust-embed 编译失败
 //! - 如果 `pnpm` 可用：运行 `pnpm install --frozen-lockfile && pnpm build`
 //! - 如果 `pnpm` 不可用但 `web-ui/dist/` 存在：使用现有构建产物
 //! - 如果 `pnpm` 不可用且 `web-ui/dist/` 不存在：创建空目录并发出警告
@@ -16,8 +16,12 @@ fn main() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let web_dir = manifest_dir.join("web-ui");
 
+    let dist_dir = web_dir.join("dist");
+
     if !web_dir.exists() || !web_dir.is_dir() {
-        // 工作空间中不包含 web-ui 前端目录
+        // cargo publish 场景：包中不含 web-ui/，创建空 dist/ 使 rust-embed 能编译
+        let _ = std::fs::create_dir_all(&dist_dir);
+        println!("cargo:warning=web-ui 目录不存在，已创建空 web-ui/dist/（cargo publish 场景）");
         return;
     }
 
@@ -28,8 +32,6 @@ fn main() {
     println!("cargo:rerun-if-changed=web-ui/index.html");
     println!("cargo:rerun-if-changed=web-ui/src/");
     println!("cargo:rerun-if-changed=web-ui/public/");
-
-    let dist_dir = web_dir.join("dist");
 
     match build_frontend(&web_dir) {
         Ok(()) => {
