@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use crate::config;
 use clap::{CommandFactory, Parser, Subcommand};
-use haimen_lark as feishu;
 use tokio_util::sync::CancellationToken;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -26,9 +25,6 @@ pub struct Cli {
 pub enum Commands {
     /// 显示配置信息
     Config,
-    /// 飞书集成
-    #[command(subcommand)]
-    Feishu(FeishuCommands),
     /// 启动所有启用的连接器和 Agent
     Start {
         /// Echo 模式：收消息后直接返回，不经过 Agent 处理
@@ -84,49 +80,6 @@ pub enum Commands {
     Uninstall,
 }
 
-#[derive(Subcommand)]
-pub enum FeishuCommands {
-    /// 飞书认证管理
-    Auth {
-        #[command(subcommand)]
-        action: FeishuAuthAction,
-    },
-    /// 群聊管理
-    Chat {
-        #[command(subcommand)]
-        action: FeishuChatAction,
-    },
-    /// 监听飞书消息
-    Listen {
-        /// 监听模式: event（事件订阅）| poll（轮询）
-        #[arg(long, default_value = "event")]
-        mode: String,
-        /// 聊天 ID（poll 模式必填）
-        #[arg(long)]
-        chat_id: Option<String>,
-        /// 轮询间隔（秒）
-        #[arg(long, default_value_t = 30)]
-        interval: u64,
-        /// 输出格式: pretty | json
-        #[arg(long, default_value = "pretty")]
-        format: String,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum FeishuAuthAction {
-    /// 查看飞书认证状态
-    Status,
-    /// 登录飞书（设备码授权）
-    Login,
-}
-
-#[derive(Subcommand)]
-pub enum FeishuChatAction {
-    /// 列出可访问的群聊
-    List,
-}
-
 /// AI Agent 调试命令
 #[derive(Subcommand)]
 pub enum AgentCommands {
@@ -159,67 +112,6 @@ fn cmd_config() -> Result<String, String> {
 fn cmd_completion<W: std::io::Write>(shell: clap_complete::Shell, writer: &mut W) {
     let mut cmd = Cli::command();
     clap_complete::generate(shell, &mut cmd, "haimen", writer);
-}
-
-/// feishu auth status 命令
-async fn cmd_feishu_auth_status(bridge: &feishu::bridge::LarkCliBridge) -> Result<(), String> {
-    let status = feishu::auth::show_auth_status(bridge).await?;
-    println!("飞书认证状态:");
-    println!("  App ID: {}", status.app_id);
-    println!("  Brand: {}", status.brand);
-    println!("  身份类型: {}", status.identity);
-    println!(
-        "  User: {} (可用: {})",
-        status.identities.user.status, status.identities.user.available
-    );
-    println!(
-        "  Bot: {} (可用: {})",
-        status.identities.bot.status, status.identities.bot.available
-    );
-    Ok(())
-}
-
-/// feishu auth login 命令
-async fn cmd_feishu_auth_login() -> Result<(), String> {
-    feishu::auth::login().await
-}
-
-/// feishu chat list 命令
-async fn cmd_feishu_chat_list(bridge: &feishu::bridge::LarkCliBridge) -> Result<(), String> {
-    let chats = feishu::chat::list_chats(bridge).await?;
-    if chats.is_empty() {
-        println!("当前没有可访问的群聊。");
-    } else {
-        println!("可访问的群聊 ({}):", chats.len());
-        for (i, chat) in chats.iter().enumerate() {
-            let name = chat.name.as_deref().unwrap_or("(未命名)");
-            println!("  {}. {} (ID: {})", i + 1, name, chat.chat_id);
-        }
-    }
-    Ok(())
-}
-
-/// feishu listen 命令
-async fn cmd_feishu_listen(
-    bridge: &feishu::bridge::LarkCliBridge,
-    mode: String,
-    chat_id: Option<String>,
-    interval: u64,
-    format: String,
-) -> Result<(), String> {
-    let use_json = format == "json";
-
-    match mode.as_str() {
-        "event" => {
-            feishu::listen::listen_events(bridge, use_json).await?;
-        }
-        "poll" => {
-            let chat_id = chat_id.ok_or_else(|| "poll 模式需要指定 --chat-id".to_string())?;
-            feishu::listen::listen_poll(bridge, &chat_id, interval, use_json).await?;
-        }
-        _ => return Err(format!("不支持的监听模式: {}. 可选: event, poll", mode)),
-    }
-    Ok(())
 }
 
 /// 根据 provider 名称构造 AgentProvider
@@ -293,23 +185,6 @@ async fn cmd_agent_chat(provider: Option<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// 构造 LarkCliBridge（从 connectors.lark 配置）
-fn create_bridge() -> Result<feishu::bridge::LarkCliBridge, String> {
-    let config = config::settings::load_settings()
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-
-    let lark_config = config
-        .connectors
-        .lark
-        .ok_or_else(|| "未配置 [connectors.lark]".to_string())?;
-
-    Ok(feishu::bridge::LarkCliBridge::new(
-        &lark_config.lark_cli_path,
-    ))
-}
-
 /// CLI 入口
 pub async fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
@@ -317,24 +192,6 @@ pub async fn run(cli: Cli) -> Result<(), String> {
             let output = cmd_config()?;
             println!("{}", output);
             Ok(())
-        }
-        Some(Commands::Feishu(feishu_cmd)) => {
-            let bridge = create_bridge()?;
-            match feishu_cmd {
-                FeishuCommands::Auth { action } => match action {
-                    FeishuAuthAction::Status => cmd_feishu_auth_status(&bridge).await,
-                    FeishuAuthAction::Login => cmd_feishu_auth_login().await,
-                },
-                FeishuCommands::Chat { action } => match action {
-                    FeishuChatAction::List => cmd_feishu_chat_list(&bridge).await,
-                },
-                FeishuCommands::Listen {
-                    mode,
-                    chat_id,
-                    interval,
-                    format,
-                } => cmd_feishu_listen(&bridge, mode, chat_id, interval, format).await,
-            }
         }
         Some(Commands::Start { echo, no_browser }) => {
             if echo {
@@ -493,7 +350,6 @@ mod tests {
         );
         for sub in &[
             "config",
-            "feishu",
             "start",
             "serve",
             "agent",
@@ -524,7 +380,6 @@ mod tests {
         );
         for sub in &[
             "config",
-            "feishu",
             "start",
             "serve",
             "agent",
@@ -555,7 +410,6 @@ mod tests {
         );
         for sub in &[
             "config",
-            "feishu",
             "start",
             "serve",
             "agent",
@@ -586,7 +440,6 @@ mod tests {
         );
         for sub in &[
             "config",
-            "feishu",
             "start",
             "serve",
             "agent",
@@ -673,25 +526,9 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_parse_feishu_auth_status() {
-        let cli = Cli::try_parse_from(["test", "feishu", "auth", "status"]).unwrap();
-        match cli.command.unwrap() {
-            Commands::Feishu(FeishuCommands::Auth { action }) => {
-                assert!(matches!(action, FeishuAuthAction::Status));
-            }
-            _ => panic!("Expected Feishu auth status command"),
-        }
-    }
-
-    #[test]
-    fn test_cli_parse_feishu_chat_list() {
-        let cli = Cli::try_parse_from(["test", "feishu", "chat", "list"]).unwrap();
-        match cli.command.unwrap() {
-            Commands::Feishu(FeishuCommands::Chat { action }) => {
-                assert!(matches!(action, FeishuChatAction::List));
-            }
-            _ => panic!("Expected Feishu chat list command"),
-        }
+    fn test_cli_parse_feishu_subcommand_fails() {
+        let result = Cli::try_parse_from(["test", "feishu"]);
+        assert!(result.is_err());
     }
 
     #[test]
