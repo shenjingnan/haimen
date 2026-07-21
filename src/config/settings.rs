@@ -214,6 +214,13 @@ pub struct HttpServerConfig {
     /// 监听端口
     #[serde(default = "default_http_port")]
     pub port: u16,
+    /// 启动后自动打开浏览器
+    #[serde(default = "default_auto_open_browser")]
+    pub auto_open_browser: bool,
+}
+
+fn default_auto_open_browser() -> bool {
+    true
 }
 
 fn default_http_enabled() -> bool {
@@ -234,6 +241,7 @@ impl Default for HttpServerConfig {
             enabled: default_http_enabled(),
             host: default_http_host(),
             port: default_http_port(),
+            auto_open_browser: default_auto_open_browser(),
         }
     }
 }
@@ -500,6 +508,7 @@ enabled = true
                 enabled: true,
                 host: "127.0.0.1".to_string(),
                 port: 8080,
+                auto_open_browser: true,
             },
             github: None,
         };

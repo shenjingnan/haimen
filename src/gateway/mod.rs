@@ -106,7 +106,7 @@ fn build_xiaozhi_strategy() -> Option<Arc<dyn haimen_xiaozhi::ResponseStrategy>>
 /// 3. 创建 CancellationToken + 启动信号监听
 /// 4. 启动 HTTP 服务器（后台任务）
 /// 5. 运行多连接器事件循环
-pub async fn start_all() -> Result<(), String> {
+pub async fn start_all(cli_no_browser: bool) -> Result<(), String> {
     let config = load_settings().ok().flatten().unwrap_or_default();
 
     let all_connectors = build_connectors(&config)?;
@@ -133,6 +133,7 @@ pub async fn start_all() -> Result<(), String> {
         let serve_config = crate::web::ServeConfig {
             host: config.http.host.clone(),
             port: config.http.port,
+            auto_open: config.http.auto_open_browser && !cli_no_browser,
         };
 
         // GitHub Webhook（可选）
