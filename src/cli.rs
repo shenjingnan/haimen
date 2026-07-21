@@ -34,6 +34,9 @@ pub enum Commands {
         /// Echo 模式：收消息后直接返回，不经过 Agent 处理
         #[arg(long)]
         echo: bool,
+        /// 不自动打开浏览器
+        #[arg(long)]
+        no_browser: bool,
     },
     /// AI Agent 调试
     #[command(subcommand)]
@@ -46,6 +49,9 @@ pub enum Commands {
         /// 监听端口
         #[arg(long, default_value_t = 9527)]
         port: u16,
+        /// 不自动打开浏览器
+        #[arg(long)]
+        no_browser: bool,
         /// Echo 模式：收到音频后原样返回（默认是 LLM 模式）
         #[arg(long)]
         xiaozhi_echo: bool,
@@ -330,11 +336,11 @@ pub async fn run(cli: Cli) -> Result<(), String> {
                 } => cmd_feishu_listen(&bridge, mode, chat_id, interval, format).await,
             }
         }
-        Some(Commands::Start { echo }) => {
+        Some(Commands::Start { echo, no_browser }) => {
             if echo {
                 crate::gateway::start_echo().await
             } else {
-                crate::gateway::start_all().await
+                crate::gateway::start_all(no_browser).await
             }
         }
         Some(Commands::Agent(agent_cmd)) => match agent_cmd {
@@ -344,6 +350,7 @@ pub async fn run(cli: Cli) -> Result<(), String> {
         Some(Commands::Serve {
             host,
             port,
+            no_browser,
             xiaozhi_echo,
             xiaozhi_tts_text,
             xiaozhi_tts_voice,
@@ -401,7 +408,11 @@ pub async fn run(cli: Cli) -> Result<(), String> {
                 ))
             };
 
-            let serve_config = crate::web::ServeConfig { host, port };
+            let serve_config = crate::web::ServeConfig {
+                host,
+                port,
+                auto_open: !no_browser,
+            };
             crate::web::start(
                 serve_config,
                 webhook_state,
@@ -617,7 +628,10 @@ mod tests {
     fn test_cli_parse_start() {
         let cli = Cli::try_parse_from(["test", "start"]).unwrap();
         match cli.command.unwrap() {
-            Commands::Start { echo } => assert!(!echo),
+            Commands::Start { echo, no_browser } => {
+                assert!(!echo);
+                assert!(!no_browser);
+            }
             _ => panic!("Expected Start command"),
         }
     }
@@ -626,8 +640,23 @@ mod tests {
     fn test_cli_parse_start_echo() {
         let cli = Cli::try_parse_from(["test", "start", "--echo"]).unwrap();
         match cli.command.unwrap() {
-            Commands::Start { echo } => assert!(echo),
+            Commands::Start { echo, no_browser } => {
+                assert!(echo);
+                assert!(!no_browser);
+            }
             _ => panic!("Expected Start --echo command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_start_no_browser() {
+        let cli = Cli::try_parse_from(["test", "start", "--no-browser"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Start { echo, no_browser } => {
+                assert!(!echo);
+                assert!(no_browser);
+            }
+            _ => panic!("Expected Start --no-browser command"),
         }
     }
 
@@ -673,11 +702,13 @@ mod tests {
                 xiaozhi_echo,
                 xiaozhi_tts_text,
                 xiaozhi_tts_voice,
+                no_browser,
                 ..
             } => {
                 assert!(!xiaozhi_echo, "default should NOT be echo mode");
                 assert!(xiaozhi_tts_text.is_none());
                 assert!(xiaozhi_tts_voice.is_none());
+                assert!(!no_browser);
             }
             _ => panic!("Expected Serve command"),
         }
@@ -689,6 +720,17 @@ mod tests {
         match cli.command.unwrap() {
             Commands::Serve { xiaozhi_echo, .. } => {
                 assert!(xiaozhi_echo, "--xiaozhi-echo should enable echo mode");
+            }
+            _ => panic!("Expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_serve_no_browser() {
+        let cli = Cli::try_parse_from(["test", "serve", "--no-browser"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Serve { no_browser, .. } => {
+                assert!(no_browser, "--no-browser should disable auto-open");
             }
             _ => panic!("Expected Serve command"),
         }

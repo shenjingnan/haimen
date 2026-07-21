@@ -12,6 +12,8 @@ use crate::gateway::webhook::WebhookState;
 pub struct ServeConfig {
     pub host: String,
     pub port: u16,
+    /// 启动成功后自动打开浏览器
+    pub auto_open: bool,
 }
 
 /// 启动 HTTP 服务器
@@ -57,6 +59,11 @@ pub async fn start(
         .map_err(|e| format!("无效的监听地址: {}", e))?;
 
     tracing::info!("Web 服务器启动于 http://{addr}");
+
+    // 自动打开浏览器
+    if config.auto_open {
+        open_browser(&config.host, config.port);
+    }
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -114,5 +121,18 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => tracing::info!("收到 Ctrl+C，正在关闭..."),
         _ = terminate => tracing::info!("收到 SIGTERM，正在关闭..."),
+    }
+}
+
+/// 自动打开浏览器到 Web 控制台
+///
+/// - `0.0.0.0` 会自动转为 `127.0.0.1`（浏览器无法访问 `0.0.0.0`）
+/// - 打开失败只记录 warning，不阻塞启动流程
+fn open_browser(host: &str, port: u16) {
+    let display_host = if host == "0.0.0.0" { "127.0.0.1" } else { host };
+    let url = format!("http://{}:{}", display_host, port);
+    match webbrowser::open(&url) {
+        Ok(()) => tracing::info!(url = %url, "已自动打开浏览器"),
+        Err(e) => tracing::warn!(url = %url, error = %e, "自动打开浏览器失败"),
     }
 }
