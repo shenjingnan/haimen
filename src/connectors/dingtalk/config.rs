@@ -1,83 +1,42 @@
 use serde::{Deserialize, Serialize};
 
-use crate::config::settings::resolve_env_ref;
-
-/// 钉钉通道配置
+/// 钉钉通道配置（TOML 配置层）
+///
+/// 对应 ~/.haimen/settings.toml 中的 [connectors.dingtalk] 段落。
+/// 认证方式由 dws CLI 独立管理（`dws auth login`），无需在配置中填写密钥。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DingTalkConfig {
-    /// AppKey（钉钉开放平台创建应用时获取）
-    pub client_id: String,
-
-    /// AppSecret（钉钉开放平台创建应用时获取）
-    pub client_secret: String,
-
-    /// 允许的用户 ID 白名单，"," 分隔。"*" 表示全部允许。
-    #[serde(default = "default_allow_from")]
-    pub allow_from: String,
-
-    /// 群聊中是否共享 Agent 会话。
-    /// true = 群内所有用户共用一个会话，false = 按用户隔离会话
+pub struct DingTalkConnectorConfig {
+    /// 是否启用
+    #[serde(default)]
+    pub enabled: bool,
+    /// dws 可执行文件路径（默认从 PATH 查找 "dws"）
+    #[serde(default = "default_dws_path")]
+    pub dws_path: String,
+    /// 群聊中是否共享 Agent 会话
     #[serde(default)]
     pub share_session_in_channel: bool,
-
-    /// 机器人编码（可选，默认等于 client_id）
-    #[serde(default)]
-    pub robot_code: String,
 }
 
-fn default_allow_from() -> String {
-    "*".to_string()
+fn default_dws_path() -> String {
+    "dws".to_string()
 }
 
-impl Default for DingTalkConfig {
+impl Default for DingTalkConnectorConfig {
     fn default() -> Self {
         Self {
-            client_id: String::new(),
-            client_secret: String::new(),
-            allow_from: default_allow_from(),
+            enabled: false,
+            dws_path: default_dws_path(),
             share_session_in_channel: false,
-            robot_code: String::new(),
         }
     }
 }
 
-impl DingTalkConfig {
-    /// 验证配置是否有效
-    pub fn validate(&self) -> Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        if self.client_id.is_empty() {
-            errors.push("client_id 不能为空".to_string());
+impl From<DingTalkConnectorConfig> for haimen_dingtalk::DingTalkConfig {
+    fn from(cfg: DingTalkConnectorConfig) -> Self {
+        Self {
+            dws_path: cfg.dws_path,
+            share_session_in_channel: cfg.share_session_in_channel,
         }
-        if self.client_secret.is_empty() {
-            errors.push("client_secret 不能为空".to_string());
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
-
-    /// 获取有效的 robot_code，为空时返回 client_id
-    pub fn effective_robot_code(&self) -> &str {
-        if self.robot_code.is_empty() {
-            &self.client_id
-        } else {
-            &self.robot_code
-        }
-    }
-
-    /// 解析配置中 ${env.VAR} 环境变量引用，返回一个新的 DingTalkConfig
-    pub fn resolve_env_refs(&self) -> Result<Self, String> {
-        Ok(Self {
-            client_id: resolve_env_ref(&self.client_id)?,
-            client_secret: resolve_env_ref(&self.client_secret)?,
-            allow_from: self.allow_from.clone(),
-            share_session_in_channel: self.share_session_in_channel,
-            robot_code: self.robot_code.clone(),
-        })
     }
 }
 
@@ -86,88 +45,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_validate_ok() {
-        let cfg = DingTalkConfig {
-            client_id: "dingxxx".into(),
-            client_secret: "secret".into(),
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_ok());
+    fn test_dingtalk_connector_config_default() {
+        let cfg = DingTalkConnectorConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.dws_path, "dws");
+        assert!(!cfg.share_session_in_channel);
     }
 
     #[test]
-    fn test_validate_missing_client_id() {
-        let cfg = DingTalkConfig {
-            client_id: String::new(),
-            client_secret: "secret".into(),
-            ..Default::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.contains(&"client_id 不能为空".to_string()));
-    }
-
-    #[test]
-    fn test_validate_missing_client_secret() {
-        let cfg = DingTalkConfig {
-            client_id: "dingxxx".into(),
-            client_secret: String::new(),
-            ..Default::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.contains(&"client_secret 不能为空".to_string()));
-    }
-
-    #[test]
-    fn test_validate_both_missing() {
-        let cfg = DingTalkConfig::default();
-        let err = cfg.validate().unwrap_err();
-        assert_eq!(err.len(), 2);
-    }
-
-    #[test]
-    fn test_effective_robot_code_default() {
-        let cfg = DingTalkConfig {
-            client_id: "dingxxx".into(),
-            client_secret: "secret".into(),
-            ..Default::default()
-        };
-        assert_eq!(cfg.effective_robot_code(), "dingxxx");
-    }
-
-    #[test]
-    fn test_effective_robot_code_explicit() {
-        let cfg = DingTalkConfig {
-            client_id: "dingxxx".into(),
-            client_secret: "secret".into(),
-            robot_code: "my_robot".into(),
-            ..Default::default()
-        };
-        assert_eq!(cfg.effective_robot_code(), "my_robot");
-    }
-
-    #[test]
-    fn test_config_serde_roundtrip() {
-        let cfg = DingTalkConfig {
-            client_id: "dingxxx".into(),
-            client_secret: "secret".into(),
-            allow_from: "user1,user2".into(),
+    fn test_dingtalk_connector_config_custom() {
+        let cfg = DingTalkConnectorConfig {
+            enabled: true,
+            dws_path: "/opt/bin/dws".into(),
             share_session_in_channel: true,
-            robot_code: String::new(),
+        };
+        assert!(cfg.enabled);
+        assert_eq!(cfg.dws_path, "/opt/bin/dws");
+        assert!(cfg.share_session_in_channel);
+    }
+
+    #[test]
+    fn test_conversion_to_haimen_dingtalk_config() {
+        let cfg = DingTalkConnectorConfig {
+            enabled: true,
+            dws_path: "/usr/local/bin/dws".into(),
+            share_session_in_channel: true,
+        };
+        let haimen_cfg: haimen_dingtalk::DingTalkConfig = cfg.into();
+        assert_eq!(haimen_cfg.dws_path, "/usr/local/bin/dws");
+        assert!(haimen_cfg.share_session_in_channel);
+    }
+
+    #[test]
+    fn test_toml_deserialize_minimal() {
+        let toml_str = r#"
+            enabled = true
+        "#;
+        let cfg: DingTalkConnectorConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.dws_path, "dws");
+        assert!(!cfg.share_session_in_channel);
+    }
+
+    #[test]
+    fn test_toml_deserialize_full() {
+        let toml_str = r#"
+            enabled = true
+            dws_path = "/custom/path/dws"
+            share_session_in_channel = true
+        "#;
+        let cfg: DingTalkConnectorConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.dws_path, "/custom/path/dws");
+        assert!(cfg.share_session_in_channel);
+    }
+
+    #[test]
+    fn test_serde_roundtrip() {
+        let cfg = DingTalkConnectorConfig {
+            enabled: true,
+            dws_path: "my-dws".into(),
+            share_session_in_channel: true,
         };
         let toml_str = toml::to_string(&cfg).unwrap();
-        let deserialized: DingTalkConfig = toml::from_str(&toml_str).unwrap();
+        let deserialized: DingTalkConnectorConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(cfg, deserialized);
-    }
-
-    #[test]
-    fn test_config_default_with_partial_toml() {
-        let toml_str = r#"
-            client_id = "dingxxx"
-            client_secret = "secret"
-        "#;
-        let cfg: DingTalkConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.client_id, "dingxxx");
-        assert_eq!(cfg.allow_from, "*");
-        assert!(!cfg.share_session_in_channel);
     }
 }

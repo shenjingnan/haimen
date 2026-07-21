@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agents::claude_code::agent::ClaudeAgent;
 use crate::config::settings::load_settings;
-use crate::connectors::dingtalk::channel::DingTalkChannel;
+use crate::connectors::dingtalk::DingTalkChannel;
 use crate::connectors::github::GitHubConnector;
 use crate::gateway::channel::MessageChannel;
 use crate::gateway::provider::AgentProvider;
@@ -41,8 +41,7 @@ pub fn build_connectors(
     // DingTalk
     if let Some(dt_cfg) = &config.connectors.dingtalk {
         if dt_cfg.enabled {
-            let dingtalk_cfg: crate::connectors::dingtalk::config::DingTalkConfig =
-                dt_cfg.clone().into();
+            let dingtalk_cfg: haimen_dingtalk::DingTalkConfig = dt_cfg.clone().into();
             channels.push((
                 "dingtalk".to_string(),
                 Box::new(DingTalkChannel::new(dingtalk_cfg)) as Box<dyn MessageChannel>,

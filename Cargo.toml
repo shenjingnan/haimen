@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/haimen-core",
+    "crates/haimen-dingtalk",
     "crates/haimen-lark",
     "crates/haimen-xiaozhi",
     ".",    # 根目录的主 crate
@@ -69,8 +70,6 @@ hmac = "0.13.0"
 sha2 = "0.11.0"
 hex = "0.4.3"
 
-# 钉钉集成
-dingtalk-stream = "0.1.7"
 tokio-util = "0.7"
 tokio-stream = "0.1"
 tempfile = "3"
@@ -107,12 +106,12 @@ rmcp = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-dingtalk-stream = { workspace = true }
 tokio-util = { workspace = true }
 tokio-stream = { workspace = true }
 
 # Workspace crate 依赖
 haimen-core = { path = "crates/haimen-core", version = "0.1.0" }
+haimen-dingtalk = { path = "crates/haimen-dingtalk", version = "0.1.0" }
 haimen-lark = { path = "crates/haimen-lark", version = "0.1.0" }
 haimen-xiaozhi = { path = "crates/haimen-xiaozhi", version = "0.1.2" }
 univoice = { version = "0.1.0", features = ["opus-encoder"] }

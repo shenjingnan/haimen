@@ -256,7 +256,7 @@ pub struct OtaInfo {
 // ─── 音频帧 ────────────────────────────────────────────────
 
 /// 缓冲的音频帧
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AudioFrame {
     pub timestamp: u32,
     pub data: Vec<u8>,

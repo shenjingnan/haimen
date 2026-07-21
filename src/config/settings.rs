@@ -69,39 +69,30 @@ fn default_lark_cli_path() -> String {
 
 /// DingTalk 连接器配置（TOML 配置层）
 ///
-/// 转换到 dingtalk::config::DingTalkConfig 传递给 Channel。
+/// 转换到 haimen_dingtalk::DingTalkConfig 传递给 Channel。
+/// 认证由 dws CLI 独立管理（`dws auth login`），无需填写密钥。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DingTalkConnectorConfig {
     /// 是否启用
     #[serde(default)]
     pub enabled: bool,
-    /// 钉钉应用 Client ID
-    pub client_id: String,
-    /// 钉钉应用 Client Secret
-    pub client_secret: String,
-    /// 允许的用户 ID 白名单，"," 分隔。"*" 表示全部允许。
-    #[serde(default = "default_dingtalk_allow_from")]
-    pub allow_from: String,
+    /// dws 可执行文件路径（默认从 PATH 查找 "dws"）
+    #[serde(default = "default_dingtalk_dws_path")]
+    pub dws_path: String,
     /// 群聊中是否共享 Agent 会话
     #[serde(default)]
     pub share_session_in_channel: bool,
-    /// 机器人编码（可选，默认等于 client_id）
-    #[serde(default)]
-    pub robot_code: String,
 }
 
-fn default_dingtalk_allow_from() -> String {
-    "*".to_string()
+fn default_dingtalk_dws_path() -> String {
+    "dws".to_string()
 }
 
-impl From<DingTalkConnectorConfig> for crate::connectors::dingtalk::config::DingTalkConfig {
+impl From<DingTalkConnectorConfig> for haimen_dingtalk::DingTalkConfig {
     fn from(cfg: DingTalkConnectorConfig) -> Self {
         Self {
-            client_id: cfg.client_id,
-            client_secret: cfg.client_secret,
-            allow_from: cfg.allow_from,
+            dws_path: cfg.dws_path,
             share_session_in_channel: cfg.share_session_in_channel,
-            robot_code: cfg.robot_code,
         }
     }
 }
@@ -419,8 +410,7 @@ lark_cli_path = "my-lark-cli"
 
 [connectors.dingtalk]
 enabled = false
-client_id = "test-id"
-client_secret = "${env.DINGTALK_CLIENT_SECRET}"
+dws_path = "/usr/local/bin/dws"
 "#,
             );
             let result = load_settings().unwrap().unwrap();
@@ -433,8 +423,7 @@ client_secret = "${env.DINGTALK_CLIENT_SECRET}"
 
             let dingtalk = result.connectors.dingtalk.unwrap();
             assert!(!dingtalk.enabled);
-            assert_eq!(dingtalk.client_id, "test-id");
-            assert_eq!(dingtalk.client_secret, "${env.DINGTALK_CLIENT_SECRET}");
+            assert_eq!(dingtalk.dws_path, "/usr/local/bin/dws");
         });
     }
 
@@ -449,8 +438,7 @@ enabled = false
 
 [connectors.dingtalk]
 enabled = false
-client_id = "id"
-client_secret = "secret"
+dws_path = "dws"
 "#,
             );
             let result = load_settings().unwrap().unwrap();
