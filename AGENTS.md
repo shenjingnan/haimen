@@ -84,58 +84,73 @@ cargo tarpaulin                     # 生成覆盖率报告
 ## 项目结构
 
 ```
-├── Cargo.toml           # 项目配置和依赖
-├── rust-toolchain.toml  # Rust 工具链版本
+├── Cargo.toml               # 项目配置和依赖
+├── rust-toolchain.toml      # Rust 工具链版本
 ├── src/
-│   ├── main.rs          # 入口文件
-│   ├── lib.rs           # 库入口 + 测试工具
-│   ├── cli.rs           # CLI 命令定义
-│   ├── gateway/         # 抽象层 + 编排（与具体 Connector/Agent 无关）
-│   │   ├── mod.rs       # listen() 动态构造 Channel + Agent
-│   │   ├── model.rs     # Message 统一消息模型
-│   │   ├── channel.rs   # MessageChannel trait（IM 通道）
-│   │   ├── webhook.rs   # WebhookHandler trait + WebhookState
-│   │   ├── provider.rs  # AgentProvider trait
-│   │   ├── chat_loop.rs # 泛型编排循环
-│   │   └── session.rs   # SessionManager 会话管理
-│   ├── connectors/      # 外部系统连接器
-│   │   ├── lark/        # 飞书/Lark IM 通道
-│   │   │   ├── bridge.rs  # lark-cli 子进程桥接
-│   │   │   ├── channel.rs # LarkChannel: impl MessageChannel
-│   │   │   ├── types.rs/auth.rs/chat.rs/listen.rs/send.rs
-│   │   │   └── mod.rs
-│   │   ├── github/      # GitHub Webhook + @mention 触发
-│   │   │   ├── mod.rs     # GitHubConnector: impl WebhookHandler
-│   │   │   ├── handler.rs # 签名验证 + @mention 提取
-│   │   │   ├── types.rs   # GitHub 事件模型
-│   │   │   └── config.rs  # GitHub 配置
-│   │   └── mod.rs
-│   ├── agents/          # AI Agent 实现
-│   │   ├── claude_code/ # Claude Code Agent (claude --print)
+│   ├── main.rs              # 入口文件
+│   ├── lib.rs               # 库入口 + 测试工具
+│   ├── cli.rs               # CLI 命令定义
+│   ├── gateway/             # 抽象层 + 编排
+│   │   ├── mod.rs           # build_connectors() + start_all()
+│   │   ├── model.rs         # Message 统一消息模型
+│   │   ├── channel.rs       # MessageChannel trait
+│   │   ├── webhook.rs       # WebhookHandler trait
+│   │   ├── provider.rs      # AgentProvider trait
+│   │   ├── chat_loop.rs     # 泛型编排循环
+│   │   └── session.rs       # SessionManager
+│   ├── connectors/
+│   │   ├── dingtalk/        # 钉钉适配层（桥接到 haimen-dingtalk）
+│   │   │   └── mod.rs       # 重导出 DingTalkChannel
+│   │   ├── github/          # GitHub Webhook
 │   │   │   ├── mod.rs
-│   │   │   └── agent.rs # ClaudeAgent: impl AgentProvider
-│   │   ├── codex/       # Codex Agent（占位）
-│   │   ├── error.rs     # Agent 错误类型
-│   │   ├── mcp_client.rs# MCP 协议客户端
-│   │   ├── mcp_agent.rs # McpAgent: impl AgentProvider
+│   │   │   ├── handler.rs
+│   │   │   ├── types.rs
+│   │   │   └── config.rs
+│   │   └── mod.rs
+│   ├── agents/
+│   │   ├── claude_code/     # Claude Code Agent
+│   │   │   ├── mod.rs
+│   │   │   └── agent.rs
+│   │   ├── codex/           # Codex 占位
+│   │   ├── error.rs
+│   │   ├── mcp_client.rs
+│   │   ├── mcp_agent.rs
 │   │   └── mod.rs
 │   ├── config/
-│   │   ├── mod.rs       # 配置模块入口
-│   │   └── settings.rs  # TOML 配置管理
-│   ├── web/             # axum HTTP 服务器
-│   │   ├── mod.rs       # 服务器启动 + 优雅关闭
-│   │   ├── static.rs    # SPA 静态文件服务
+│   │   ├── mod.rs
+│   │   └── settings.rs      # TOML 配置管理
+│   ├── web/
+│   │   ├── mod.rs
+│   │   ├── static.rs
 │   │   └── api/
 │   │       ├── mod.rs
-│   │       ├── system.rs   # /api/v1/system/info
-│   │       └── webhook.rs  # Webhook HTTP handler
-│   ├── logging.rs       # tracing 双层日志
-│   ├── datetime.rs      # 日期时间工具
-│   └── commands/        # 工具命令（completion, upgrade, uninstall）
-├── tests/               # 集成测试
-├── .agents/             # 架构方案/计划
-├── .github/             # CI/CD 配置
-└── .githooks/           # Git hooks
+│   │       ├── system.rs
+│   │       └── webhook.rs
+│   ├── logging.rs
+│   ├── datetime.rs
+│   └── commands/             # completion, upgrade, uninstall
+├── crates/
+│   ├── haimen-core/          # 核心抽象（Message, MessageChannel）
+│   ├── haimen-dingtalk/      # 钉钉 CLI (dws) 桥接
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── bridge.rs     # DwsBridge（子进程管理）
+│   │       ├── channel.rs    # DingTalkChannel
+│   │       └── types.rs      # DingTalkEvent NDJSON
+│   ├── haimen-lark/          # 飞书 CLI (lark-cli) 桥接
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── bridge.rs     # LarkCliBridge
+│   │       ├── channel.rs    # LarkChannel
+│   │       └── types.rs      # FeishuEvent
+│   └── haimen-xiaozhi/       # 小智 AI 语音通道
+├── web-ui/                   # 前端 Web 控制台
+├── tests/                    # 集成测试
+├── .agents/
+├── .github/
+└── .githooks/
 ```
 
 ## Git 工作流

@@ -11,7 +11,19 @@
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-brightgreen.svg" alt="License: MIT"></a>
 </p>
 
-**haimen** 是一个 AI 网关基建 CLI 工具，集成飞书（Feishu/Lark），支持在终端接收和处理飞书消息。
+**haimen** 是一个 AI 网关基建 CLI 工具，通过 Connector 架构集成多种 IM 消息渠道（飞书/Lark、钉钉），
+通过 Agent 抽象支持多种 AI 后端（Claude Code、MCP 协议等）。
+
+## 特性
+
+- **飞书/Lark 消息监听** — 通过 lark-cli 桥接实时接收飞书消息
+- **钉钉消息监听** — 通过 dws（DingTalk CLI）桥接实时接收钉钉消息
+- **统一消息模型** — 不同 IM 平台统一为 MessageChannel 抽象，网关层无感对接
+- **AI 网关编排** — 消息 → Agent 处理 → 回复的完整闭环
+- **会话管理** — 支持按会话隔离、超时切换、最大轮次控制
+- **MCP 协议支持** — 支持 MCP 服务器作为 Agent 后端
+- **TOML 配置管理** — 支持环境变量引用 ${env.VAR}
+- **Web 控制台** — HTTP 服务器提供实时状态查看
 
 ## 安装
 
@@ -33,7 +45,7 @@ cargo install haimen
 
 ### 方式三：手动下载
 
-从 [GitHub Releases](https://github.com/shenjingnan/haimen/releases) 下载对应平台的压缩包，解压后放入 `PATH`。
+从 [GitHub Releases](https://github.com/shenjingnan/haimen/releases) 下载对应平台的压缩包，解压后放入 PATH。
 
 ### 升级
 
@@ -47,53 +59,116 @@ haimen upgrade
 haimen uninstall
 ```
 
-## 特性
-
-- **飞书消息监听** — 实时接收飞书消息并在终端展示（事件订阅模式 / 轮询模式）
-- **lark-cli 桥接** — 利用飞书官方 CLI 处理认证、事件订阅等复杂逻辑
-- **AI 网关预留** — 模块化架构，为未来 AI 处理管线预留扩展点
-- **TOML 配置管理** — 支持环境变量引用 `${env.VAR}`
-- **双层日志** — 基于 tracing 的日志系统，同时输出到文件和 stderr
-- **Shell 补全** — 支持 bash / zsh / fish / powershell 自动补全
-
 ## 前置依赖
 
-安装 [lark-cli](https://github.com/larksuite/cli)（飞书官方 CLI）：
+haimen 通过外部 CLI 桥接 IM 平台，需要预先安装和认证：
+
+### 飞书/Lark
 
 ```bash
 npm install -g @larksuite/cli
-lark-cli auth login    # 设备码授权登录
+lark-cli auth login
+```
+
+### 钉钉
+
+```bash
+npm install -g dingtalk-workspace-cli
+dws auth login
 ```
 
 ## 快速开始
 
+### 启动 AI 网关
+
 ```bash
-# 显示帮助
-cargo run
+haimen start
+```
 
-# 查看飞书认证状态
-cargo run -- feishu auth status
+### 配置文件
 
-# 登录飞书
-cargo run -- feishu auth login
+配置文件位于 ~/.haimen/settings.toml：
 
-# 列出可访问的群聊
-cargo run -- feishu chat list
+```toml
+debug = false
+log_level = "info"
 
-# 监听飞书消息（事件订阅模式）
-cargo run -- feishu listen
+[http]
+enabled = true
+host = "0.0.0.0"
+port = 9527
 
-# 监听飞书消息（轮询模式）
-cargo run -- feishu listen --mode poll --chat-id oc_xxxxx
+[connectors.lark]
+enabled = true
+lark_cli_path = "lark-cli"
 
-# 显示配置
-cargo run -- config
+[connectors.dingtalk]
+enabled = false
+dws_path = "dws"
 
-# 显示网关状态
-cargo run -- gateway status
+[gateway]
+agent = "claude-code"
+session_idle_timeout_mins = 30
+session_max_turns = 20
+agent_timeout_secs = 300
+```
 
-# 运行测试
-cargo test
+## 项目结构
+
+```
+├── Cargo.toml               # 项目配置和依赖
+├── src/
+│   ├── main.rs              # 入口文件
+│   ├── lib.rs               # 库入口
+│   ├── cli.rs               # CLI 命令定义
+│   ├── config/              # TOML 配置管理
+│   ├── connectors/
+│   │   ├── dingtalk/        # 钉钉连接器适配层
+│   │   └── github/          # GitHub Webhook
+│   ├── gateway/             # 网关编排核心
+│   │   ├── mod.rs           # 构建 + 启动
+│   │   ├── chat_loop.rs     # 泛型编排循环
+│   │   ├── session.rs       # 会话管理
+│   │   └── ...
+│   ├── agents/              # AI Agent 实现
+│   ├── web/                 # HTTP 服务器
+│   ├── logging.rs
+│   └── datetime.rs
+├── crates/
+│   ├── haimen-core/         # 核心抽象
+│   ├── haimen-dingtalk/     # 钉钉 CLI 桥接
+│   ├── haimen-lark/         # 飞书 CLI 桥接
+│   └── haimen-xiaozhi/      # 小智语音通道
+├── web-ui/                  # 前端控制台
+├── tests/                   # 集成测试
+└── docs/                    # 技术文档
+```
+
+## 架构
+
+所有 IM API 通信通过外部 CLI 子进程桥接，haimen 不直接管理 IM 平台凭证。
+认证和 Token 生命周期由 CLI 自身管理（lark-cli / dws）。
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    haimen CLI (Rust)                        │
+│                                                             │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
+│  │ haimen-lark  │  │haimen-dingtk │  │ haimen-xiaozhi   │  │
+│  │ lark-cli桥接 │  │ dws CLI桥接  │  │ WebSocket 语音   │  │
+│  └──────┬───────┘  └──────┬───────┘  └──────────────────┘  │
+│         │                 │                                  │
+│         ▼                 ▼                                  │
+│  ┌──────────────┐  ┌──────────────┐                         │
+│  │   lark-cli   │  │     dws      │                         │
+│  │  (子进程)    │  │  (子进程)    │                         │
+│  └──────┬───────┘  └──────┬───────┘                         │
+│         │                 │                                  │
+│         ▼                 ▼                                  │
+│  ┌──────────────┐  ┌──────────────┐                         │
+│  │  飞书 OpenAPI│  │ 钉钉 OpenAPI │                         │
+│  └──────────────┘  └──────────────┘                         │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ## CLI 命令
@@ -103,101 +178,23 @@ haimen — AI 网关基建 CLI
 
 COMMANDS:
   config              显示配置信息
-  feishu              飞书集成
-    auth status       查看飞书认证状态
-    auth login        登录飞书（设备码授权）
-    chat list         列出可访问的群聊
-    listen [OPTIONS]  监听飞书消息
-  gateway
-    status            显示网关状态
-    listen            启动 AI 网关（飞书消息 → MCP → 回飞书）
-  serve [OPTIONS]     启动 HTTP Web 服务器
-  upgrade             升级 haimen 到最新版本
-  uninstall           卸载 haimen
-  completion <SHELL>  生成 Shell 补全脚本
+  start [OPTIONS]     启动 AI 网关（所有启用的连接器）
+    --no-browser      不自动打开浏览器
+  listen              单连接器模式
+  listen-echo         Echo 模式（直接回显）
+  serve [OPTIONS]     仅启动 Web 控制台
+  upgrade             升级
+  uninstall           卸载
+  completion <SHELL>  生成补全脚本
 ```
 
-### listen 命令
+## 开发
 
-| 参数         | 说明                         | 默认值   |
-| ------------ | ---------------------------- | -------- |
-| `--mode`     | 监听模式: `event` 或 `poll`  | `event`  |
-| `--chat-id`  | 聊天 ID（poll 模式必填）     | —        |
-| `--interval` | 轮询间隔（秒）               | 30       |
-| `--format`   | 输出格式: `pretty` 或 `json` | `pretty` |
-
-## 项目结构
-
-```
-├── Cargo.toml           # 项目配置和依赖
-├── rust-toolchain.toml  # Rust 工具链版本（1.85）
-├── src/
-│   ├── main.rs          # 入口文件
-│   ├── lib.rs           # 库入口 + 测试工具
-│   ├── cli.rs           # CLI 命令定义
-│   ├── config/
-│   │   ├── mod.rs       # 配置模块入口
-│   │   └── settings.rs  # TOML 配置管理
-│   ├── feishu/
-│   │   ├── mod.rs       # 飞书模块入口
-│   │   ├── types.rs     # 飞书数据模型
-│   │   ├── bridge.rs    # lark-cli 子进程桥接
-│   │   ├── auth.rs      # 飞书认证
-│   │   ├── chat.rs      # 群聊管理
-│   │   └── listen.rs    # 消息监听
-│   ├── gateway/
-│   │   └── mod.rs       # AI 网关占位模块
-│   ├── logging.rs       # tracing 双层日志
-│   └── datetime.rs      # 日期时间工具
-├── tests/               # 集成测试
-├── .github/workflows/   # CI/CD
-└── .githooks/           # Git hooks
-```
-
-## 架构
-
-```
-┌──────────────┐    subprocess     ┌──────────────┐    WebSocket     ┌─────────┐
-│   haimen CLI │ ────────────────> │   lark-cli   │ ──────────────> │  飞书   │
-│  (Rust)      │ <──────────────── │              │ <────────────── │  Open   │
-│              │   stdout JSON     │              │    Event Bus    │  API    │
-└──────────────┘                   └──────────────┘                 └─────────┘
-```
-
-所有飞书 API 通信通过 `lark-cli` 子进程桥接，haimen 不直接管理飞书凭证。
-
-## 依赖说明
-
-| 分类 | Crate                        | 用途                        |
-| ---- | ---------------------------- | --------------------------- |
-| 核心 | clap                         | CLI 参数解析                |
-| 核心 | tokio                        | 异步运行时                  |
-| 核心 | serde / serde_json / toml    | 序列化                      |
-| 核心 | chrono                       | 日期时间处理                |
-| 核心 | tracing / tracing-subscriber | 日志                        |
-| 核心 | thiserror / anyhow           | 错误处理                    |
-| 核心 | futures-util                 | 异步流处理                  |
-| 外部 | lark-cli                     | 飞书 API 桥接（需预先安装） |
-
-## 配置
-
-配置文件位于 `~/.haimen/settings.toml`：
-
-```toml
-debug = false
-log_level = "info"
-
-[feishu]
-lark_cli_path = "lark-cli"
-
-[feishu.listen]
-mode = "event"
-interval_secs = 30
-
-[gateway]
-# enabled = false
-# provider = "openai"
-# model = "gpt-4"
+```bash
+cargo run -- start         # 运行
+cargo test --all           # 测试
+cargo fmt --check          # 格式检查
+cargo clippy -- -D warnings # Lint 检查
 ```
 
 ## 许可
