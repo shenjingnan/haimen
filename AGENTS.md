@@ -57,7 +57,12 @@ cargo doc --open                    # 生成并打开 API 文档
 # 前端开发（web-ui/）
 cd web-ui && pnpm dev               # 启动 Vite 开发服务器（HMR）
 cd web-ui && pnpm build             # 构建前端产物
-cd web-ui && pnpm lint              # ESLint 检查
+cd web-ui && pnpm lint              # Biome lint + 自动修复
+cd web-ui && pnpm check             # Biome CI 严格检查
+cd web-ui && pnpm format            # Biome 格式化
+cd web-ui && pnpm test              # Vitest 测试
+cd web-ui && pnpm test:watch        # Vitest 监听模式
+cd web-ui && pnpm storybook         # Storybook 组件开发
 
 # 覆盖率
 cargo tarpaulin                     # 生成覆盖率报告
