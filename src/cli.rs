@@ -229,40 +229,30 @@ pub async fn run(cli: Cli) -> Result<(), String> {
                 }
             });
 
-            let app_key = || -> String {
-                std::env::var("DOUBAO_APP_KEY")
-                    .expect("LLM/ASR-TTS/TTS 模式需要设置 DOUBAO_APP_KEY 环境变量")
-            };
-            let access_token = || -> String {
-                std::env::var("DOUBAO_ACCESS_TOKEN")
-                    .expect("LLM/ASR-TTS/TTS 模式需要设置 DOUBAO_ACCESS_TOKEN 环境变量")
-            };
-
             let xiaozhi_strategy: Arc<dyn haimen_xiaozhi::ResponseStrategy> = if xiaozhi_echo {
                 Arc::new(haimen_xiaozhi::EchoStrategy)
             } else if xiaozhi_asr_tts {
-                Arc::new(crate::xiaozhi_asr_tts::AsrTtsStrategy::new(
-                    app_key(),
-                    access_token(),
+                Arc::new(crate::xiaozhi_asr_tts::AsrTtsStrategy::from_config(
+                    &settings.asr,
+                    &settings.tts,
                     xiaozhi_tts_voice,
-                ))
+                )?)
             } else if let Some(text) = xiaozhi_tts_text {
-                Arc::new(crate::xiaozhi_tts::TtsStrategy::new(
+                Arc::new(crate::xiaozhi_tts::TtsStrategy::from_config(
                     text,
                     xiaozhi_tts_voice,
-                    app_key(),
-                    access_token(),
+                    &settings.tts,
                 ))
             } else {
                 // 默认 ASR-LLM-TTS 模式
                 let llm_agent: Arc<dyn crate::gateway::provider::AgentProvider> =
                     create_agent(Some(xiaozhi_llm_provider.clone())).map(Arc::from)?;
-                Arc::new(crate::xiaozhi_asr_llm_tts::AsrLlmTtsStrategy::new(
-                    app_key(),
-                    access_token(),
+                Arc::new(crate::xiaozhi_asr_llm_tts::AsrLlmTtsStrategy::from_config(
+                    &settings.asr,
+                    &settings.tts,
                     xiaozhi_tts_voice,
                     llm_agent,
-                ))
+                )?)
             };
 
             let serve_config = crate::web::ServeConfig {

@@ -73,3 +73,26 @@ export interface LogEntry {
   message: string;
   source?: string;
 }
+
+// ── 语音配置 ──
+
+export interface AsrSettings {
+  provider: string;
+  app_key: string | null;
+  access_token: string | null;
+}
+
+export interface TtsSettings {
+  provider: string;
+  voice: string | null;
+  app_key: string | null;
+  access_token: string | null;
+  cluster: string | null;
+  resource_id: string | null;
+}
+
+export interface TtsVoice {
+  id: string;
+  name: string;
+  language: string;
+}

@@ -202,7 +202,137 @@ fn default_mcp_type() -> String {
     "stdio".to_string()
 }
 
-/// HTTP 服务器配置（`haimen start` 自动启动 Web 控制台 + xiaozhi + GitHub Webhook）
+/// ASR（语音识别）配置
+///
+/// 独立的基础能力，不绑定具体场景（xiaozhi 等），未来可被多种场景复用。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AsrConfig {
+    /// ASR 提供商
+    #[serde(default = "default_asr_provider")]
+    pub provider: String,
+    /// 火山引擎 App Key
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_key: Option<String>,
+    /// 火山引擎 Access Token
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+}
+
+fn default_asr_provider() -> String {
+    "doubao".to_string()
+}
+
+impl Default for AsrConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_asr_provider(),
+            app_key: None,
+            access_token: None,
+        }
+    }
+}
+
+impl AsrConfig {
+    /// 获取有效的 App Key（配置优先 → 环境变量）
+    pub fn resolved_app_key(&self) -> Result<String, String> {
+        self.app_key
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("DOUBAO_APP_KEY").ok())
+            .ok_or_else(|| {
+                "未设置 DOUBAO_APP_KEY（可在 settings.toml 或环境变量中设置）".to_string()
+            })
+    }
+
+    /// 获取有效的 Access Token（配置优先 → 环境变量）
+    pub fn resolved_access_token(&self) -> Result<String, String> {
+        self.access_token
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("DOUBAO_ACCESS_TOKEN").ok())
+            .ok_or_else(|| "未设置 DOUBAO_ACCESS_TOKEN".to_string())
+    }
+}
+
+/// TTS（语音合成）配置
+///
+/// 独立的基础能力，不绑定具体场景（xiaozhi 等），未来可被多种场景复用。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TtsConfig {
+    /// TTS 提供商
+    #[serde(default = "default_tts_provider")]
+    pub provider: String,
+    /// TTS 音色
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+    /// 火山引擎 App Key
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_key: Option<String>,
+    /// 火山引擎 Access Token
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+    /// 火山引擎 Cluster
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<String>,
+    /// Resource ID（声音克隆等场景）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_id: Option<String>,
+}
+
+fn default_tts_provider() -> String {
+    "doubao".to_string()
+}
+
+impl Default for TtsConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_tts_provider(),
+            voice: None,
+            app_key: None,
+            access_token: None,
+            cluster: None,
+            resource_id: None,
+        }
+    }
+}
+
+impl TtsConfig {
+    /// 获取有效的 App Key（配置优先 → 环境变量）
+    pub fn resolved_app_key(&self) -> Result<String, String> {
+        self.app_key
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("DOUBAO_APP_KEY").ok())
+            .ok_or_else(|| "未设置 DOUBAO_APP_KEY".to_string())
+    }
+
+    /// 获取有效的 Access Token（配置优先 → 环境变量）
+    pub fn resolved_access_token(&self) -> Result<String, String> {
+        self.access_token
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("DOUBAO_ACCESS_TOKEN").ok())
+            .ok_or_else(|| "未设置 DOUBAO_ACCESS_TOKEN".to_string())
+    }
+
+    /// 获取有效的音色（配置优先 → 环境变量 → 默认值）
+    pub fn resolved_voice(&self) -> String {
+        self.voice
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("DOUBAO_VOICE_TYPE").ok())
+            .unwrap_or_else(|| "zh_female_xiaohe_uranus_bigtts".to_string())
+    }
+
+    /// 获取有效的 Cluster（配置优先 → 环境变量）
+    pub fn resolved_cluster(&self) -> Option<String> {
+        self.cluster
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("DOUBAO_CLUSTER").ok())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HttpServerConfig {
     /// 是否启用 HTTP 服务器
@@ -264,6 +394,12 @@ pub struct AppConfig {
     /// HTTP 服务器配置（`haimen start` 自动启动）
     #[serde(default)]
     pub http: HttpServerConfig,
+    /// ASR 语音识别配置（独立能力）
+    #[serde(default)]
+    pub asr: AsrConfig,
+    /// TTS 语音合成配置（独立能力）
+    #[serde(default)]
+    pub tts: TtsConfig,
     /// GitHub Webhook 配置（后续方案 A 移入 connectors）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github: Option<crate::connectors::github::config::GitHubConfig>,
@@ -281,6 +417,8 @@ impl Default for AppConfig {
             gateway: GatewayConfig::default(),
             connectors: ConnectorsSection::default(),
             http: HttpServerConfig::default(),
+            asr: AsrConfig::default(),
+            tts: TtsConfig::default(),
             github: None,
         }
     }
@@ -302,6 +440,24 @@ pub fn load_settings() -> Result<Option<AppConfig>, String> {
         toml::from_str(&content).map_err(|e| format!("TOML 格式错误: {}", e))?;
 
     Ok(Some(config))
+}
+
+/// 保存完整配置到 ~/.haimen/settings.toml
+///
+/// 会覆盖整个文件（包括其他配置节），TOML 注释不会被保留。
+pub fn save_settings(config: &AppConfig) -> Result<(), String> {
+    let file_path = get_settings_path();
+
+    // 确保配置目录存在
+    if let Some(parent) = file_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {}", e))?;
+    }
+
+    let content = toml::to_string_pretty(config).map_err(|e| format!("序列化配置失败: {}", e))?;
+
+    std::fs::write(&file_path, content).map_err(|e| format!("写入配置文件失败: {}", e))?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -486,6 +642,10 @@ enabled = true
         assert!(config.connectors.dingtalk.is_none());
         assert!(config.gateway.agent.is_none());
         assert!(config.http.enabled);
+        assert_eq!(config.asr.provider, "doubao");
+        assert!(config.asr.app_key.is_none());
+        assert_eq!(config.tts.provider, "doubao");
+        assert!(config.tts.voice.is_none());
     }
 
     #[test]
@@ -509,6 +669,14 @@ enabled = true
                 host: "127.0.0.1".to_string(),
                 port: 8080,
                 auto_open_browser: true,
+            },
+            asr: AsrConfig {
+                app_key: Some("test-key".to_string()),
+                ..Default::default()
+            },
+            tts: TtsConfig {
+                voice: Some("zh_female_vv_uranus_bigtts".to_string()),
+                ..Default::default()
             },
             github: None,
         };
@@ -548,5 +716,191 @@ enabled = true
         let toml_str = toml::to_string(&config).unwrap();
         let deserialized: GatewayConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(deserialized.agent_timeout_secs, 600);
+    }
+
+    // ─── AsrConfig 测试 ───────────────────────────────────
+
+    #[test]
+    fn test_asr_config_default() {
+        let cfg = AsrConfig::default();
+        assert_eq!(cfg.provider, "doubao");
+        assert!(cfg.app_key.is_none());
+        assert!(cfg.access_token.is_none());
+    }
+
+    #[test]
+    fn test_asr_resolved_app_key_from_config() {
+        let cfg = AsrConfig {
+            app_key: Some("config-key".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolved_app_key().unwrap(), "config-key");
+    }
+
+    #[test]
+    fn test_asr_resolved_app_key_from_env() {
+        unsafe {
+            std::env::set_var("DOUBAO_APP_KEY", "env-key");
+        }
+        let cfg = AsrConfig::default();
+        assert_eq!(cfg.resolved_app_key().unwrap(), "env-key");
+        unsafe {
+            std::env::remove_var("DOUBAO_APP_KEY");
+        }
+    }
+
+    #[test]
+    fn test_asr_resolved_app_key_config_overrides_env() {
+        unsafe {
+            std::env::set_var("DOUBAO_APP_KEY", "env-key");
+        }
+        let cfg = AsrConfig {
+            app_key: Some("config-key".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolved_app_key().unwrap(), "config-key");
+        unsafe {
+            std::env::remove_var("DOUBAO_APP_KEY");
+        }
+    }
+
+    #[test]
+    fn test_asr_resolved_app_key_missing() {
+        let cfg = AsrConfig::default();
+        let result = cfg.resolved_app_key();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_asr_resolved_app_key_empty_string() {
+        let cfg = AsrConfig {
+            app_key: Some(String::new()),
+            ..Default::default()
+        };
+        let result = cfg.resolved_app_key();
+        assert!(result.is_err());
+    }
+
+    // ─── TtsConfig 测试 ───────────────────────────────────
+
+    #[test]
+    fn test_tts_config_default() {
+        let cfg = TtsConfig::default();
+        assert_eq!(cfg.provider, "doubao");
+        assert!(cfg.voice.is_none());
+        assert!(cfg.app_key.is_none());
+        assert!(cfg.access_token.is_none());
+    }
+
+    #[test]
+    fn test_tts_resolved_voice_from_config() {
+        let cfg = TtsConfig {
+            voice: Some("zh_female_vv_uranus_bigtts".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolved_voice(), "zh_female_vv_uranus_bigtts");
+    }
+
+    #[test]
+    fn test_tts_resolved_voice_from_env() {
+        unsafe {
+            std::env::set_var("DOUBAO_VOICE_TYPE", "env-voice");
+        }
+        let cfg = TtsConfig::default();
+        assert_eq!(cfg.resolved_voice(), "env-voice");
+        unsafe {
+            std::env::remove_var("DOUBAO_VOICE_TYPE");
+        }
+    }
+
+    #[test]
+    fn test_tts_resolved_voice_default() {
+        let cfg = TtsConfig::default();
+        let voice = cfg.resolved_voice();
+        assert_eq!(voice, "zh_female_xiaohe_uranus_bigtts");
+    }
+
+    #[test]
+    fn test_tts_resolved_voice_config_overrides_env() {
+        unsafe {
+            std::env::set_var("DOUBAO_VOICE_TYPE", "env-voice");
+        }
+        let cfg = TtsConfig {
+            voice: Some("zh_female_vv_uranus_bigtts".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolved_voice(), "zh_female_vv_uranus_bigtts");
+        unsafe {
+            std::env::remove_var("DOUBAO_VOICE_TYPE");
+        }
+    }
+
+    #[test]
+    fn test_tts_resolved_voice_empty_string_uses_env() {
+        unsafe {
+            std::env::set_var("DOUBAO_VOICE_TYPE", "env-voice");
+        }
+        let cfg = TtsConfig {
+            voice: Some(String::new()),
+            ..Default::default()
+        };
+        // 空字符串视为 None → 回退到环境变量
+        assert_eq!(cfg.resolved_voice(), "env-voice");
+        unsafe {
+            std::env::remove_var("DOUBAO_VOICE_TYPE");
+        }
+    }
+
+    #[test]
+    fn test_tts_resolved_cluster_from_config() {
+        let cfg = TtsConfig {
+            cluster: Some("volcano_icl".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolved_cluster().as_deref(), Some("volcano_icl"));
+    }
+
+    #[test]
+    fn test_tts_resolved_cluster_none() {
+        let cfg = TtsConfig::default();
+        assert!(cfg.resolved_cluster().is_none());
+    }
+
+    // ─── save_settings 测试 ───────────────────────────────
+
+    #[test]
+    fn test_save_and_load_settings() {
+        run_with_temp_home(|_home| {
+            let config = AppConfig {
+                debug: true,
+                asr: AsrConfig {
+                    app_key: Some("saved-key".to_string()),
+                    ..Default::default()
+                },
+                tts: TtsConfig {
+                    voice: Some("zh_female_vv_uranus_bigtts".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            save_settings(&config).unwrap();
+
+            let loaded = load_settings().unwrap().unwrap();
+            assert_eq!(loaded.asr.app_key, Some("saved-key".to_string()));
+            assert_eq!(
+                loaded.tts.voice,
+                Some("zh_female_vv_uranus_bigtts".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn test_save_settings_creates_directory() {
+        run_with_temp_home(|home| {
+            let config = AppConfig::default();
+            save_settings(&config).unwrap();
+            assert!(home.join(".haimen/settings.toml").exists());
+        });
     }
 }

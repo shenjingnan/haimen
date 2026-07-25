@@ -30,7 +30,33 @@ pub async fn start(
 ) -> Result<(), String> {
     use haimen_xiaozhi;
 
-    // 构建路由（WebhookState 分支需要用 .with_state() 传递 state）
+    // 构建路由
+    let voice_routes = axum::Router::new()
+        .route(
+            "/api/v1/settings/asr",
+            axum::routing::get(api::voice_settings::get_asr_settings),
+        )
+        .route(
+            "/api/v1/settings/asr",
+            axum::routing::put(api::voice_settings::update_asr_settings),
+        )
+        .route(
+            "/api/v1/settings/asr/verify",
+            axum::routing::post(api::voice_settings::verify_asr_credentials),
+        )
+        .route(
+            "/api/v1/settings/tts",
+            axum::routing::get(api::voice_settings::get_tts_settings),
+        )
+        .route(
+            "/api/v1/settings/tts",
+            axum::routing::put(api::voice_settings::update_tts_settings),
+        )
+        .route(
+            "/api/v1/settings/tts/voices",
+            axum::routing::get(api::voice_settings::list_tts_voices),
+        );
+
     let app = if let Some(state) = webhook_state {
         let mut r = axum::Router::new()
             .route("/health", axum::routing::get(health_handler))
@@ -43,6 +69,7 @@ pub async fn start(
         if let Some(strategy) = xiaozhi_strategy {
             r = haimen_xiaozhi::add_routes(r, strategy);
         }
+        r = r.merge(voice_routes);
         r.fallback(r#static::handle)
     } else {
         let mut r = axum::Router::new()
@@ -51,6 +78,7 @@ pub async fn start(
         if let Some(strategy) = xiaozhi_strategy {
             r = haimen_xiaozhi::add_routes(r, strategy);
         }
+        r = r.merge(voice_routes);
         r.fallback(r#static::handle)
     };
 
