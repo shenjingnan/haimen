@@ -1,3 +1,4 @@
+import { Eye, EyeOff } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 import {
   getAsrSettings,
@@ -7,15 +8,16 @@ import {
   updateTtsSettings,
   verifyAsrCredentials,
 } from '@/api/voice';
-import { Eye, EyeOff } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import VoiceSelector from '@/components/VoiceSelector';
-import type { AsrSettings, TtsSettings, TtsVoice } from '@/types';
+import { ASR_PROVIDERS } from '@/data/asr-providers';
+import type { TtsSettings, TtsVoice } from '@/types';
 
 type AsyncState<T> =
   | { type: 'loading' }
@@ -67,25 +69,30 @@ function PasswordInput({
 // ─── ASR 配置区域 ───────────────────────────────────────────
 
 function AsrSettingsPanel() {
-  const [state, setState] = useState<AsyncState<AsrSettings>>({ type: 'loading' });
-  const [appKey, setAppKey] = useState('');
-  const [accessToken, setAccessToken] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [editState, setEditState] = useState<Record<string, Record<string, string>>>({});
+  const [activeProvider, setActiveProvider] = useState('doubao');
+  const [selectedTab, setSelectedTab] = useState('doubao');
+  const [saving, setSaving] = useState(false);
+  const [saveResult, setSaveResult] = useState<string | null>(null);
+  const [verifying, setVerifying] = useState(false);
   const [verifyResult, setVerifyResult] = useState<{ valid: boolean; message: string } | null>(
     null,
   );
-  const [verifying, setVerifying] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [saveResult, setSaveResult] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    setState({ type: 'loading' });
+    setLoading(true);
+    setError(null);
     try {
       const data = await getAsrSettings();
-      setAppKey(data.app_key ?? '');
-      setAccessToken(data.access_token ?? '');
-      setState({ type: 'loaded', data });
+      setEditState(data.providers ?? {});
+      setActiveProvider(data.active_provider ?? 'doubao');
+      setSelectedTab(data.active_provider ?? 'doubao');
+      setLoading(false);
     } catch {
-      setState({ type: 'error', message: '加载 ASR 配置失败' });
+      setError('加载 ASR 配置失败');
+      setLoading(false);
     }
   }, []);
 
@@ -93,29 +100,26 @@ function AsrSettingsPanel() {
     load();
   }, [load]);
 
-  const handleVerify = async () => {
-    if (!appKey || !accessToken) return;
-    setVerifying(true);
-    try {
-      const result = await verifyAsrCredentials(appKey, accessToken);
-      setVerifyResult(result);
-    } catch {
-      setVerifyResult({ valid: false, message: '网络请求失败' });
-    } finally {
-      setVerifying(false);
-    }
+  const handleFieldChange = (key: string, value: string) => {
+    setEditState((prev) => ({
+      ...prev,
+      [selectedTab]: {
+        ...(prev[selectedTab] ?? {}),
+        [key]: value,
+      },
+    }));
   };
 
   const handleSave = async () => {
     setSaving(true);
     try {
       await updateAsrSettings({
-        app_key: appKey,
-        access_token: accessToken,
+        active_provider: activeProvider,
+        providers: editState,
       });
       setSaveResult('保存成功');
       setVerifyResult(null);
-      load();
+      await load();
     } catch {
       setSaveResult('保存失败');
     } finally {
@@ -124,20 +128,56 @@ function AsrSettingsPanel() {
     }
   };
 
-  if (state.type === 'loading') {
+  const handleSetActive = async () => {
+    setSaving(true);
+    try {
+      await updateAsrSettings({
+        active_provider: selectedTab,
+        providers: editState,
+      });
+      setActiveProvider(selectedTab);
+      setSaveResult('已切换激活服务商');
+      await load();
+    } catch {
+      setSaveResult('保存失败');
+    } finally {
+      setSaving(false);
+      setTimeout(() => setSaveResult(null), 3000);
+    }
+  };
+
+  const handleVerify = async () => {
+    const creds = editState[selectedTab] ?? {};
+    if (!Object.values(creds).some((v) => v.length > 0)) return;
+
+    setVerifying(true);
+    try {
+      const result = await verifyAsrCredentials(
+        creds,
+        selectedTab,
+      );
+      setVerifyResult(result);
+    } catch {
+      setVerifyResult({ valid: false, message: '网络请求失败' });
+    } finally {
+      setVerifying(false);
+    }
+  };
+
+  if (loading) {
     return (
       <Card>
         <CardHeader>
           <CardTitle>ASR 语音识别</CardTitle>
         </CardHeader>
         <CardContent>
-          <Skeleton className="h-32 w-full" />
+          <Skeleton className="h-48 w-full" />
         </CardContent>
       </Card>
     );
   }
 
-  if (state.type === 'error') {
+  if (error) {
     return (
       <Card>
         <CardHeader>
@@ -146,7 +186,7 @@ function AsrSettingsPanel() {
         <CardContent>
           <Alert variant="destructive">
             <AlertTitle>加载失败</AlertTitle>
-            <AlertDescription>{state.message}</AlertDescription>
+            <AlertDescription>{error}</AlertDescription>
           </Alert>
           <Button variant="outline" className="mt-2" onClick={load}>
             重试
@@ -158,62 +198,100 @@ function AsrSettingsPanel() {
 
   return (
     <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
+      <CardHeader className="pb-3">
+        <CardTitle className="flex items-center gap-2 text-base">
           ASR 语音识别
-          <Badge variant="secondary" className="text-xs">
-            {state.data.provider}
-          </Badge>
         </CardTitle>
       </CardHeader>
-      <CardContent className="space-y-4">
-        <div className="space-y-2">
-          <span className="text-sm font-medium">App Key</span>
-          <PasswordInput
-            id="asr-app-key"
-            placeholder={state.data.app_key ?? '未设置，使用环境变量 DOUBAO_APP_KEY'}
-            value={appKey}
-            onChange={setAppKey}
-          />
-        </div>
+      <CardContent>
+        <Tabs value={selectedTab} onValueChange={setSelectedTab} className="w-full">
+          {/* Tab 栏 */}
+          <TabsList>
+            {ASR_PROVIDERS.map((p) => {
+              const isActive = p.id === activeProvider;
 
-        <div className="space-y-2">
-          <span className="text-sm font-medium">Access Token</span>
-          <PasswordInput
-            id="asr-access-token"
-            placeholder={state.data.access_token ?? '未设置，使用环境变量 DOUBAO_ACCESS_TOKEN'}
-            value={accessToken}
-            onChange={setAccessToken}
-          />
-        </div>
+              return (
+                <TabsTrigger key={p.id} value={p.id}>
+                  {p.name}
+                  {isActive && (
+                    <Badge variant="default" className="text-[10px] px-1.5 py-0 leading-4">✓</Badge>
+                  )}
+                </TabsTrigger>
+              );
+            })}
+          </TabsList>
 
-        {verifyResult && (
-          <Alert variant={verifyResult.valid ? 'default' : 'destructive'}>
-            <AlertTitle>{verifyResult.valid ? '验证通过' : '验证失败'}</AlertTitle>
-            <AlertDescription>{verifyResult.message}</AlertDescription>
-          </Alert>
-        )}
+          {/* 每个服务商的配置面板 */}
+          {ASR_PROVIDERS.map((p) => (
+            <TabsContent key={p.id} value={p.id} className="space-y-4 mt-4">
+              {/* 服务商名称和状态 */}
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <span className="font-medium text-foreground">{p.name}</span>
+                {p.id === activeProvider ? (
+                  <Badge variant="default" className="text-[10px] px-1.5">
+                    当前激活
+                  </Badge>
+                ) : (
+                  <Badge variant="outline" className="text-[10px] px-1.5">
+                    未激活
+                  </Badge>
+                )}
+              </div>
 
-        <div className="flex items-center gap-2">
-          <Button
-            variant="outline"
-            onClick={handleVerify}
-            disabled={verifying || !appKey || !accessToken}
-          >
-            {verifying ? '验证中...' : '验证凭证'}
-          </Button>
-          <Button onClick={handleSave} disabled={saving}>
-            {saving ? '保存中...' : '保存 ASR'}
-          </Button>
-          {saveResult && (
-            <span
-              className={`text-sm ${saveResult === '保存成功' ? 'text-green-600' : 'text-red-600'}`}
-            >
-              {saveResult}
-            </span>
-          )}
-          <ApiStatusBadge success={!!state.data.app_key} label="未配置" />
-        </div>
+              {/* 动态字段 */}
+              {p.fields.map((field) => (
+                <div key={field.key} className="space-y-2">
+                  <span className="text-sm font-medium">{field.label}</span>
+                  <PasswordInput
+                    id={`asr-${p.id}-${field.key}`}
+                    placeholder={field.placeholder ?? `输入${field.label}`}
+                    value={editState[p.id]?.[field.key] ?? ''}
+                    onChange={(v) => handleFieldChange(field.key, v)}
+                  />
+                </div>
+              ))}
+
+              {/* 验证结果 */}
+              {verifyResult && (
+                <Alert variant={verifyResult.valid ? 'default' : 'destructive'}>
+                  <AlertTitle>{verifyResult.valid ? '验证通过' : '验证失败'}</AlertTitle>
+                  <AlertDescription>{verifyResult.message}</AlertDescription>
+                </Alert>
+              )}
+
+              {/* 操作按钮 */}
+              <div className="flex items-center gap-2 pt-2 flex-wrap">
+                <Button
+                  variant="outline"
+                  onClick={handleVerify}
+                  disabled={verifying || !p.fields.some((f) => editState[p.id]?.[f.key])}
+                >
+                  {verifying ? '验证中...' : '验证凭证'}
+                </Button>
+                <Button onClick={handleSave} disabled={saving}>
+                  {saving ? '保存中...' : '保存配置'}
+                </Button>
+                {p.id !== activeProvider && (
+                  <Button variant="secondary" onClick={handleSetActive} disabled={saving}>
+                    {saving ? '保存中...' : '🌟 设为首选'}
+                  </Button>
+                )}
+                {saveResult && (
+                  <span
+                    className={`text-sm ${
+                      saveResult === '保存成功' || saveResult === '已切换激活服务商'
+                        ? 'text-green-600'
+                        : 'text-red-600'
+                    }`}
+                  >
+                    {saveResult}
+                  </span>
+                )}
+              </div>
+            </TabsContent>
+          ))}
+        </Tabs>
+
       </CardContent>
     </Card>
   );
@@ -227,7 +305,9 @@ function TtsSettingsPanel() {
   const [voice, setVoice] = useState('');
   const [appKey, setAppKey] = useState('');
   const [accessToken, setAccessToken] = useState('');
-  const [verifyResult, setVerifyResult] = useState<{ valid: boolean; message: string } | null>(null);
+  const [verifyResult, setVerifyResult] = useState<{ valid: boolean; message: string } | null>(
+    null,
+  );
   const [verifying, setVerifying] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveResult, setSaveResult] = useState<string | null>(null);
@@ -272,7 +352,7 @@ function TtsSettingsPanel() {
     if (!appKey || !accessToken) return;
     setVerifying(true);
     try {
-      const result = await verifyAsrCredentials(appKey, accessToken);
+      const result = await verifyAsrCredentials({ app_key: appKey, access_key: accessToken }, 'doubao');
       setVerifyResult(result);
     } catch {
       setVerifyResult({ valid: false, message: '网络请求失败' });
@@ -344,7 +424,7 @@ function TtsSettingsPanel() {
           />
         </div>
 
-<div className="space-y-2">
+        <div className="space-y-2">
           <span className="text-sm font-medium" id="tts-voice-label">
             TTS 音色
           </span>

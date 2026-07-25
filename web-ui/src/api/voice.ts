@@ -14,8 +14,8 @@ export async function getAsrSettings(): Promise<AsrSettings> {
 }
 
 export async function updateAsrSettings(settings: {
-  app_key?: string;
-  access_token?: string;
+  active_provider?: string;
+  providers?: Record<string, Record<string, string>>;
 }): Promise<AsrSettings> {
   const res = await apiFetch<ApiResponse<AsrSettings>>('/api/v1/settings/asr', {
     method: 'PUT',
@@ -25,14 +25,15 @@ export async function updateAsrSettings(settings: {
 }
 
 export async function verifyAsrCredentials(
-  appKey: string,
-  accessToken: string,
+  creds: Record<string, string>,
+  provider: string,
 ): Promise<{ valid: boolean; message: string }> {
+  const body: Record<string, string> = { ...creds, provider };
   const res = await apiFetch<ApiResponse<{ valid: boolean; message: string }>>(
     '/api/v1/settings/asr/verify',
     {
       method: 'POST',
-      body: JSON.stringify({ app_key: appKey, access_token: accessToken }),
+      body: JSON.stringify(body),
     },
   );
   return ensureData(res);

@@ -39,3 +39,4 @@ settings.local.json
 
 # AI Agent plans
 .agents/plans/
+tmp

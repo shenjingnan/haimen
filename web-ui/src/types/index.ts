@@ -77,9 +77,15 @@ export interface LogEntry {
 // ── 语音配置 ──
 
 export interface AsrSettings {
-  provider: string;
-  app_key: string | null;
-  access_token: string | null;
+  /** 当前激活的服务商 */
+  active_provider: string;
+  /** 所有已配置提供商的凭证 { provider_name: { key: value } } */
+  providers: Record<string, Record<string, string>>;
+  /** 当前激活提供商的回退解析值 */
+  resolved?: {
+    app_key: string | null;
+    access_key: string | null;
+  };
 }
 
 export interface TtsSettings {

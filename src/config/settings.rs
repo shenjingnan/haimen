@@ -205,17 +205,34 @@ fn default_mcp_type() -> String {
 /// ASR（语音识别）配置
 ///
 /// 独立的基础能力，不绑定具体场景（xiaozhi 等），未来可被多种场景复用。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// # 配置格式
+///
+/// 支持多服务商配置，通过 `active_provider` 切换当前使用的服务商：
+///
+/// ```toml
+/// [asr]
+/// active_provider = "doubao"
+///
+/// [asr.providers.doubao]
+/// app_key = "..."
+/// access_key = "..."
+///
+/// [asr.providers.qwen]
+/// api_key = "..."
+/// ```
+///
+/// # 向后兼容
+///
+/// 旧格式 `provider = "doubao"` + `app_key` / `access_token` 在加载时自动迁移。
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct AsrConfig {
-    /// ASR 提供商
+    /// 当前激活的 ASR 提供商
     #[serde(default = "default_asr_provider")]
-    pub provider: String,
-    /// 火山引擎 App Key
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub app_key: Option<String>,
-    /// 火山引擎 Access Token
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub access_token: Option<String>,
+    pub active_provider: String,
+    /// 所有已配置的 ASR 提供商的凭证（{provider_name → {key → value}}）
+    #[serde(default)]
+    pub providers: HashMap<String, HashMap<String, String>>,
 }
 
 fn default_asr_provider() -> String {
@@ -225,32 +242,105 @@ fn default_asr_provider() -> String {
 impl Default for AsrConfig {
     fn default() -> Self {
         Self {
-            provider: default_asr_provider(),
-            app_key: None,
-            access_token: None,
+            active_provider: default_asr_provider(),
+            providers: HashMap::new(),
         }
     }
 }
 
+/// 旧格式 ASR 配置（用于向后兼容反序列化）
+#[derive(Debug, Clone, Deserialize)]
+struct AsrConfigLegacy {
+    provider: Option<String>,
+    app_key: Option<String>,
+    access_token: Option<String>,
+    active_provider: Option<String>,
+    providers: Option<HashMap<String, HashMap<String, String>>>,
+}
+
+impl<'de> Deserialize<'de> for AsrConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let legacy = AsrConfigLegacy::deserialize(deserializer)?;
+
+        // 如果已有新格式字段，直接使用
+        if let Some(active) = legacy.active_provider {
+            return Ok(Self {
+                active_provider: active,
+                providers: legacy.providers.unwrap_or_default(),
+            });
+        }
+
+        // 旧格式迁移
+        let provider = legacy.provider.unwrap_or_else(|| "doubao".to_string());
+        let mut providers = legacy.providers.unwrap_or_default();
+
+        // 如果旧格式有凭证值，迁移到 providers
+        let has_legacy_creds = legacy.app_key.is_some() || legacy.access_token.is_some();
+        if has_legacy_creds && !providers.contains_key(&provider) {
+            let mut creds = HashMap::new();
+            if let Some(key) = legacy.app_key.filter(|s| !s.is_empty()) {
+                creds.insert("app_key".to_string(), key);
+            }
+            if let Some(token) = legacy.access_token.filter(|s| !s.is_empty()) {
+                creds.insert("access_key".to_string(), token);
+            }
+            if !creds.is_empty() {
+                providers.insert(provider.clone(), creds);
+            }
+        }
+
+        Ok(Self {
+            active_provider: provider,
+            providers,
+        })
+    }
+}
+
 impl AsrConfig {
-    /// 获取有效的 App Key（配置优先 → 环境变量）
-    pub fn resolved_app_key(&self) -> Result<String, String> {
-        self.app_key
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("DOUBAO_APP_KEY").ok())
-            .ok_or_else(|| {
-                "未设置 DOUBAO_APP_KEY（可在 settings.toml 或环境变量中设置）".to_string()
-            })
+    /// 获取当前激活提供商的某个凭证值
+    ///
+    /// 查找顺序：providers 配置 → 环境变量（按提供商）
+    pub fn get_credential(&self, key: &str) -> Option<String> {
+        // 先从 providers 配置中查找
+        if let Some(val) = self
+            .providers
+            .get(&self.active_provider)
+            .and_then(|p| p.get(key))
+            .filter(|v| !v.is_empty())
+        {
+            return Some(val.clone());
+        }
+
+        // 回退到环境变量（按提供商映射）
+        match (self.active_provider.as_str(), key) {
+            ("doubao", "app_key") => std::env::var("DOUBAO_APP_KEY").ok(),
+            ("doubao", "access_key") => std::env::var("DOUBAO_ACCESS_TOKEN").ok(),
+            _ => None,
+        }
     }
 
-    /// 获取有效的 Access Token（配置优先 → 环境变量）
+    /// 获取有效的 App Key（兼容旧接口，从当前激活提供商读取）
+    pub fn resolved_app_key(&self) -> Result<String, String> {
+        self.get_credential("app_key")
+            .ok_or_else(|| "未设置 App Key（可在 settings.toml 或环境变量中设置）".to_string())
+    }
+
+    /// 获取有效的 Access Token / Key（兼容旧接口，从当前激活提供商读取）
     pub fn resolved_access_token(&self) -> Result<String, String> {
-        self.access_token
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("DOUBAO_ACCESS_TOKEN").ok())
-            .ok_or_else(|| "未设置 DOUBAO_ACCESS_TOKEN".to_string())
+        self.get_credential("access_key")
+            .ok_or_else(|| "未设置 Access Token（可在 settings.toml 或环境变量中设置）".to_string())
+    }
+
+    /// 获取指定提供商的指定凭证（不依赖 active_provider）
+    pub fn get_provider_credential(&self, provider: &str, key: &str) -> Option<String> {
+        self.providers
+            .get(provider)
+            .and_then(|p| p.get(key))
+            .filter(|v| !v.is_empty())
+            .cloned()
     }
 }
 
@@ -642,14 +732,20 @@ enabled = true
         assert!(config.connectors.dingtalk.is_none());
         assert!(config.gateway.agent.is_none());
         assert!(config.http.enabled);
-        assert_eq!(config.asr.provider, "doubao");
-        assert!(config.asr.app_key.is_none());
+        assert_eq!(config.asr.active_provider, "doubao");
+        assert!(config.asr.providers.is_empty());
         assert_eq!(config.tts.provider, "doubao");
         assert!(config.tts.voice.is_none());
     }
 
     #[test]
     fn test_app_config_serde_roundtrip() {
+        let mut providers = HashMap::new();
+        let mut doubao_creds = HashMap::new();
+        doubao_creds.insert("app_key".to_string(), "test-key".to_string());
+        doubao_creds.insert("access_key".to_string(), "test-token".to_string());
+        providers.insert("doubao".to_string(), doubao_creds);
+
         let config = AppConfig {
             debug: true,
             log_level: "warn".to_string(),
@@ -671,8 +767,8 @@ enabled = true
                 auto_open_browser: true,
             },
             asr: AsrConfig {
-                app_key: Some("test-key".to_string()),
-                ..Default::default()
+                active_provider: "doubao".to_string(),
+                providers,
             },
             tts: TtsConfig {
                 voice: Some("zh_female_vv_uranus_bigtts".to_string()),
@@ -723,16 +819,20 @@ enabled = true
     #[test]
     fn test_asr_config_default() {
         let cfg = AsrConfig::default();
-        assert_eq!(cfg.provider, "doubao");
-        assert!(cfg.app_key.is_none());
-        assert!(cfg.access_token.is_none());
+        assert_eq!(cfg.active_provider, "doubao");
+        assert!(cfg.providers.is_empty());
     }
 
     #[test]
     fn test_asr_resolved_app_key_from_config() {
+        let mut providers = HashMap::new();
+        let mut creds = HashMap::new();
+        creds.insert("app_key".to_string(), "config-key".to_string());
+        providers.insert("doubao".to_string(), creds);
+
         let cfg = AsrConfig {
-            app_key: Some("config-key".to_string()),
-            ..Default::default()
+            active_provider: "doubao".to_string(),
+            providers,
         };
         assert_eq!(cfg.resolved_app_key().unwrap(), "config-key");
     }
@@ -754,9 +854,14 @@ enabled = true
         unsafe {
             std::env::set_var("DOUBAO_APP_KEY", "env-key");
         }
+        let mut providers = HashMap::new();
+        let mut creds = HashMap::new();
+        creds.insert("app_key".to_string(), "config-key".to_string());
+        providers.insert("doubao".to_string(), creds);
+
         let cfg = AsrConfig {
-            app_key: Some("config-key".to_string()),
-            ..Default::default()
+            active_provider: "doubao".to_string(),
+            providers,
         };
         assert_eq!(cfg.resolved_app_key().unwrap(), "config-key");
         unsafe {
@@ -772,13 +877,73 @@ enabled = true
     }
 
     #[test]
-    fn test_asr_resolved_app_key_empty_string() {
+    fn test_asr_resolved_access_token_from_config() {
+        let mut providers = HashMap::new();
+        let mut creds = HashMap::new();
+        creds.insert("access_key".to_string(), "config-token".to_string());
+        providers.insert("doubao".to_string(), creds);
+
         let cfg = AsrConfig {
-            app_key: Some(String::new()),
-            ..Default::default()
+            active_provider: "doubao".to_string(),
+            providers,
         };
-        let result = cfg.resolved_app_key();
-        assert!(result.is_err());
+        assert_eq!(cfg.resolved_access_token().unwrap(), "config-token");
+    }
+
+    #[test]
+    fn test_asr_get_credential_different_provider() {
+        let mut providers = HashMap::new();
+        let mut qwen_creds = HashMap::new();
+        qwen_creds.insert("api_key".to_string(), "qwen-key".to_string());
+        providers.insert("qwen".to_string(), qwen_creds);
+        let mut doubao_creds = HashMap::new();
+        doubao_creds.insert("app_key".to_string(), "doubao-key".to_string());
+        providers.insert("doubao".to_string(), doubao_creds);
+
+        let cfg = AsrConfig {
+            active_provider: "qwen".to_string(),
+            providers,
+        };
+        assert_eq!(cfg.get_credential("api_key").unwrap(), "qwen-key");
+        // qwen 没有 app_key
+        assert!(cfg.get_credential("app_key").is_none());
+    }
+
+    #[test]
+    fn test_asr_old_format_migration() {
+        run_with_temp_home(|home| {
+            write_toml_settings(
+                home,
+                r#"
+[asr]
+provider = "doubao"
+app_key = "old-key"
+access_token = "old-token"
+"#,
+            );
+            let result = load_settings().unwrap().unwrap();
+            assert_eq!(result.asr.active_provider, "doubao");
+            let doubao = result.asr.providers.get("doubao").unwrap();
+            assert_eq!(doubao.get("app_key").unwrap(), "old-key");
+            assert_eq!(doubao.get("access_key").unwrap(), "old-token");
+        });
+    }
+
+    #[test]
+    fn test_asr_old_format_empty_migration() {
+        run_with_temp_home(|home| {
+            write_toml_settings(
+                home,
+                r#"
+[asr]
+provider = "doubao"
+"#,
+            );
+            let result = load_settings().unwrap().unwrap();
+            assert_eq!(result.asr.active_provider, "doubao");
+            // 没有凭证数据，providers 应为空
+            assert!(result.asr.providers.is_empty());
+        });
     }
 
     // ─── TtsConfig 测试 ───────────────────────────────────
@@ -871,11 +1036,16 @@ enabled = true
     #[test]
     fn test_save_and_load_settings() {
         run_with_temp_home(|_home| {
+            let mut providers = HashMap::new();
+            let mut creds = HashMap::new();
+            creds.insert("app_key".to_string(), "saved-key".to_string());
+            providers.insert("doubao".to_string(), creds);
+
             let config = AppConfig {
                 debug: true,
                 asr: AsrConfig {
-                    app_key: Some("saved-key".to_string()),
-                    ..Default::default()
+                    active_provider: "doubao".to_string(),
+                    providers,
                 },
                 tts: TtsConfig {
                     voice: Some("zh_female_vv_uranus_bigtts".to_string()),
@@ -887,7 +1057,14 @@ enabled = true
             save_settings(&config).unwrap();
 
             let loaded = load_settings().unwrap().unwrap();
-            assert_eq!(loaded.asr.app_key, Some("saved-key".to_string()));
+            assert_eq!(
+                loaded
+                    .asr
+                    .providers
+                    .get("doubao")
+                    .and_then(|p| p.get("app_key")),
+                Some(&"saved-key".to_string())
+            );
             assert_eq!(
                 loaded.tts.voice,
                 Some("zh_female_vv_uranus_bigtts".to_string())

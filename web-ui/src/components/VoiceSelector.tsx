@@ -10,11 +10,7 @@ import {
   CommandItem,
   CommandList,
 } from '@/components/ui/command';
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from '@/components/ui/popover';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { cn } from '@/lib/utils';
 import type { TtsVoice } from '@/types';
 
@@ -24,11 +20,7 @@ interface VoiceSelectorProps {
   onChange: (voiceId: string) => void;
 }
 
-export default function VoiceSelector({
-  voices,
-  selectedVoice,
-  onChange,
-}: VoiceSelectorProps) {
+export default function VoiceSelector({ voices, selectedVoice, onChange }: VoiceSelectorProps) {
   const [open, setOpen] = useState(false);
 
   const selected = voices.find((v) => v.id === selectedVoice);
@@ -42,9 +34,7 @@ export default function VoiceSelector({
           aria-expanded={open}
           className="w-full justify-between"
         >
-          {selected
-            ? `${selected.name} (${selected.id})`
-            : '选择音色...'}
+          {selected ? `${selected.name} (${selected.id})` : '选择音色...'}
           <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
         </Button>
       </PopoverTrigger>
@@ -66,9 +56,7 @@ export default function VoiceSelector({
                   <Check
                     className={cn(
                       'mr-2 h-4 w-4',
-                      selectedVoice === voice.id
-                        ? 'opacity-100'
-                        : 'opacity-0',
+                      selectedVoice === voice.id ? 'opacity-100' : 'opacity-0',
                     )}
                   />
                   <div className="flex flex-1 flex-col">
