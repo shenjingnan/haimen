@@ -46,7 +46,10 @@ export async function getTtsSettings(): Promise<TtsSettings> {
   return ensureData(res);
 }
 
-export async function updateTtsSettings(settings: Partial<TtsSettings>): Promise<TtsSettings> {
+export async function updateTtsSettings(settings: {
+  active_provider?: string;
+  providers?: Record<string, Record<string, string>>;
+}): Promise<TtsSettings> {
   const res = await apiFetch<ApiResponse<TtsSettings>>('/api/v1/settings/tts', {
     method: 'PUT',
     body: JSON.stringify(settings),
@@ -54,9 +57,25 @@ export async function updateTtsSettings(settings: Partial<TtsSettings>): Promise
   return ensureData(res);
 }
 
-export async function listTtsVoices(): Promise<TtsVoice[]> {
+export async function listTtsVoices(provider?: string): Promise<TtsVoice[]> {
+  const query = provider ? `?provider=${encodeURIComponent(provider)}` : '';
   const res = await apiFetch<ApiResponse<{ provider: string; voices: TtsVoice[] }>>(
-    '/api/v1/settings/tts/voices',
+    `/api/v1/settings/tts/voices${query}`,
   );
   return ensureData(res).voices;
+}
+
+export async function verifyTtsCredentials(
+  creds: Record<string, string>,
+  provider: string,
+): Promise<{ valid: boolean; message: string }> {
+  const body: Record<string, string> = { ...creds, provider };
+  const res = await apiFetch<ApiResponse<{ valid: boolean; message: string }>>(
+    '/api/v1/settings/tts/verify',
+    {
+      method: 'POST',
+      body: JSON.stringify(body),
+    },
+  );
+  return ensureData(res);
 }

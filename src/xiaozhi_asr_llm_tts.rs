@@ -41,8 +41,7 @@ use univoice::asr::{
     AsrProvider, AudioInput, AudioStream, BaseProviderOption, DEFAULT_CHUNK_SIZE, DoubaoAsr,
     DoubaoAsrMode, DoubaoAsrOption, adapt_audio_input,
 };
-use univoice::tts::provider::{DoubaoTts, DoubaoTtsOption};
-use univoice::tts::{BaseTtsOption, TtsProvider, TtsRequest};
+use univoice::tts::TtsRequest;
 
 use crate::gateway::provider::AgentProvider;
 use crate::xiaozhi_tts::pcm_to_opus_frames;
@@ -77,22 +76,14 @@ struct AsrPipelineState {
 /// ASR → LLM → TTS 响应策略：将设备录制的语音识别为文字，
 /// 送 AI Agent 处理，再将回复合成为语音回传
 ///
-/// 管线：Opus 解码 (16kHz) → Doubao ASR → AgentProvider → Doubao TTS (24kHz) → Opus 编码
+/// 管线：Opus 解码 (16kHz) → Doubao ASR → AgentProvider → TTS Provider (24kHz) → Opus 编码
 pub struct AsrLlmTtsStrategy {
     /// 火山引擎 App Key（ASR 使用）
     app_key: String,
     /// 火山引擎 Access Token（ASR 使用）
     access_token: String,
-    /// TTS 专用 App Key（可选，不设置时复用 ASR 的）
-    tts_app_key: Option<String>,
-    /// TTS 专用 Access Token（可选，不设置时复用 ASR 的）
-    tts_access_token: Option<String>,
-    /// TTS 音色（None 使用环境变量或默认值）
-    voice: Option<String>,
-    /// 火山引擎 Resource ID（用于声音克隆等）
-    resource_id: Option<String>,
-    /// 火山引擎 Cluster（用于推导 resource_id）
-    cluster: Option<String>,
+    /// TTS 配置（包含活跃提供商和凭证）
+    tts_config: crate::config::settings::TtsConfig,
     /// AI Agent（Claude Code、Codex 等）
     agent: Arc<dyn AgentProvider>,
     /// LLM 会话 ID，用于多轮对话上下文连续
@@ -139,29 +130,20 @@ impl AsrLlmTtsStrategy {
     ///
     /// # 参数
     ///
-    /// * `app_key` — 火山引擎 App Key
-    /// * `access_token` — 火山引擎 Access Token
-    /// * `voice` — TTS 音色（None 从环境变量或默认值读取）
+    /// * `app_key` — 火山引擎 App Key（ASR 使用）
+    /// * `access_token` — 火山引擎 Access Token（ASR 使用）
+    /// * `tts_config` — TTS 配置
     /// * `agent` — AI Agent 实例
     pub fn new(
         app_key: String,
         access_token: String,
-        voice: Option<String>,
+        tts_config: crate::config::settings::TtsConfig,
         agent: Arc<dyn AgentProvider>,
     ) -> Self {
-        let voice = voice
-            .or_else(|| std::env::var("DOUBAO_VOICE_TYPE").ok())
-            .or_else(|| Some("zh_female_xiaohe_uranus_bigtts".into()));
-        let cluster = std::env::var("DOUBAO_CLUSTER").ok();
-
         Self {
             app_key,
             access_token,
-            tts_app_key: None,
-            tts_access_token: None,
-            voice,
-            resource_id: None,
-            cluster,
+            tts_config,
             agent,
             llm_session_id: Mutex::new(None),
             streaming_state: Mutex::new(None),
@@ -181,33 +163,23 @@ impl AsrLlmTtsStrategy {
     ) -> Result<Self, String> {
         let app_key = asr.resolved_app_key()?;
         let access_token = asr.resolved_access_token()?;
-        let voice = voice_override
-            .or_else(|| tts.voice.clone().filter(|s| !s.is_empty()))
-            .or_else(|| std::env::var("DOUBAO_VOICE_TYPE").ok())
-            .or_else(|| Some("zh_female_xiaohe_uranus_bigtts".into()));
-        let cluster = tts.resolved_cluster();
-        let resource_id = tts.resource_id.clone();
 
-        // TTS 可能有独立的凭证
-        let tts_app_key = tts
-            .app_key
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("DOUBAO_APP_KEY").ok());
-        let tts_access_token = tts
-            .access_token
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("DOUBAO_ACCESS_TOKEN").ok());
+        // 用 CLI 覆盖的音色生成一个修改后的 TtsConfig
+        let tts_config = if let Some(ref v) = voice_override {
+            let mut cfg = tts.clone();
+            cfg.providers
+                .entry(cfg.active_provider.clone())
+                .or_default()
+                .insert("voice".to_string(), v.clone());
+            cfg
+        } else {
+            tts.clone()
+        };
 
         Ok(Self {
             app_key,
             access_token,
-            tts_app_key,
-            tts_access_token,
-            voice,
-            resource_id,
-            cluster,
+            tts_config,
             agent,
             llm_session_id: Mutex::new(None),
             streaming_state: Mutex::new(None),
@@ -216,36 +188,14 @@ impl AsrLlmTtsStrategy {
         })
     }
 
-    /// 获取 TTS 使用的 App Key（优先使用 TTS 专用，否则复用 ASR 的）
-    fn resolved_tts_app_key(&self) -> &str {
-        self.tts_app_key.as_deref().unwrap_or(&self.app_key)
-    }
-
-    /// 获取 TTS 使用的 Access Token（优先使用 TTS 专用，否则复用 ASR 的）
-    fn resolved_tts_access_token(&self) -> &str {
-        self.tts_access_token
-            .as_deref()
-            .unwrap_or(&self.access_token)
-    }
-
     /// 设置 Resource ID（声音克隆等场景）
     pub fn with_resource_id(mut self, resource_id: String) -> Self {
-        self.resource_id = Some(resource_id);
+        self.tts_config
+            .providers
+            .entry(self.tts_config.active_provider.clone())
+            .or_default()
+            .insert("resource_id".to_string(), resource_id);
         self
-    }
-
-    /// 将 cluster 映射为 resource_id
-    ///
-    /// - `volcano_icl` → `seed-tts-1.0`（声音克隆）
-    /// - 其他 → `seed-tts-2.0`
-    fn resolve_resource_id(&self) -> String {
-        if let Some(ref rid) = self.resource_id {
-            return rid.clone();
-        }
-        match self.cluster.as_deref() {
-            Some("volcano_icl") => "seed-tts-1.0".into(),
-            _ => "seed-tts-2.0".into(),
-        }
     }
 
     /// 尝试获取流式 ASR 管道的识别结果
@@ -705,27 +655,14 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         // Phase 3: 流式 TTS 合成 → Opus 编码 → 逐帧发送
         // ════════════════════════════════════════════════════════════════
 
-        let resource_id = self.resolve_resource_id();
-        let voice = self.voice.clone().map(Into::into);
-
         tracing::info!(
             session_id = %session_id,
-            voice = ?voice,
-            resource_id = %resource_id,
+            provider = %self.tts_config.active_provider,
             "TTS-STREAM: 开始流式语音合成",
         );
 
-        let tts = DoubaoTts::new(DoubaoTtsOption {
-            base: BaseTtsOption {
-                format: Some("pcm".into()),
-                voice,
-                ..Default::default()
-            },
-            app_id: Some(self.resolved_tts_app_key().to_string()),
-            access_token: Some(self.resolved_tts_access_token().to_string()),
-            resource_id: Some(resource_id),
-            ..Default::default()
-        });
+        let tts = crate::tts_factory::create_tts_provider(&self.tts_config)
+            .map_err(|e| format!("创建 TTS 提供者失败: {}", e))?;
 
         let mut audio_stream = tts
             .speak_stream(text_stream)
@@ -847,28 +784,15 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             "ASR-LLM-TTS: AI Agent 处理完成",
         );
 
-        // ── Step 4: Doubao TTS 语音合成 ──
-        let resource_id = self.resolve_resource_id();
-        let voice = self.voice.clone().map(Into::into);
-
+        // ── Step 4: TTS 语音合成 ──
         tracing::info!(
             session_id = %session_id,
-            voice = ?voice,
-            resource_id = %resource_id,
+            provider = %self.tts_config.active_provider,
             "ASR-LLM-TTS: 开始语音合成",
         );
 
-        let tts = DoubaoTts::new(DoubaoTtsOption {
-            base: BaseTtsOption {
-                format: Some("pcm".into()),
-                voice,
-                ..Default::default()
-            },
-            app_id: Some(self.resolved_tts_app_key().to_string()),
-            access_token: Some(self.resolved_tts_access_token().to_string()),
-            resource_id: Some(resource_id),
-            ..Default::default()
-        });
+        let tts = crate::tts_factory::create_tts_provider(&self.tts_config)
+            .map_err(|e| format!("创建 TTS 提供者失败: {}", e))?;
 
         let response = tts
             .synthesize(TtsRequest {
@@ -1101,8 +1025,25 @@ mod tests {
         }
     }
 
+    fn test_tts_config() -> crate::config::settings::TtsConfig {
+        let mut providers = std::collections::HashMap::new();
+        let mut creds = std::collections::HashMap::new();
+        creds.insert("app_key".to_string(), "test-app-key".to_string());
+        creds.insert("access_token".to_string(), "test-access-token".to_string());
+        providers.insert("doubao".to_string(), creds);
+        crate::config::settings::TtsConfig {
+            active_provider: "doubao".to_string(),
+            providers,
+        }
+    }
+
     fn make_strategy(agent: Arc<dyn AgentProvider>) -> AsrLlmTtsStrategy {
-        AsrLlmTtsStrategy::new("app_key".into(), "access_token".into(), None, agent)
+        AsrLlmTtsStrategy::new(
+            "app_key".into(),
+            "access_token".into(),
+            test_tts_config(),
+            agent,
+        )
     }
 
     // ─── Opus 编解码往返测试 ───────────────────────────
@@ -1231,73 +1172,10 @@ mod tests {
     #[test]
     fn test_t10_with_resource_id() {
         let strategy = make_strategy(Arc::new(MockAgent)).with_resource_id("seed-tts-1.0".into());
-        assert_eq!(strategy.resource_id, Some("seed-tts-1.0".into()));
-    }
-
-    #[test]
-    fn test_t11_resolve_resource_id_default() {
-        let strategy = make_strategy(Arc::new(MockAgent));
-        assert_eq!(strategy.resolve_resource_id(), "seed-tts-2.0");
-    }
-
-    #[test]
-    fn test_t12_resolve_resource_id_custom() {
-        let strategy =
-            make_strategy(Arc::new(MockAgent)).with_resource_id("custom-resource".into());
-        assert_eq!(strategy.resolve_resource_id(), "custom-resource");
-    }
-
-    #[test]
-    fn test_t13_voice_default_when_none() {
-        let strategy = make_strategy(Arc::new(MockAgent));
         assert_eq!(
-            strategy.voice.as_deref(),
-            Some("zh_female_xiaohe_uranus_bigtts")
+            strategy.tts_config.get_credential("resource_id").as_deref(),
+            Some("seed-tts-1.0")
         );
-    }
-
-    #[test]
-    fn test_t14_voice_uses_env_var() {
-        unsafe {
-            std::env::set_var("DOUBAO_VOICE_TYPE", "zh_female_vv_uranus_bigtts");
-        }
-        let strategy = make_strategy(Arc::new(MockAgent));
-        assert_eq!(
-            strategy.voice.as_deref(),
-            Some("zh_female_vv_uranus_bigtts")
-        );
-        unsafe {
-            std::env::remove_var("DOUBAO_VOICE_TYPE");
-        }
-    }
-
-    #[test]
-    fn test_t15_voice_cli_overrides_env() {
-        unsafe {
-            std::env::set_var("DOUBAO_VOICE_TYPE", "env_voice");
-        }
-        let strategy = AsrLlmTtsStrategy::new(
-            "k".into(),
-            "t".into(),
-            Some("cli_voice".into()),
-            Arc::new(MockAgent),
-        );
-        assert_eq!(strategy.voice.as_deref(), Some("cli_voice"));
-        unsafe {
-            std::env::remove_var("DOUBAO_VOICE_TYPE");
-        }
-    }
-
-    #[test]
-    fn test_t16_resolve_resource_id_volcano_icl() {
-        unsafe {
-            std::env::set_var("DOUBAO_CLUSTER", "volcano_icl");
-        }
-        let strategy = make_strategy(Arc::new(MockAgent));
-        assert_eq!(strategy.resolve_resource_id(), "seed-tts-1.0");
-        unsafe {
-            std::env::remove_var("DOUBAO_CLUSTER");
-        }
     }
 
     // ─── LLM session 管理测试 ───────────────────────────
@@ -1411,7 +1289,10 @@ mod tests {
     #[test]
     fn test_t29_with_resource_id_preserves_state() {
         let strategy = make_strategy(Arc::new(MockAgent)).with_resource_id("test-resource".into());
-        assert_eq!(strategy.resource_id, Some("test-resource".into()));
+        assert_eq!(
+            strategy.tts_config.get_credential("resource_id").as_deref(),
+            Some("test-resource")
+        );
         // streaming_state 不应受 with_resource_id 影响
         let guard = strategy.streaming_state.lock().unwrap();
         assert!(guard.is_none());

@@ -1,12 +1,12 @@
 //! xiaozhi-esp32 TTS 响应策略
 //!
-//! 将预设文本通过 Doubao TTS 合成为音频，编码为 Opus 帧后发送给设备播放。
+//! 将预设文本通过当前激活的 TTS Provider 合成为音频，编码为 Opus 帧后发送给设备播放。
 //!
 //! # 管线
 //!
 //! ```text
 //! 预设文本
-//!   ↓ DoubaoTts::synthesize(format="pcm", sample_rate=24000)
+//!   ↓ TtsProvider::synthesize(format="pcm", sample_rate=24000)
 //! PCM16 mono 24000Hz (Vec<u8>)
 //!   ↓ pcm_to_opus_frames() 按 60ms 分帧
 //! Vec<OpusPacket>
@@ -18,101 +18,54 @@
 use async_trait::async_trait;
 use haimen_xiaozhi::{AudioFrame, AudioParams, ResponseStrategy};
 use opus2::{self, Application, Channels};
-use univoice::tts::provider::{DoubaoTts, DoubaoTtsOption};
-use univoice::tts::{BaseTtsOption, TtsProvider, TtsRequest};
+use univoice::tts::TtsRequest;
+
+use crate::config::settings::TtsConfig;
 
 /// TTS 响应策略：忽略用户录音，将预设文本合成语音发送给设备
 ///
-/// # 关于音色和 Resource ID
-///
-/// 火山引擎 TTS 的 `resource_id` 要与音色匹配：
-/// - `seed-tts-1.0` — 用于经典 V1 音色（moon_bigtts, mars_bigtts 等）
-/// - `seed-tts-2.0` — 用于 V2 音色（uranus_bigtts, jupiter_bigtts 等）
-///
-/// 当 `cluster` 为 `volcano_icl` 时 → `seed-tts-1.0`
-/// 其他 cluster 值（含默认）→ `seed-tts-2.0`
+/// 通过 `TtsConfig.active_provider` 自动选择使用的 TTS 提供商。
 pub struct TtsStrategy {
     /// 要转成语音的文本
     text: String,
-    /// TTS 音色（None 使用环境变量 DOUBAO_VOICE_TYPE 或 Doubao V2 默认值）
+    /// TTS 音色覆盖（优先级高于配置）
     voice: Option<String>,
-    /// 火山引擎 App Key
-    app_key: String,
-    /// 火山引擎 Access Token
-    access_token: String,
-    /// 火山引擎 Resource ID（None 后由 cluster 推导）
-    resource_id: Option<String>,
-    /// 火山引擎 Cluster（用于推导 resource_id）
-    cluster: Option<String>,
+    /// TTS 配置（包含活跃提供商和凭证）
+    tts_config: TtsConfig,
 }
 
 impl TtsStrategy {
     /// 创建 TTS 策略
     ///
-    /// 音色和 cluster 未指定时会从环境变量 `DOUBAO_VOICE_TYPE` / `DOUBAO_CLUSTER` 读取。
-    pub fn new(text: String, voice: Option<String>, app_key: String, access_token: String) -> Self {
-        // 音色：CLI 参数 > 环境变量 > univoice 默认
-        let voice = voice
-            .or_else(|| std::env::var("DOUBAO_VOICE_TYPE").ok())
-            .or_else(|| Some("zh_female_xiaohe_uranus_bigtts".into()));
-        // cluster：环境变量
-        let cluster = std::env::var("DOUBAO_CLUSTER").ok();
-
+    /// 音色未指定时会从 `tts_config` 或默认值读取。
+    pub fn new(text: String, voice: Option<String>, tts_config: TtsConfig) -> Self {
         Self {
             text,
             voice,
-            app_key,
-            access_token,
-            resource_id: None,
-            cluster,
+            tts_config,
         }
     }
 
     /// 从 TTS 配置构建策略
     ///
     /// `voice_override` 可以覆盖配置中的音色（用于 CLI 参数 `--xiaozhi-tts-voice`）。
-    pub fn from_config(
-        text: String,
-        voice_override: Option<String>,
-        tts: &crate::config::settings::TtsConfig,
-    ) -> Self {
-        let voice = voice_override
-            .or_else(|| tts.voice.clone().filter(|s| !s.is_empty()))
-            .or_else(|| std::env::var("DOUBAO_VOICE_TYPE").ok())
-            .or_else(|| Some("zh_female_xiaohe_uranus_bigtts".into()));
-        let app_key = tts.resolved_app_key().unwrap_or_default();
-        let access_token = tts.resolved_access_token().unwrap_or_default();
-        let cluster = tts.resolved_cluster();
-        let resource_id = tts.resource_id.clone();
+    pub fn from_config(text: String, voice_override: Option<String>, tts: &TtsConfig) -> Self {
+        // 用 CLI 覆盖的音色生成一个修改后的 TtsConfig
+        let tts_config = if let Some(ref v) = voice_override {
+            let mut cfg = tts.clone();
+            cfg.providers
+                .entry(cfg.active_provider.clone())
+                .or_default()
+                .insert("voice".to_string(), v.clone());
+            cfg
+        } else {
+            tts.clone()
+        };
 
         Self {
             text,
-            voice,
-            app_key,
-            access_token,
-            resource_id,
-            cluster,
-        }
-    }
-
-    /// 设置 Resource ID（声音克隆等场景）
-    pub fn with_resource_id(mut self, resource_id: String) -> Self {
-        self.resource_id = Some(resource_id);
-        self
-    }
-
-    /// 将 cluster 映射为 resource_id
-    ///
-    /// 与 TypeScript `mapClusterToResourceId` 逻辑一致：
-    /// - `volcano_icl` → `seed-tts-1.0`（声音克隆）
-    /// - 其他 → `seed-tts-2.0`
-    fn resolve_resource_id(&self) -> String {
-        if let Some(ref rid) = self.resource_id {
-            return rid.clone();
-        }
-        match self.cluster.as_deref() {
-            Some("volcano_icl") => "seed-tts-1.0".into(),
-            _ => "seed-tts-2.0".into(),
+            voice: voice_override,
+            tts_config,
         }
     }
 }
@@ -139,31 +92,18 @@ impl ResponseStrategy for TtsStrategy {
         _audio_buffer: Vec<AudioFrame>,
         session_id: &str,
     ) -> Result<Vec<AudioFrame>, String> {
-        // 1. TTS 合成 → PCM
-        let resource_id = self.resolve_resource_id();
-        let voice = self.voice.clone().map(Into::into);
+        // 1. 通过工厂创建 TTS Provider
+        let tts = crate::tts_factory::create_tts_provider(&self.tts_config)?;
 
         tracing::info!(
             session_id = %session_id,
             text = %self.text,
-            voice = ?voice,
-            resource_id = %resource_id,
-            cluster = ?self.cluster,
+            voice = ?self.voice,
+            provider = %self.tts_config.active_provider,
             "TTS: 开始语音合成",
         );
 
-        let tts = DoubaoTts::new(DoubaoTtsOption {
-            base: BaseTtsOption {
-                format: Some("pcm".into()),
-                voice,
-                ..Default::default()
-            },
-            app_id: Some(self.app_key.clone()),
-            access_token: Some(self.access_token.clone()),
-            resource_id: Some(resource_id),
-            ..Default::default()
-        });
-
+        // 2. TTS 合成 → PCM
         let response = tts
             .synthesize(TtsRequest {
                 text: self.text.clone(),
@@ -187,7 +127,7 @@ impl ResponseStrategy for TtsStrategy {
             return Ok(Vec::new());
         }
 
-        // 2. PCM → Opus 帧（60ms 帧，24kHz，16-bit mono）
+        // 3. PCM → Opus 帧（60ms 帧，24kHz，16-bit mono）
         let opus_frames = pcm_to_opus_frames(&response.audio, 24000, 60)
             .map_err(|e| format!("Opus 编码失败: {}", e))?;
 
@@ -197,7 +137,7 @@ impl ResponseStrategy for TtsStrategy {
             "TTS: Opus 编码完成",
         );
 
-        // 3. 封装为 AudioFrame，时间戳从 0 开始累加 60ms
+        // 4. 封装为 AudioFrame，时间戳从 0 开始累加 60ms
         let mut frames = Vec::with_capacity(opus_frames.len());
         let mut timestamp: u32 = 0;
         for opus in opus_frames {
@@ -354,17 +294,27 @@ mod tests {
 
     // ─── TtsStrategy 基本测试 ───────────────────────────────
 
+    fn make_tts_config() -> crate::config::settings::TtsConfig {
+        let mut providers = std::collections::HashMap::new();
+        let mut creds = std::collections::HashMap::new();
+        creds.insert("app_key".to_string(), "test-app-key".to_string());
+        creds.insert("access_token".to_string(), "test-access-token".to_string());
+        providers.insert("doubao".to_string(), creds);
+        crate::config::settings::TtsConfig {
+            active_provider: "doubao".to_string(),
+            providers,
+        }
+    }
+
     #[test]
     fn test_t8_strategy_name() {
-        let strategy =
-            TtsStrategy::new("test".into(), None, "app_key".into(), "access_token".into());
+        let strategy = TtsStrategy::new("test".into(), None, make_tts_config());
         assert_eq!(strategy.name(), "tts");
     }
 
     #[test]
     fn test_t9_hello_audio_params() {
-        let strategy =
-            TtsStrategy::new("test".into(), None, "app_key".into(), "access_token".into());
+        let strategy = TtsStrategy::new("test".into(), None, make_tts_config());
         let client_params = AudioParams {
             format: "opus".into(),
             sample_rate: 16000,
@@ -383,65 +333,5 @@ mod tests {
     fn test_t10_strategy_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<TtsStrategy>();
-    }
-
-    #[test]
-    fn test_t11_with_resource_id() {
-        let strategy = TtsStrategy::new("t".into(), None, "k".into(), "t".into())
-            .with_resource_id("seed-tts-1.0".into());
-        assert_eq!(strategy.resource_id, Some("seed-tts-1.0".into()));
-    }
-
-    #[test]
-    fn test_t12_resolve_resource_id_default() {
-        // 无 cluster → seed-tts-2.0
-        let strategy = TtsStrategy::new("t".into(), None, "k".into(), "t".into());
-        assert_eq!(strategy.resolve_resource_id(), "seed-tts-2.0");
-    }
-
-    #[test]
-    fn test_t13_resolve_resource_id_custom() {
-        let strategy = TtsStrategy::new("t".into(), None, "k".into(), "t".into())
-            .with_resource_id("custom-resource".into());
-        assert_eq!(strategy.resolve_resource_id(), "custom-resource");
-    }
-
-    #[test]
-    fn test_t14_voice_default_when_none() {
-        // 当未设置 DOUBAO_VOICE_TYPE 环境变量时，应使用 V2 默认音色
-        let strategy = TtsStrategy::new("t".into(), None, "k".into(), "t".into());
-        assert_eq!(
-            strategy.voice.as_deref(),
-            Some("zh_female_xiaohe_uranus_bigtts")
-        );
-    }
-
-    #[test]
-    fn test_t15_voice_uses_env_var() {
-        // 设置 DOUBAO_VOICE_TYPE 环境变量
-        unsafe {
-            std::env::set_var("DOUBAO_VOICE_TYPE", "zh_female_vv_uranus_bigtts");
-        }
-        let strategy = TtsStrategy::new("t".into(), None, "k".into(), "t".into());
-        assert_eq!(
-            strategy.voice.as_deref(),
-            Some("zh_female_vv_uranus_bigtts")
-        );
-        unsafe {
-            std::env::remove_var("DOUBAO_VOICE_TYPE");
-        }
-    }
-
-    #[test]
-    fn test_t16_voice_cli_overrides_env() {
-        unsafe {
-            std::env::set_var("DOUBAO_VOICE_TYPE", "env_voice");
-        }
-        let strategy =
-            TtsStrategy::new("t".into(), Some("cli_voice".into()), "k".into(), "t".into());
-        assert_eq!(strategy.voice.as_deref(), Some("cli_voice"));
-        unsafe {
-            std::env::remove_var("DOUBAO_VOICE_TYPE");
-        }
     }
 }

@@ -55,6 +55,10 @@ pub async fn start(
         .route(
             "/api/v1/settings/tts/voices",
             axum::routing::get(api::voice_settings::list_tts_voices),
+        )
+        .route(
+            "/api/v1/settings/tts/verify",
+            axum::routing::post(api::voice_settings::verify_tts_credentials),
         );
 
     let app = if let Some(state) = webhook_state {

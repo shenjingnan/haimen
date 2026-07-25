@@ -8,28 +8,20 @@
 //! - `GET /api/v1/settings/asr` — 获取 ASR 配置（所有提供商 + 当前激活）
 //! - `PUT /api/v1/settings/asr` — 更新 ASR 全部配置（providers + active_provider）
 //! - `POST /api/v1/settings/asr/verify` — 验证指定提供商的凭证有效性
-//! - `GET /api/v1/settings/tts` — 获取 TTS 配置（脱敏）
-//! - `PUT /api/v1/settings/tts` — 更新 TTS 配置 + 持久化
-//! - `GET /api/v1/settings/tts/voices` — 获取可用音色列表
+//! - `GET /api/v1/settings/tts` — 获取 TTS 配置（所有提供商 + 当前激活）
+//! - `PUT /api/v1/settings/tts` — 更新 TTS 全部配置（providers + active_provider）
+//! - `GET /api/v1/settings/tts/voices` — 获取可用音色列表（支持 `?provider=` 参数）
+//! - `POST /api/v1/settings/tts/verify` — 验证指定 TTS 提供商的凭证有效性
 
 use std::collections::HashMap;
 
-use axum::{Json, http::StatusCode};
+use axum::{Json, extract::Query, http::StatusCode};
 
 use crate::config::settings::AppConfig;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 工具函数
 // ═══════════════════════════════════════════════════════════════════════════════
-
-/// 从请求 JSON 中读取可选的字符串字段，空字符串视为 `None`（清除）
-fn optional_str(value: &serde_json::Value, key: &str) -> Option<Option<String>> {
-    value.get(key).map(|v| match v.as_str() {
-        Some("") => None,
-        Some(s) => Some(s.to_string()),
-        None => None,
-    })
-}
 
 /// 从请求 JSON 中读取 providers 映射
 fn parse_providers(value: &serde_json::Value) -> Option<HashMap<String, HashMap<String, String>>> {
@@ -333,43 +325,46 @@ async fn verify_doubao_token(app_key: &str, access_token: &str) -> Result<(), St
 
 /// `GET /api/v1/settings/tts`
 ///
-/// 返回实际生效的配置值（配置优先，未设置时回退到环境变量）。
+/// 返回完整的 TTS 配置：所有已配置的提供商凭证 + 当前激活的提供商。
 /// 凭证字段返回明文，前端通过 `type="password"` 控制展示/隐藏。
+///
+/// 同时返回当前激活提供商的 resolved 值（配置 → 环境变量回退）。
 pub async fn get_tts_settings() -> Json<serde_json::Value> {
     let cfg = load_config();
     Json(serde_json::json!({
         "success": true,
         "data": {
-            "provider": cfg.tts.provider,
-            "voice": Some(cfg.tts.resolved_voice()),
-            "app_key": cfg.tts.resolved_app_key().ok(),
-            "access_token": cfg.tts.resolved_access_token().ok(),
-            "cluster": cfg.tts.resolved_cluster(),
-            "resource_id": cfg.tts.resource_id,
+            "active_provider": cfg.tts.active_provider,
+            "providers": cfg.tts.providers,
+            "resolved": {
+                "app_key": cfg.tts.resolved_app_key().ok(),
+                "access_token": cfg.tts.resolved_access_token().ok(),
+                "voice": Some(cfg.tts.resolved_voice()),
+            }
         }
     }))
 }
 
 /// `PUT /api/v1/settings/tts`
+///
+/// 替换完整的 TTS 配置。支持以下字段：
+/// - `active_provider` — 切换当前激活的服务商
+/// - `providers` — 所有提供商的完整凭证映射
 pub async fn update_tts_settings(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let mut cfg = load_config();
 
-    if let Some(val) = optional_str(&body, "voice") {
-        cfg.tts.voice = val;
+    // 更新 active_provider（如果提供）
+    if let Some(active) = body.get("active_provider").and_then(|v| v.as_str()) {
+        if !active.is_empty() {
+            cfg.tts.active_provider = active.to_string();
+        }
     }
-    if let Some(val) = optional_str(&body, "app_key") {
-        cfg.tts.app_key = val;
-    }
-    if let Some(val) = optional_str(&body, "access_token") {
-        cfg.tts.access_token = val;
-    }
-    if let Some(val) = optional_str(&body, "cluster") {
-        cfg.tts.cluster = val;
-    }
-    if let Some(val) = optional_str(&body, "resource_id") {
-        cfg.tts.resource_id = val;
+
+    // 更新 providers（如果提供）
+    if let Some(providers) = parse_providers(&body) {
+        cfg.tts.providers = providers;
     }
 
     if let Err(e) = crate::config::settings::save_settings(&cfg) {
@@ -386,23 +381,36 @@ pub async fn update_tts_settings(
     Ok(Json(serde_json::json!({
         "success": true,
         "data": {
-            "provider": cfg.tts.provider,
-            "voice": cfg.tts.voice,
-            "app_key": cfg.tts.app_key,
-            "access_token": cfg.tts.access_token,
-            "cluster": cfg.tts.cluster,
-            "resource_id": cfg.tts.resource_id,
+            "active_provider": cfg.tts.active_provider,
+            "providers": cfg.tts.providers,
         }
     })))
 }
 
 /// `GET /api/v1/settings/tts/voices`
-pub async fn list_tts_voices() -> Json<serde_json::Value> {
-    let voices = univoice::tts::voices::doubao::list_voices();
+///
+/// 获取指定提供商的可用音色列表。通过 `?provider=doubao` 查询参数指定。
+/// 默认返回当前激活提供商的音色。
+pub async fn list_tts_voices(params: Query<HashMap<String, String>>) -> Json<serde_json::Value> {
+    let cfg = load_config();
+    let provider = params
+        .get("provider")
+        .map(String::as_str)
+        .unwrap_or_else(|| cfg.tts.active_provider.as_str());
+
+    let voices = match provider {
+        "doubao" => univoice::tts::voices::doubao::list_voices(),
+        "qwen" => univoice::tts::voices::qwen::list_voices(),
+        "glm" => univoice::tts::voices::glm::list_voices(),
+        "minimax" => univoice::tts::voices::minimax::list_voices(),
+        "qwen_realtime" => univoice::tts::voices::qwen_realtime::list_voices(),
+        _ => Vec::new(),
+    };
+
     Json(serde_json::json!({
         "success": true,
         "data": {
-            "provider": "doubao",
+            "provider": provider,
             "voices": voices.iter().map(|v| serde_json::json!({
                 "id": v.id,
                 "name": v.name,
@@ -412,6 +420,135 @@ pub async fn list_tts_voices() -> Json<serde_json::Value> {
     }))
 }
 
+/// `POST /api/v1/settings/tts/verify`
+///
+/// 验证指定 TTS 提供商的凭证是否有效。
+///
+/// 请求体包含 `provider` 字段和各提供商对应的凭证字段：
+/// - doubao: `app_key` + `access_token`
+/// - qwen / glm / openai / minimax / gemini: `api_key`
+/// - xfyun: `app_id` + `api_key` + `api_secret`
+pub async fn verify_tts_credentials(
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let provider = body
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("doubao");
+
+    match provider {
+        "doubao" => verify_tts_doubao(&body).await,
+        "qwen" => {
+            verify_http_key(
+                "qwen",
+                &body,
+                "api_key",
+                "Authorization",
+                "Bearer {key}",
+                "https://dashscope.aliyuncs.com/api/v1/models",
+            )
+            .await
+        }
+        "glm" => {
+            verify_http_key(
+                "glm",
+                &body,
+                "api_key",
+                "Authorization",
+                "Bearer {key}",
+                "https://open.bigmodel.cn/api/paas/v4/audio/transcriptions",
+            )
+            .await
+        }
+        "openai" => {
+            verify_http_key(
+                "openai",
+                &body,
+                "api_key",
+                "Authorization",
+                "Bearer {key}",
+                "https://api.openai.com/v1/models",
+            )
+            .await
+        }
+        "minimax" => {
+            verify_http_key(
+                "minimax",
+                &body,
+                "api_key",
+                "Authorization",
+                "Bearer {key}",
+                "https://api.minimax.chat/v1/text/chatcompletion_v2",
+            )
+            .await
+        }
+        "gemini" => {
+            verify_http_key(
+                "gemini",
+                &body,
+                "api_key",
+                "x-goog-api-key",
+                "{key}",
+                "https://generativelanguage.googleapis.com/v1/models",
+            )
+            .await
+        }
+        "xfyun" => Ok(Json(serde_json::json!({
+            "success": true,
+            "data": { "valid": false, "message": "讯飞凭证验证需 WebSocket HMAC 鉴权，请在 Web UI 保存后直接测试语音合成功能".to_string() }
+        }))),
+        _ => Ok(Json(serde_json::json!({
+            "success": true,
+            "data": { "valid": false, "message": format!("暂不支持验证 {} 提供商", provider) }
+        }))),
+    }
+}
+
+/// 用提供的凭证调用 Doubao TTS 合成测试音频验证有效性
+///
+/// 复用 ASR 端的 verify_doubao 逻辑（TTS 合成测试）
+async fn verify_tts_doubao(
+    body: &serde_json::Value,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let app_key = body
+        .get("app_key")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "缺少 app_key"
+                })),
+            )
+        })?;
+    let access_token = body
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "缺少 access_token"
+                })),
+            )
+        })?;
+
+    match verify_doubao_token(app_key, access_token).await {
+        Ok(()) => Ok(Json(serde_json::json!({
+            "success": true,
+            "data": { "valid": true, "message": "凭证验证成功" }
+        }))),
+        Err(e) => Ok(Json(serde_json::json!({
+            "success": true,
+            "data": { "valid": false, "message": format!("凭证验证失败: {}", e) }
+        }))),
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // 测试
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -419,30 +556,6 @@ pub async fn list_tts_voices() -> Json<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_optional_str_present() {
-        let json = serde_json::json!({"key": "value"});
-        assert_eq!(optional_str(&json, "key"), Some(Some("value".to_string())));
-    }
-
-    #[test]
-    fn test_optional_str_empty_as_none() {
-        let json = serde_json::json!({"key": ""});
-        assert_eq!(optional_str(&json, "key"), Some(None));
-    }
-
-    #[test]
-    fn test_optional_str_missing() {
-        let json = serde_json::json!({"other": "val"});
-        assert_eq!(optional_str(&json, "key"), None);
-    }
-
-    #[test]
-    fn test_optional_str_null() {
-        let json = serde_json::json!({"key": null});
-        assert_eq!(optional_str(&json, "key"), Some(None));
-    }
 
     #[test]
     fn test_parse_providers_valid() {
