@@ -68,26 +68,29 @@ pub fn build_agent(
 /// 根据配置和环境变量构造 xiaozhi WebSocket 响应策略
 ///
 /// 默认使用 ASR-LLM-TTS 模式（语音识别 → Claude Code 处理 → 语音合成）。
-/// 需要设置 `DOUBAO_APP_KEY` 和 `DOUBAO_ACCESS_TOKEN` 环境变量。
-/// 环境变量缺失时跳过 xiaozhi 路由（不挂载）。
-fn build_xiaozhi_strategy() -> Option<Arc<dyn haimen_xiaozhi::ResponseStrategy>> {
+/// 需要配置 ASR 和 TTS 提供商凭证。环境变量缺失时跳过 xiaozhi 路由（不挂载）。
+fn build_xiaozhi_strategy(
+    config: &crate::config::settings::AppConfig,
+) -> Option<Arc<dyn haimen_xiaozhi::ResponseStrategy>> {
+    // 检查 ASR 凭证
     let (app_key, access_token) = match (
-        std::env::var("DOUBAO_APP_KEY"),
-        std::env::var("DOUBAO_ACCESS_TOKEN"),
+        config.asr.resolved_app_key(),
+        config.asr.resolved_access_token(),
     ) {
         (Ok(key), Ok(token)) => (key, token),
         _ => {
-            tracing::info!("未设置 DOUBAO_APP_KEY / DOUBAO_ACCESS_TOKEN，xiaozhi WebSocket 不启动");
+            tracing::info!("未配置 ASR 凭证（app_key / access_token），xiaozhi WebSocket 不启动");
             return None;
         }
     };
 
     let llm_agent: Arc<dyn AgentProvider> = Arc::new(ClaudeAgent);
+    let tts_config = config.tts.clone();
     Some(Arc::new(
         crate::xiaozhi_asr_llm_tts::AsrLlmTtsStrategy::new(
             app_key,
             access_token,
-            None, // 默认音色
+            tts_config,
             llm_agent,
         ),
     ))
@@ -145,7 +148,7 @@ pub async fn start_all(cli_no_browser: bool) -> Result<(), String> {
             }
         });
 
-        let xiaozhi_strategy = build_xiaozhi_strategy();
+        let xiaozhi_strategy = build_xiaozhi_strategy(&config);
 
         tracing::info!(
             "HTTP 服务器启动于 {}:{}{}",

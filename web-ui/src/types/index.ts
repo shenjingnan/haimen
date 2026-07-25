@@ -89,12 +89,16 @@ export interface AsrSettings {
 }
 
 export interface TtsSettings {
-  provider: string;
-  voice: string | null;
-  app_key: string | null;
-  access_token: string | null;
-  cluster: string | null;
-  resource_id: string | null;
+  /** 当前激活的服务商 */
+  active_provider: string;
+  /** 所有已配置提供商的凭证 { provider_name: { key: value } } */
+  providers: Record<string, Record<string, string>>;
+  /** 当前激活提供商的回退解析值 */
+  resolved?: {
+    app_key: string | null;
+    access_token: string | null;
+    voice: string | null;
+  };
 }
 
 export interface TtsVoice {

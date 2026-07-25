@@ -7,6 +7,7 @@ pub mod connectors;
 pub mod datetime;
 pub mod gateway;
 pub mod logging;
+pub mod tts_factory;
 pub mod web;
 pub mod xiaozhi_asr_llm_tts;
 pub mod xiaozhi_asr_tts;

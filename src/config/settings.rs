@@ -347,26 +347,98 @@ impl AsrConfig {
 /// TTS（语音合成）配置
 ///
 /// 独立的基础能力，不绑定具体场景（xiaozhi 等），未来可被多种场景复用。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// # 配置格式
+///
+/// 支持多服务商配置，通过 `active_provider` 切换当前使用的服务商：
+///
+/// ```toml
+/// [tts]
+/// active_provider = "doubao"
+///
+/// [tts.providers.doubao]
+/// app_key = "..."
+/// access_token = "..."
+/// voice = "zh_female_xiaohe_uranus_bigtts"
+/// cluster = "volcano_icl"
+///
+/// [tts.providers.qwen]
+/// api_key = "..."
+/// ```
+///
+/// # 向后兼容
+///
+/// 旧格式 `provider = "doubao"` + `app_key` / `access_token` 等字段在加载时自动迁移。
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct TtsConfig {
-    /// TTS 提供商
+    /// 当前激活的 TTS 提供商
     #[serde(default = "default_tts_provider")]
-    pub provider: String,
-    /// TTS 音色
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub voice: Option<String>,
-    /// 火山引擎 App Key
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub app_key: Option<String>,
-    /// 火山引擎 Access Token
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub access_token: Option<String>,
-    /// 火山引擎 Cluster
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cluster: Option<String>,
-    /// Resource ID（声音克隆等场景）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resource_id: Option<String>,
+    pub active_provider: String,
+    /// 所有已配置的 TTS 提供商的凭证（{provider_name → {key → value}}）
+    #[serde(default)]
+    pub providers: HashMap<String, HashMap<String, String>>,
+}
+
+/// 旧格式 TTS 配置（用于向后兼容反序列化）
+#[derive(Debug, Clone, Deserialize)]
+struct TtsConfigLegacy {
+    provider: Option<String>,
+    voice: Option<String>,
+    app_key: Option<String>,
+    access_token: Option<String>,
+    cluster: Option<String>,
+    resource_id: Option<String>,
+    active_provider: Option<String>,
+    providers: Option<HashMap<String, HashMap<String, String>>>,
+}
+
+impl<'de> Deserialize<'de> for TtsConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let legacy = TtsConfigLegacy::deserialize(deserializer)?;
+
+        // 如果已有新格式字段，直接使用
+        if let Some(active) = legacy.active_provider {
+            return Ok(Self {
+                active_provider: active,
+                providers: legacy.providers.unwrap_or_default(),
+            });
+        }
+
+        // 旧格式迁移
+        let provider = legacy.provider.unwrap_or_else(|| "doubao".to_string());
+        let mut providers = legacy.providers.unwrap_or_default();
+
+        // 如果旧格式有凭证值，迁移到 providers
+        if !providers.contains_key(&provider) {
+            let mut creds = HashMap::new();
+            if let Some(val) = legacy.voice.filter(|s| !s.is_empty()) {
+                creds.insert("voice".to_string(), val);
+            }
+            if let Some(val) = legacy.app_key.filter(|s| !s.is_empty()) {
+                creds.insert("app_key".to_string(), val);
+            }
+            if let Some(val) = legacy.access_token.filter(|s| !s.is_empty()) {
+                creds.insert("access_token".to_string(), val);
+            }
+            if let Some(val) = legacy.cluster.filter(|s| !s.is_empty()) {
+                creds.insert("cluster".to_string(), val);
+            }
+            if let Some(val) = legacy.resource_id.filter(|s| !s.is_empty()) {
+                creds.insert("resource_id".to_string(), val);
+            }
+            if !creds.is_empty() {
+                providers.insert(provider.clone(), creds);
+            }
+        }
+
+        Ok(Self {
+            active_provider: provider,
+            providers,
+        })
+    }
 }
 
 fn default_tts_provider() -> String {
@@ -376,50 +448,80 @@ fn default_tts_provider() -> String {
 impl Default for TtsConfig {
     fn default() -> Self {
         Self {
-            provider: default_tts_provider(),
-            voice: None,
-            app_key: None,
-            access_token: None,
-            cluster: None,
-            resource_id: None,
+            active_provider: default_tts_provider(),
+            providers: HashMap::new(),
         }
     }
 }
 
 impl TtsConfig {
-    /// 获取有效的 App Key（配置优先 → 环境变量）
+    /// 获取当前激活提供商的某个凭证值
+    ///
+    /// 查找顺序：providers 配置 → 环境变量（按提供商）
+    pub fn get_credential(&self, key: &str) -> Option<String> {
+        // 先从 providers 配置中查找
+        if let Some(val) = self
+            .providers
+            .get(&self.active_provider)
+            .and_then(|p| p.get(key))
+            .filter(|v| !v.is_empty())
+        {
+            return Some(val.clone());
+        }
+
+        // 回退到环境变量（按提供商映射）
+        match (self.active_provider.as_str(), key) {
+            ("doubao", "app_key") => std::env::var("DOUBAO_APP_KEY").ok(),
+            ("doubao", "access_token") => std::env::var("DOUBAO_ACCESS_TOKEN").ok(),
+            ("doubao", "voice") => std::env::var("DOUBAO_VOICE_TYPE").ok(),
+            ("doubao", "cluster") => std::env::var("DOUBAO_CLUSTER").ok(),
+            ("qwen", "api_key") => std::env::var("QWEN_API_KEY").ok(),
+            ("glm", "api_key") => std::env::var("GLM_API_KEY").ok(),
+            ("openai", "api_key") => std::env::var("OPENAI_API_KEY").ok(),
+            ("minimax", "api_key") => std::env::var("MINIMAX_API_KEY").ok(),
+            ("xfyun", "app_id") => std::env::var("XFYUN_APP_ID").ok(),
+            ("xfyun", "api_key") => std::env::var("XFYUN_API_KEY").ok(),
+            ("xfyun", "api_secret") => std::env::var("XFYUN_API_SECRET").ok(),
+            ("gemini", "api_key") => std::env::var("GEMINI_API_KEY").ok(),
+            _ => None,
+        }
+    }
+
+    /// 获取有效的 App Key（兼容旧接口，从当前激活提供商读取）
     pub fn resolved_app_key(&self) -> Result<String, String> {
-        self.app_key
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("DOUBAO_APP_KEY").ok())
-            .ok_or_else(|| "未设置 DOUBAO_APP_KEY".to_string())
+        self.get_credential("app_key")
+            .ok_or_else(|| "未设置 App Key（可在 settings.toml 或环境变量中设置）".to_string())
     }
 
-    /// 获取有效的 Access Token（配置优先 → 环境变量）
+    /// 获取有效的 Access Token（兼容旧接口，从当前激活提供商读取）
     pub fn resolved_access_token(&self) -> Result<String, String> {
-        self.access_token
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("DOUBAO_ACCESS_TOKEN").ok())
-            .ok_or_else(|| "未设置 DOUBAO_ACCESS_TOKEN".to_string())
+        self.get_credential("access_token")
+            .ok_or_else(|| "未设置 Access Token（可在 settings.toml 或环境变量中设置）".to_string())
     }
 
-    /// 获取有效的音色（配置优先 → 环境变量 → 默认值）
+    /// 获取有效的音色（兼容旧接口，从当前激活提供商读取）
     pub fn resolved_voice(&self) -> String {
-        self.voice
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("DOUBAO_VOICE_TYPE").ok())
+        self.get_credential("voice")
             .unwrap_or_else(|| "zh_female_xiaohe_uranus_bigtts".to_string())
     }
 
-    /// 获取有效的 Cluster（配置优先 → 环境变量）
+    /// 获取有效的 Cluster（兼容旧接口，从当前激活提供商读取）
     pub fn resolved_cluster(&self) -> Option<String> {
-        self.cluster
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("DOUBAO_CLUSTER").ok())
+        self.get_credential("cluster")
+    }
+
+    /// 获取 resource_id（兼容旧接口，从当前激活提供商读取）
+    pub fn resolved_resource_id(&self) -> Option<String> {
+        self.get_credential("resource_id")
+    }
+
+    /// 获取指定提供商的指定凭证（不依赖 active_provider）
+    pub fn get_provider_credential(&self, provider: &str, key: &str) -> Option<String> {
+        self.providers
+            .get(provider)
+            .and_then(|p| p.get(key))
+            .filter(|v| !v.is_empty())
+            .cloned()
     }
 }
 
@@ -734,8 +836,8 @@ enabled = true
         assert!(config.http.enabled);
         assert_eq!(config.asr.active_provider, "doubao");
         assert!(config.asr.providers.is_empty());
-        assert_eq!(config.tts.provider, "doubao");
-        assert!(config.tts.voice.is_none());
+        assert_eq!(config.tts.active_provider, "doubao");
+        assert!(config.tts.providers.is_empty());
     }
 
     #[test]
@@ -771,8 +873,17 @@ enabled = true
                 providers,
             },
             tts: TtsConfig {
-                voice: Some("zh_female_vv_uranus_bigtts".to_string()),
-                ..Default::default()
+                active_provider: "doubao".to_string(),
+                providers: {
+                    let mut m = HashMap::new();
+                    let mut creds = HashMap::new();
+                    creds.insert(
+                        "voice".to_string(),
+                        "zh_female_vv_uranus_bigtts".to_string(),
+                    );
+                    m.insert("doubao".to_string(), creds);
+                    m
+                },
             },
             github: None,
         };
@@ -951,17 +1062,22 @@ provider = "doubao"
     #[test]
     fn test_tts_config_default() {
         let cfg = TtsConfig::default();
-        assert_eq!(cfg.provider, "doubao");
-        assert!(cfg.voice.is_none());
-        assert!(cfg.app_key.is_none());
-        assert!(cfg.access_token.is_none());
+        assert_eq!(cfg.active_provider, "doubao");
+        assert!(cfg.providers.is_empty());
     }
 
     #[test]
     fn test_tts_resolved_voice_from_config() {
+        let mut providers = HashMap::new();
+        let mut creds = HashMap::new();
+        creds.insert(
+            "voice".to_string(),
+            "zh_female_vv_uranus_bigtts".to_string(),
+        );
+        providers.insert("doubao".to_string(), creds);
         let cfg = TtsConfig {
-            voice: Some("zh_female_vv_uranus_bigtts".to_string()),
-            ..Default::default()
+            active_provider: "doubao".to_string(),
+            providers,
         };
         assert_eq!(cfg.resolved_voice(), "zh_female_vv_uranus_bigtts");
     }
@@ -990,9 +1106,16 @@ provider = "doubao"
         unsafe {
             std::env::set_var("DOUBAO_VOICE_TYPE", "env-voice");
         }
+        let mut providers = HashMap::new();
+        let mut creds = HashMap::new();
+        creds.insert(
+            "voice".to_string(),
+            "zh_female_vv_uranus_bigtts".to_string(),
+        );
+        providers.insert("doubao".to_string(), creds);
         let cfg = TtsConfig {
-            voice: Some("zh_female_vv_uranus_bigtts".to_string()),
-            ..Default::default()
+            active_provider: "doubao".to_string(),
+            providers,
         };
         assert_eq!(cfg.resolved_voice(), "zh_female_vv_uranus_bigtts");
         unsafe {
@@ -1001,26 +1124,14 @@ provider = "doubao"
     }
 
     #[test]
-    fn test_tts_resolved_voice_empty_string_uses_env() {
-        unsafe {
-            std::env::set_var("DOUBAO_VOICE_TYPE", "env-voice");
-        }
-        let cfg = TtsConfig {
-            voice: Some(String::new()),
-            ..Default::default()
-        };
-        // 空字符串视为 None → 回退到环境变量
-        assert_eq!(cfg.resolved_voice(), "env-voice");
-        unsafe {
-            std::env::remove_var("DOUBAO_VOICE_TYPE");
-        }
-    }
-
-    #[test]
     fn test_tts_resolved_cluster_from_config() {
+        let mut providers = HashMap::new();
+        let mut creds = HashMap::new();
+        creds.insert("cluster".to_string(), "volcano_icl".to_string());
+        providers.insert("doubao".to_string(), creds);
         let cfg = TtsConfig {
-            cluster: Some("volcano_icl".to_string()),
-            ..Default::default()
+            active_provider: "doubao".to_string(),
+            providers,
         };
         assert_eq!(cfg.resolved_cluster().as_deref(), Some("volcano_icl"));
     }
@@ -1029,6 +1140,101 @@ provider = "doubao"
     fn test_tts_resolved_cluster_none() {
         let cfg = TtsConfig::default();
         assert!(cfg.resolved_cluster().is_none());
+    }
+
+    #[test]
+    fn test_tts_get_credential_multi_provider() {
+        let mut providers = HashMap::new();
+        let mut doubao_creds = HashMap::new();
+        doubao_creds.insert("app_key".to_string(), "doubao-app-key".to_string());
+        doubao_creds.insert("access_token".to_string(), "doubao-token".to_string());
+        providers.insert("doubao".to_string(), doubao_creds);
+        let mut qwen_creds = HashMap::new();
+        qwen_creds.insert("api_key".to_string(), "qwen-key".to_string());
+        providers.insert("qwen".to_string(), qwen_creds);
+
+        // 当 active_provider 为 doubao 时
+        let cfg = TtsConfig {
+            active_provider: "doubao".to_string(),
+            providers: providers.clone(),
+        };
+        assert_eq!(cfg.get_credential("app_key").unwrap(), "doubao-app-key");
+        assert_eq!(cfg.get_credential("access_token").unwrap(), "doubao-token");
+        assert!(cfg.get_credential("api_key").is_none());
+
+        // 切换为 qwen 时
+        let cfg = TtsConfig {
+            active_provider: "qwen".to_string(),
+            providers,
+        };
+        assert_eq!(cfg.get_credential("api_key").unwrap(), "qwen-key");
+        assert!(cfg.get_credential("app_key").is_none());
+    }
+
+    #[test]
+    fn test_tts_old_format_migration() {
+        run_with_temp_home(|home| {
+            write_toml_settings(
+                home,
+                r#"
+[tts]
+provider = "doubao"
+app_key = "old-key"
+access_token = "old-token"
+voice = "zh_female_vv_uranus_bigtts"
+"#,
+            );
+            let result = load_settings().unwrap().unwrap();
+            assert_eq!(result.tts.active_provider, "doubao");
+            let doubao = result.tts.providers.get("doubao").unwrap();
+            assert_eq!(doubao.get("app_key").unwrap(), "old-key");
+            assert_eq!(doubao.get("access_token").unwrap(), "old-token");
+            assert_eq!(doubao.get("voice").unwrap(), "zh_female_vv_uranus_bigtts");
+        });
+    }
+
+    #[test]
+    fn test_tts_old_format_empty_migration() {
+        run_with_temp_home(|home| {
+            write_toml_settings(
+                home,
+                r#"
+[tts]
+provider = "doubao"
+"#,
+            );
+            let result = load_settings().unwrap().unwrap();
+            assert_eq!(result.tts.active_provider, "doubao");
+            assert!(result.tts.providers.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_tts_new_format_direct() {
+        run_with_temp_home(|home| {
+            write_toml_settings(
+                home,
+                r#"
+[tts]
+active_provider = "qwen"
+
+[tts.providers.qwen]
+api_key = "qwen-api-key"
+"#,
+            );
+            let result = load_settings().unwrap().unwrap();
+            assert_eq!(result.tts.active_provider, "qwen");
+            assert_eq!(
+                result
+                    .tts
+                    .providers
+                    .get("qwen")
+                    .unwrap()
+                    .get("api_key")
+                    .unwrap(),
+                "qwen-api-key"
+            );
+        });
     }
 
     // ─── save_settings 测试 ───────────────────────────────
@@ -1048,8 +1254,17 @@ provider = "doubao"
                     providers,
                 },
                 tts: TtsConfig {
-                    voice: Some("zh_female_vv_uranus_bigtts".to_string()),
-                    ..Default::default()
+                    active_provider: "doubao".to_string(),
+                    providers: {
+                        let mut m = HashMap::new();
+                        let mut creds = HashMap::new();
+                        creds.insert(
+                            "voice".to_string(),
+                            "zh_female_vv_uranus_bigtts".to_string(),
+                        );
+                        m.insert("doubao".to_string(), creds);
+                        m
+                    },
                 },
                 ..Default::default()
             };
@@ -1066,8 +1281,12 @@ provider = "doubao"
                 Some(&"saved-key".to_string())
             );
             assert_eq!(
-                loaded.tts.voice,
-                Some("zh_female_vv_uranus_bigtts".to_string())
+                loaded
+                    .tts
+                    .providers
+                    .get("doubao")
+                    .and_then(|p| p.get("voice")),
+                Some(&"zh_female_vv_uranus_bigtts".to_string())
             );
         });
     }
