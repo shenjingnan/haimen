@@ -28,6 +28,7 @@
 //! 策略内部维护 LLM 的 `session_id`，每次 `generate_response` 调用后更新，
 //! 实现音色多轮对话的上下文连续性。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -63,6 +64,14 @@ struct AsrPipelineState {
     decoder: Decoder,
     /// 每帧采样数（60ms @ 16kHz = 960 samples）
     frame_samples: usize,
+    /// 诊断：已接收并处理的音频帧数（每帧 60ms）
+    frame_count: u64,
+    /// 诊断：上一次打印帧计数日志的帧号
+    last_log_frame: u64,
+    /// 本地能量检测：连续静音帧数（60ms/帧），>= MAX_SILENCE_FRAMES 时触发 VAD
+    silence_count: u64,
+    /// 本地能量检测：是否检测到过有效语音（初始静音不计入 silence_count）
+    speech_detected: bool,
 }
 
 /// ASR → LLM → TTS 响应策略：将设备录制的语音识别为文字，
@@ -90,8 +99,39 @@ pub struct AsrLlmTtsStrategy {
     llm_session_id: Mutex<Option<String>>,
     /// 流式 ASR 管道状态（录音期间启用，录音结束时消耗）
     streaming_state: Mutex<Option<AsrPipelineState>>,
-    /// VAD 端点通知器：ASR 检测到用户说完时触发
-    vad_notify: Arc<Notify>,
+    /// VAD 端点通知器：ASR 检测到用户说完时触发（每录音周期创建新 Notify）
+    vad_notify: Mutex<Arc<Notify>>,
+    /// 本地能量检测标记：静音超阈值后关闭 ASR 流，阻止后续帧重新初始化
+    silence_closed: AtomicBool,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 本地 PCM 能量检测——在 ASR 服务端 VAD 判停之前先关闭音频流
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// PCM16 mono 静音 RMS 阈值（低于此值视为静音）
+///
+/// 经验值：PCM16 满幅 32768，正常语音 RMS ≈ 3000~15000，
+/// 环境底噪 RMS ≈ 100~800，阈值 2000 可区分底噪和有效语音。
+const SILENCE_RMS_THRESHOLD: f64 = 2000.0;
+
+/// 连续静音帧数阈值（60ms/帧），约 1.2s 静音后触发本地 VAD
+const MAX_SILENCE_FRAMES: u64 = 20;
+
+/// 计算 PCM16 mono 帧的 RMS 能量值
+fn compute_pcm_rms(pcm_bytes: &[u8]) -> f64 {
+    let samples = pcm_bytes.len() / 2;
+    if samples == 0 {
+        return 0.0;
+    }
+    let sum_sq: f64 = pcm_bytes
+        .chunks_exact(2)
+        .map(|b| {
+            let sample = i16::from_le_bytes([b[0], b[1]]);
+            (sample as f64).powi(2)
+        })
+        .sum();
+    (sum_sq / samples as f64).sqrt()
 }
 
 impl AsrLlmTtsStrategy {
@@ -125,7 +165,8 @@ impl AsrLlmTtsStrategy {
             agent,
             llm_session_id: Mutex::new(None),
             streaming_state: Mutex::new(None),
-            vad_notify: Arc::new(Notify::new()),
+            vad_notify: Mutex::new(Arc::new(Notify::new())),
+            silence_closed: AtomicBool::new(false),
         }
     }
 
@@ -170,7 +211,8 @@ impl AsrLlmTtsStrategy {
             agent,
             llm_session_id: Mutex::new(None),
             streaming_state: Mutex::new(None),
-            vad_notify: Arc::new(Notify::new()),
+            vad_notify: Mutex::new(Arc::new(Notify::new())),
+            silence_closed: AtomicBool::new(false),
         })
     }
 
@@ -223,7 +265,12 @@ impl AsrLlmTtsStrategy {
 
         match state.asr_handle.await {
             Ok(Ok(text)) => {
-                tracing::info!("流式 ASR 成功，识别文本长度: {}", text.len());
+                tracing::info!(
+                    "流式 ASR 成功，识别文本长度: {}，共 {} 帧音频 ({:.0}s)",
+                    text.len(),
+                    state.frame_count,
+                    state.frame_count as f64 * 60.0 / 1000.0,
+                );
                 Some(text)
             }
             Ok(Err(e)) => {
@@ -323,16 +370,23 @@ impl AsrLlmTtsStrategy {
             },
             app_key: Some(app_key),
             access_key: Some(access_token),
-            mode: DoubaoAsrMode::Async,
+            mode: DoubaoAsrMode::Streaming,
             sample_rate: 16000,
             bits: 16,
             channel: 1,
-            enable_nonstream: Some(true),
+            // VAD 端点检测：800ms 静音强制判停
             end_window_size: Some(800),
+            // 至少 1s 音频后才允许判停（避免极短音频误判）
+            force_to_speech_time: Some(1000),
             ..Default::default()
         });
 
-        let vad_notify = self.vad_notify.clone();
+        let vad_notify = self
+            .vad_notify
+            .lock()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_else(|| Arc::new(Notify::new()));
 
         let asr_handle: tokio::task::JoinHandle<Result<String, String>> =
             tokio::spawn(async move {
@@ -415,6 +469,10 @@ impl AsrLlmTtsStrategy {
             asr_handle,
             decoder,
             frame_samples,
+            frame_count: 0,
+            last_log_frame: 0,
+            silence_count: 0,
+            speech_detected: false,
         };
 
         let mut guard = self
@@ -467,6 +525,11 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             .lock()
             .map_err(|e| format!("锁获取失败: {}", e))?;
         *guard = None;
+        // 创建全新 Notify 清除上一轮残留的通知信号
+        if let Ok(mut ng) = self.vad_notify.lock() {
+            *ng = Arc::new(Notify::new());
+        }
+        self.silence_closed.store(false, Ordering::Release);
 
         Ok(())
     }
@@ -477,6 +540,11 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
     /// 这样确保 ASR WebSocket 连接只在用户真正说话时建立。
     async fn on_audio_frame(&self, frame: &AudioFrame) -> Result<(), String> {
         if frame.data.is_empty() {
+            return Ok(());
+        }
+
+        // 如果本地能量检测已关闭管道，跳过后续帧（不重新初始化）
+        if self.silence_closed.load(Ordering::Acquire) {
             return Ok(());
         }
 
@@ -491,7 +559,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             self.init_asr_pipeline().await?;
         }
 
-        // 在锁内完成解码，提取 pcm_bytes 和 pcm_tx 后释放锁
+        // ── Phase 1: 解码 + PCM 能量检测（锁内） ──
         let (pcm_bytes, pcm_tx) = {
             let mut guard = self
                 .streaming_state
@@ -500,6 +568,17 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             let state = guard
                 .as_mut()
                 .ok_or_else(|| "流式 ASR 未启动".to_string())?;
+
+            state.frame_count += 1;
+            // 每 50 帧（~3s）打印一次接收诊断日志
+            if state.frame_count - state.last_log_frame >= 50 {
+                state.last_log_frame = state.frame_count;
+                tracing::info!(
+                    "流式 ASR: 已接收 {} 帧 ({:.0}s 音频)",
+                    state.frame_count,
+                    state.frame_count as f64 * 60.0 / 1000.0,
+                );
+            }
 
             let mut pcm_buf = vec![0i16; state.frame_samples];
             let decoded_samples = state
@@ -513,9 +592,38 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 pcm_bytes.extend_from_slice(&sample.to_le_bytes());
             }
 
+            // ── 本地 PCM 能量检测 ──
+            let rms = compute_pcm_rms(&pcm_bytes);
+            if rms >= SILENCE_RMS_THRESHOLD {
+                state.speech_detected = true;
+                state.silence_count = 0;
+            } else if state.speech_detected {
+                // 只在首次语音后的静音才累计
+                state.silence_count = state.silence_count.saturating_add(1);
+            }
+
+            if state.silence_count >= MAX_SILENCE_FRAMES {
+                // 静音超阈值：关闭 ASR 音频流，让服务端完成处理
+                // 替换 sender 使旧的被 drop，从而关闭 ASR 音频流
+                let (new_tx, _) = mpsc::channel::<Vec<u8>>(1);
+                let _ = std::mem::replace(&mut state.pcm_tx, new_tx);
+                tracing::info!(
+                    "本地能量 VAD: 检测到 {} 帧连续静音 ({:.0}s)，关闭 ASR 流",
+                    state.silence_count,
+                    state.silence_count as f64 * 60.0 / 1000.0,
+                );
+                self.silence_closed.store(true, Ordering::Release);
+                if let Ok(guard) = self.vad_notify.lock() {
+                    guard.notify_one();
+                }
+                // 不发送此帧（静音帧无意义）
+                return Ok(());
+            }
+
             (pcm_bytes, state.pcm_tx.clone())
         }; // MutexGuard 在此处释放
 
+        // ── Phase 2: 发送 PCM 到 ASR（锁外） ──
         pcm_tx
             .send(pcm_bytes)
             .await
@@ -533,7 +641,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
     // ────────── VAD 端点检测 ──────────
 
     fn vad_completion(&self) -> Option<Arc<Notify>> {
-        Some(self.vad_notify.clone())
+        self.vad_notify.lock().ok().map(|g| g.clone())
     }
 
     /// 流式生成 ASR → LLM → TTS 响应并逐帧发送
