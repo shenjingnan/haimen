@@ -68,6 +68,32 @@ impl AsrTtsStrategy {
         }
     }
 
+    /// 从 ASR + TTS 配置构建策略
+    ///
+    /// `voice_override` 可以覆盖配置中的音色（用于 CLI 参数 `--xiaozhi-tts-voice`）。
+    pub fn from_config(
+        asr: &crate::config::settings::AsrConfig,
+        tts: &crate::config::settings::TtsConfig,
+        voice_override: Option<String>,
+    ) -> Result<Self, String> {
+        let app_key = asr.resolved_app_key()?;
+        let access_token = asr.resolved_access_token()?;
+        let voice = voice_override
+            .or_else(|| tts.voice.clone().filter(|s| !s.is_empty()))
+            .or_else(|| std::env::var("DOUBAO_VOICE_TYPE").ok())
+            .or_else(|| Some("zh_female_xiaohe_uranus_bigtts".into()));
+        let cluster = tts.resolved_cluster();
+        let resource_id = tts.resource_id.clone();
+
+        Ok(Self {
+            app_key,
+            access_token,
+            voice,
+            resource_id,
+            cluster,
+        })
+    }
+
     /// 设置 Resource ID（声音克隆等场景）
     pub fn with_resource_id(mut self, resource_id: String) -> Self {
         self.resource_id = Some(resource_id);

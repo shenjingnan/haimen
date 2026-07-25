@@ -70,10 +70,14 @@ struct AsrPipelineState {
 ///
 /// 管线：Opus 解码 (16kHz) → Doubao ASR → AgentProvider → Doubao TTS (24kHz) → Opus 编码
 pub struct AsrLlmTtsStrategy {
-    /// 火山引擎 App Key
+    /// 火山引擎 App Key（ASR 使用）
     app_key: String,
-    /// 火山引擎 Access Token
+    /// 火山引擎 Access Token（ASR 使用）
     access_token: String,
+    /// TTS 专用 App Key（可选，不设置时复用 ASR 的）
+    tts_app_key: Option<String>,
+    /// TTS 专用 Access Token（可选，不设置时复用 ASR 的）
+    tts_access_token: Option<String>,
     /// TTS 音色（None 使用环境变量或默认值）
     voice: Option<String>,
     /// 火山引擎 Resource ID（用于声音克隆等）
@@ -113,6 +117,8 @@ impl AsrLlmTtsStrategy {
         Self {
             app_key,
             access_token,
+            tts_app_key: None,
+            tts_access_token: None,
             voice,
             resource_id: None,
             cluster,
@@ -121,6 +127,63 @@ impl AsrLlmTtsStrategy {
             streaming_state: Mutex::new(None),
             vad_notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// 从 ASR + TTS 配置构建策略
+    ///
+    /// `voice_override` 可以覆盖配置中的音色（用于 CLI 参数 `--xiaozhi-tts-voice`）。
+    pub fn from_config(
+        asr: &crate::config::settings::AsrConfig,
+        tts: &crate::config::settings::TtsConfig,
+        voice_override: Option<String>,
+        agent: Arc<dyn AgentProvider>,
+    ) -> Result<Self, String> {
+        let app_key = asr.resolved_app_key()?;
+        let access_token = asr.resolved_access_token()?;
+        let voice = voice_override
+            .or_else(|| tts.voice.clone().filter(|s| !s.is_empty()))
+            .or_else(|| std::env::var("DOUBAO_VOICE_TYPE").ok())
+            .or_else(|| Some("zh_female_xiaohe_uranus_bigtts".into()));
+        let cluster = tts.resolved_cluster();
+        let resource_id = tts.resource_id.clone();
+
+        // TTS 可能有独立的凭证
+        let tts_app_key = tts
+            .app_key
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("DOUBAO_APP_KEY").ok());
+        let tts_access_token = tts
+            .access_token
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("DOUBAO_ACCESS_TOKEN").ok());
+
+        Ok(Self {
+            app_key,
+            access_token,
+            tts_app_key,
+            tts_access_token,
+            voice,
+            resource_id,
+            cluster,
+            agent,
+            llm_session_id: Mutex::new(None),
+            streaming_state: Mutex::new(None),
+            vad_notify: Arc::new(Notify::new()),
+        })
+    }
+
+    /// 获取 TTS 使用的 App Key（优先使用 TTS 专用，否则复用 ASR 的）
+    fn resolved_tts_app_key(&self) -> &str {
+        self.tts_app_key.as_deref().unwrap_or(&self.app_key)
+    }
+
+    /// 获取 TTS 使用的 Access Token（优先使用 TTS 专用，否则复用 ASR 的）
+    fn resolved_tts_access_token(&self) -> &str {
+        self.tts_access_token
+            .as_deref()
+            .unwrap_or(&self.access_token)
     }
 
     /// 设置 Resource ID（声音克隆等场景）
@@ -550,8 +613,8 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 voice,
                 ..Default::default()
             },
-            app_id: Some(self.app_key.clone()),
-            access_token: Some(self.access_token.clone()),
+            app_id: Some(self.resolved_tts_app_key().to_string()),
+            access_token: Some(self.resolved_tts_access_token().to_string()),
             resource_id: Some(resource_id),
             ..Default::default()
         });
@@ -693,8 +756,8 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 voice,
                 ..Default::default()
             },
-            app_id: Some(self.app_key.clone()),
-            access_token: Some(self.access_token.clone()),
+            app_id: Some(self.resolved_tts_app_key().to_string()),
+            access_token: Some(self.resolved_tts_access_token().to_string()),
             resource_id: Some(resource_id),
             ..Default::default()
         });
