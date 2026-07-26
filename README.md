@@ -66,30 +66,30 @@ haimen uninstall
 - **双层日志** — 基于 tracing 的日志系统，同时输出到文件和 stderr
 - **Shell 补全** — 支持 bash / zsh / fish / powershell / elvish 自动补全
 
+## 支持列表
+
+### AI Agent
+
+| 名称 | 类型 | 说明 |
+|------|------|------|
+| Claude Code | AgentProvider | 通过 Claude CLI 交互 |
+| Codex | AgentProvider | OpenAI Codex 集成 |
+
+### 消息渠道
+
+| 名称 | 类型 | 连接方式 |
+|------|------|----------|
+| 飞书 / Lark | MessageChannel | lark-cli 子进程桥接 |
+| 钉钉 | MessageChannel | 直连 Web API |
+| GitHub | WebhookHandler | Webhook + @mention 触发 |
+| 小智 AI 硬件 | WebSocket | 音频流协议直连 |
+
 ## 快速开始
 
 ```bash
 # 启动所有启用的连接器和 Agent
 haimen start
 ```
-
-## 可选依赖
-
-### 飞书/Lark 消息渠道
-
-使用飞书/Lark 消息通道时需要安装 [lark-cli](https://github.com/larksuite/cli)：
-
-```bash
-npm install -g @larksuite/cli
-lark-cli auth login    # 设备码授权登录
-```
-
-### 其他渠道
-
-- **钉钉** — 无需额外安装，通过 Web API 直接连接
-- **GitHub Webhook** — 配置 Webhook URL 到 `http(s)://你的地址:9527/api/v1/webhook/github`
-- **Claude Code Agent** — 需要安装 [Claude Code](https://claude.ai/code)（`npm install -g @anthropic-ai/claude-code`）
-- **小智 AI 硬件** — 无需额外依赖，直接通过 WebSocket 连接
 
 ## CLI 命令
 
