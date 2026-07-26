@@ -1,7 +1,9 @@
 /target
 
 # Web UI 前端构建产物（由 build.rs 在 cargo build 时自动生成）
-/web-ui/dist/
+# 只忽略构建产物文件，但保留占位 index.html 用于 crates.io 发布
+/web-ui/dist/*
+!/web-ui/dist/index.html
 
 # Coverage
 /coverage
