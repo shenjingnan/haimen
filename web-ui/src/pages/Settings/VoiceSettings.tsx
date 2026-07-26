@@ -16,6 +16,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
+import { Switch } from '@/components/ui/switch';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import VoiceSelector from '@/components/VoiceSelector';
 import { ASR_PROVIDERS } from '@/data/asr-providers';
@@ -300,6 +301,8 @@ function TtsSettingsPanel() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [editState, setEditState] = useState<Record<string, Record<string, string>>>({});
+  const [fixedTextEnabled, setFixedTextEnabled] = useState(false);
+  const [fixedText, setFixedText] = useState('');
   const [activeProvider, setActiveProvider] = useState('doubao');
   const [selectedTab, setSelectedTab] = useState('doubao');
   const [voices, setVoices] = useState<TtsVoice[]>([]);
@@ -316,6 +319,8 @@ function TtsSettingsPanel() {
     try {
       const data = await getTtsSettings();
       setEditState(data.providers ?? {});
+      setFixedTextEnabled(data.fixed_text_enabled ?? false);
+      setFixedText(data.fixed_text ?? '');
       setActiveProvider(data.active_provider ?? 'doubao');
       setSelectedTab(data.active_provider ?? 'doubao');
       // 加载当前选中提供商的音色
@@ -366,6 +371,8 @@ function TtsSettingsPanel() {
       await updateTtsSettings({
         active_provider: activeProvider,
         providers: editState,
+        fixed_text_enabled: fixedTextEnabled,
+        fixed_text: fixedText || null,
       });
       setSaveResult('保存成功');
       setVerifyResult(null);
@@ -384,6 +391,8 @@ function TtsSettingsPanel() {
       await updateTtsSettings({
         active_provider: selectedTab,
         providers: editState,
+        fixed_text_enabled: fixedTextEnabled,
+        fixed_text: fixedText || null,
       });
       setActiveProvider(selectedTab);
       setSaveResult('已切换激活服务商');
@@ -571,6 +580,26 @@ function TtsSettingsPanel() {
             </TabsContent>
           ))}
         </Tabs>
+
+        {/* ── 固定文本模式 ── */}
+        <div className="mt-6 rounded-lg border p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5">
+              <span className="text-sm font-medium">固定文本模式</span>
+              <p className="text-xs text-muted-foreground">
+                开启后，无论 ASR 识别到什么内容，设备都将播放下方指定的文本
+              </p>
+            </div>
+            <Switch checked={fixedTextEnabled} onCheckedChange={setFixedTextEnabled} />
+          </div>
+          {fixedTextEnabled && (
+            <Input
+              placeholder="输入要播放的固定文本..."
+              value={fixedText}
+              onChange={(e) => setFixedText(e.target.value)}
+            />
+          )}
+        </div>
       </CardContent>
     </Card>
   );

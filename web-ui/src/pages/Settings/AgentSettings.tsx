@@ -173,8 +173,6 @@ function AgentSettingsPanel() {
                 )}
               </div>
 
-
-
               {/* 验证结果 */}
               {verifyResult && (
                 <Alert variant={verifyResult.valid ? 'default' : 'destructive'}>

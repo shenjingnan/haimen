@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream};
 use haimen_xiaozhi::{AudioFrame, AudioParams, ResponseStrategy};
 use opus2::{Channels, Decoder};
 use tokio::sync::{Notify, mpsc};
@@ -624,41 +624,64 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         );
 
         // ════════════════════════════════════════════════════════════════
-        // Phase 2: AI Agent 流式处理
+        // Phase 2: 生成回复文本（AI Agent 或固定文本）
         // ════════════════════════════════════════════════════════════════
-
-        // 读取当前 LLM 会话 ID
-        let current_llm_session = self
-            .llm_session_id
-            .lock()
-            .map_err(|e| format!("LLM session_id 锁获取失败: {}", e))?
-            .clone();
-
-        let (text_stream, new_llm_session_id) = self
-            .agent
-            .process_stream(&user_text, current_llm_session.as_deref())
-            .await
-            .map_err(|e| format!("AI Agent 流式处理失败: {}", e))?;
-
-        // 立即更新 LLM 会话 ID（用于多轮对话）
-        if let Ok(mut session) = self.llm_session_id.lock() {
-            *session = Some(new_llm_session_id);
-        }
-
-        tracing::info!(
-            session_id = %session_id,
-            agent = self.agent.name(),
-            "TTS-STREAM: Agent 流式输出已启动",
-        );
 
         // 在流式转发的同时收集完整回复内容以便日志记录
         let llm_response_full = Arc::new(Mutex::new(String::new()));
         let response_for_log = llm_response_full.clone();
-        let text_stream = text_stream.inspect(move |chunk| {
-            if let Ok(mut full) = response_for_log.lock() {
-                full.push_str(chunk);
-            }
-        });
+
+        let text_stream: Box<dyn futures_util::Stream<Item = String> + Unpin + Send> =
+            if self.tts_config.fixed_text_enabled {
+                // 固定文本模式：跳过 LLM，使用预设文本
+                let fixed_text = self
+                    .tts_config
+                    .fixed_text
+                    .clone()
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| "欢迎使用智能语音助手".to_string());
+
+                tracing::info!(
+                    session_id = %session_id,
+                    text = %fixed_text,
+                    "TTS-STREAM: 固定文本模式，跳过 LLM",
+                );
+
+                if let Ok(mut full) = response_for_log.lock() {
+                    full.push_str(&fixed_text);
+                }
+                Box::new(stream::iter(vec![fixed_text]))
+            } else {
+                // 普通模式：走 AI Agent 流式处理
+                let current_llm_session = self
+                    .llm_session_id
+                    .lock()
+                    .map_err(|e| format!("LLM session_id 锁获取失败: {}", e))?
+                    .clone();
+
+                let (text_stream_inner, new_llm_session_id) = self
+                    .agent
+                    .process_stream(&user_text, current_llm_session.as_deref())
+                    .await
+                    .map_err(|e| format!("AI Agent 流式处理失败: {}", e))?;
+
+                // 立即更新 LLM 会话 ID（用于多轮对话）
+                if let Ok(mut session) = self.llm_session_id.lock() {
+                    *session = Some(new_llm_session_id);
+                }
+
+                tracing::info!(
+                    session_id = %session_id,
+                    agent = self.agent.name(),
+                    "TTS-STREAM: Agent 流式输出已启动",
+                );
+
+                Box::new(text_stream_inner.inspect(move |chunk| {
+                    if let Ok(mut full) = response_for_log.lock() {
+                        full.push_str(chunk);
+                    }
+                }))
+            };
 
         // ════════════════════════════════════════════════════════════════
         // Phase 3: 流式 TTS 合成 → Opus 编码 → 逐帧发送
@@ -753,7 +776,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         };
 
         // ════════════════════════════════════════════════════════════════
-        // Phase 2: AI Agent 处理（流式与批处理共用）
+        // Phase 2: 生成回复文本（AI Agent 或固定文本）
         // ════════════════════════════════════════════════════════════════
         tracing::info!(
             session_id = %session_id,
@@ -761,46 +784,65 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             "ASR-LLM-TTS: ASR 识别完成",
         );
 
-        // ── Step 3: AI Agent 处理 ──
-        tracing::info!(
-            session_id = %session_id,
-            agent = self.agent.name(),
-            "ASR-LLM-TTS: 开始 AI Agent 处理",
-        );
+        let llm_text = if self.tts_config.fixed_text_enabled {
+            // 固定文本模式：跳过 LLM，使用预设文本
+            let fixed_text = self
+                .tts_config
+                .fixed_text
+                .clone()
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| "欢迎使用智能语音助手".to_string());
 
-        // 读取当前 LLM 会话 ID
-        let current_llm_session = self
-            .llm_session_id
-            .lock()
-            .map_err(|e| format!("LLM session_id 锁获取失败: {}", e))?
-            .clone();
+            tracing::info!(
+                session_id = %session_id,
+                text = %fixed_text,
+                "ASR-LLM-TTS: 固定文本模式，跳过 LLM",
+            );
 
-        let llm_response = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            self.agent
-                .process(&user_text, current_llm_session.as_deref()),
-        )
-        .await
-        .map_err(|_| "AI Agent 响应超时 (60s)".to_string())?
-        .map_err(|e| format!("AI Agent 处理失败: {}", e))?;
+            fixed_text
+        } else {
+            // 普通模式：走 AI Agent 处理
+            tracing::info!(
+                session_id = %session_id,
+                agent = self.agent.name(),
+                "ASR-LLM-TTS: 开始 AI Agent 处理",
+            );
 
-        let (llm_text, new_llm_session_id) = llm_response;
+            let current_llm_session = self
+                .llm_session_id
+                .lock()
+                .map_err(|e| format!("LLM session_id 锁获取失败: {}", e))?
+                .clone();
 
-        if llm_text.is_empty() {
-            return Err("AI Agent 返回空回复".to_string());
-        }
+            let llm_response = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                self.agent
+                    .process(&user_text, current_llm_session.as_deref()),
+            )
+            .await
+            .map_err(|_| "AI Agent 响应超时 (60s)".to_string())?
+            .map_err(|e| format!("AI Agent 处理失败: {}", e))?;
 
-        // 更新 LLM 会话 ID（用于多轮对话）
-        if let Ok(mut session) = self.llm_session_id.lock() {
-            *session = Some(new_llm_session_id);
-        }
+            let (llm_text, new_llm_session_id) = llm_response;
 
-        tracing::info!(
-            session_id = %session_id,
-            response_len = llm_text.len(),
-            response = %llm_text,
-            "ASR-LLM-TTS: AI Agent 处理完成",
-        );
+            if llm_text.is_empty() {
+                return Err("AI Agent 返回空回复".to_string());
+            }
+
+            // 更新 LLM 会话 ID（用于多轮对话）
+            if let Ok(mut session) = self.llm_session_id.lock() {
+                *session = Some(new_llm_session_id);
+            }
+
+            tracing::info!(
+                session_id = %session_id,
+                response_len = llm_text.len(),
+                response = %llm_text,
+                "ASR-LLM-TTS: AI Agent 处理完成",
+            );
+
+            llm_text
+        };
 
         // ── Step 4: TTS 语音合成 ──
         tracing::info!(
@@ -1052,6 +1094,7 @@ mod tests {
         crate::config::settings::TtsConfig {
             active_provider: "doubao".to_string(),
             providers,
+            ..Default::default()
         }
     }
 

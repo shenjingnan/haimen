@@ -69,12 +69,14 @@ pub fn build_agent(
 
 /// 根据配置和环境变量构造 xiaozhi WebSocket 响应策略
 ///
-/// 默认使用 ASR-LLM-TTS 模式（语音识别 → Claude Code 处理 → 语音合成）。
+/// 固定文本模式（`tts.fixed_text_enabled = true`）会保留 ASR 流式管线用于 VAD 判停，
+/// 但跳过 LLM 处理，直接使用预设文本进行 TTS 合成。
+///
 /// 需要配置 ASR 和 TTS 提供商凭证。环境变量缺失时跳过 xiaozhi 路由（不挂载）。
 fn build_xiaozhi_strategy(
     config: &crate::config::settings::AppConfig,
 ) -> Option<Arc<dyn haimen_xiaozhi::ResponseStrategy>> {
-    // 检查 ASR 凭证
+    // 检查 ASR 凭证（所有模式都需要 ASR 用于 VAD 判停）
     let (app_key, access_token) = match (
         config.asr.resolved_app_key(),
         config.asr.resolved_access_token(),

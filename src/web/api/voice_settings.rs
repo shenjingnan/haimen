@@ -336,6 +336,8 @@ pub async fn get_tts_settings() -> Json<serde_json::Value> {
         "data": {
             "active_provider": cfg.tts.active_provider,
             "providers": cfg.tts.providers,
+            "fixed_text_enabled": cfg.tts.fixed_text_enabled,
+            "fixed_text": cfg.tts.fixed_text,
             "resolved": {
                 "app_key": cfg.tts.resolved_app_key().ok(),
                 "access_token": cfg.tts.resolved_access_token().ok(),
@@ -350,6 +352,8 @@ pub async fn get_tts_settings() -> Json<serde_json::Value> {
 /// 替换完整的 TTS 配置。支持以下字段：
 /// - `active_provider` — 切换当前激活的服务商
 /// - `providers` — 所有提供商的完整凭证映射
+/// - `fixed_text_enabled` — 是否启用固定文本模式
+/// - `fixed_text` — 固定文本内容
 pub async fn update_tts_settings(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
@@ -365,6 +369,24 @@ pub async fn update_tts_settings(
     // 更新 providers（如果提供）
     if let Some(providers) = parse_providers(&body) {
         cfg.tts.providers = providers;
+    }
+
+    // 更新固定文本模式（如果提供）
+    if let Some(enabled) = body.get("fixed_text_enabled").and_then(|v| v.as_bool()) {
+        cfg.tts.fixed_text_enabled = enabled;
+    }
+
+    // 更新固定文本内容（如果提供）
+    if body.get("fixed_text").is_some() {
+        let text = body
+            .get("fixed_text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        cfg.tts.fixed_text = if text.is_empty() {
+            None
+        } else {
+            Some(text.to_string())
+        };
     }
 
     if let Err(e) = crate::config::settings::save_settings(&cfg) {
