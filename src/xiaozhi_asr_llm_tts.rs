@@ -651,6 +651,15 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             "TTS-STREAM: Agent 流式输出已启动",
         );
 
+        // 在流式转发的同时收集完整回复内容以便日志记录
+        let llm_response_full = Arc::new(Mutex::new(String::new()));
+        let response_for_log = llm_response_full.clone();
+        let text_stream = text_stream.inspect(move |chunk| {
+            if let Ok(mut full) = response_for_log.lock() {
+                full.push_str(chunk);
+            }
+        });
+
         // ════════════════════════════════════════════════════════════════
         // Phase 3: 流式 TTS 合成 → Opus 编码 → 逐帧发送
         // ════════════════════════════════════════════════════════════════
@@ -665,7 +674,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             .map_err(|e| format!("创建 TTS 提供者失败: {}", e))?;
 
         let mut audio_stream = tts
-            .speak_stream(text_stream)
+            .speak_stream(Box::pin(text_stream))
             .await
             .map_err(|e| format!("流式 TTS 启动失败: {}", e))?;
 
@@ -703,9 +712,17 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             }
         }
 
+        let full_response = llm_response_full
+            .lock()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+
         tracing::info!(
             session_id = %session_id,
             total_audio_bytes = total_audio_bytes,
+            response_len = full_response.len(),
+            response = %full_response,
             "TTS-STREAM: 流式合成完成",
         );
 
@@ -781,6 +798,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         tracing::info!(
             session_id = %session_id,
             response_len = llm_text.len(),
+            response = %llm_text,
             "ASR-LLM-TTS: AI Agent 处理完成",
         );
 

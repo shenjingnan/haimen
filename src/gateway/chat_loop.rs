@@ -118,6 +118,7 @@ where
                     chat_id = %chat_id,
                     total_chars = response.len(),
                     session_id = %new_session_id,
+                    response = %response,
                     "Agent 处理完成"
                 );
 
@@ -134,7 +135,11 @@ where
                     match agent.process(&message.content, None).await {
                         Ok((response, new_session_id)) => {
                             session_mgr.create_session(&chat_id, &new_session_id, &work_dir);
-                            tracing::info!(chat_id = %chat_id, "降级重试成功");
+                            tracing::info!(
+                                chat_id = %chat_id,
+                                response = %response,
+                                "降级重试成功"
+                            );
                             let _ = channel
                                 .send(&chat_id, &format!("💡 处理完成:\n\n{}", response))
                                 .await;
@@ -334,6 +339,7 @@ pub async fn run_unified_gateway(
                     chat_id = %chat_id,
                     total_chars = response.len(),
                     session_id = %new_session_id,
+                    response = %response,
                     "Agent 处理完成"
                 );
 
@@ -356,7 +362,11 @@ pub async fn run_unified_gateway(
                     match retry_result {
                         Ok(Ok((response, new_session_id))) => {
                             session_mgr.create_session(&chat_id, &new_session_id, &work_dir);
-                            tracing::info!(chat_id = %chat_id, "降级重试成功");
+                            tracing::info!(
+                                chat_id = %chat_id,
+                                response = %response,
+                                "降级重试成功"
+                            );
                             let _ = channel
                                 .send(
                                     &message.conversation_id,
