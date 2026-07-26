@@ -21,21 +21,21 @@
 
 ```bash
 # macOS / Linux
-curl -fsSL https://github.com/shenjingnan/haimen/releases/latest/download/haimen-installer.sh | sh
+curl -fsSL https://github.com/shenjingnan/haimen/releases/latest/download/install.sh | sh
 
 # Windows PowerShell
-$r = Invoke-WebRequest https://github.com/shenjingnan/haimen/releases/latest/download/haimen-installer.ps1; iex $r.Content
+$r = Invoke-WebRequest https://github.com/shenjingnan/haimen/releases/latest/download/install.ps1; iex $r.Content
 ```
 
-> **国内用户（中国大陆）**：如果 GitHub 访问缓慢，可使用 Gitee 镜像安装（通过 `ghproxy.com` 加速）：
->
-> ```bash
-> # macOS / Linux
-> curl -fsSL https://gitee.com/shenjingnan/haimen/raw/main/docs/public/install-gitee.sh | sh
->
-> # Windows PowerShell
-> $r = Invoke-WebRequest https://gitee.com/shenjingnan/haimen/raw/main/docs/public/install-gitee.ps1; iex $r.Content
-> ```
+**国内用户（中国大陆）**：如果 GitHub 访问缓慢，可使用 Gitee 镜像安装
+
+```bash
+# macOS / Linux
+curl -fsSL https://gitee.com/shenjingnan/haimen/raw/main/docs/public/install-gitee.sh | sh
+
+# Windows PowerShell
+$r = Invoke-WebRequest https://gitee.com/shenjingnan/haimen/raw/main/docs/public/install-gitee.ps1; iex $r.Content
+```
 
 ### 方式二：cargo install
 
@@ -47,12 +47,12 @@ cargo install haimen
 
 从 [GitHub Releases](https://github.com/shenjingnan/haimen/releases) 下载对应平台的压缩包，解压后放入 `PATH`。
 
-| 平台 | 架构 | 文件名 |
-|------|------|--------|
-| macOS | Intel | `haimen-x86_64-apple-darwin.tar.xz` |
-| macOS | Apple Silicon | `haimen-aarch64-apple-darwin.tar.xz` |
-| Linux | x86_64 | `haimen-x86_64-unknown-linux-gnu.tar.xz` |
-| Linux | ARM64 | `haimen-aarch64-unknown-linux-gnu.tar.xz` |
+| 平台  | 架构          | 文件名                                    |
+| ----- | ------------- | ----------------------------------------- |
+| macOS | Intel         | `haimen-x86_64-apple-darwin.tar.xz`       |
+| macOS | Apple Silicon | `haimen-aarch64-apple-darwin.tar.xz`      |
+| Linux | x86_64        | `haimen-x86_64-unknown-linux-gnu.tar.xz`  |
+| Linux | ARM64         | `haimen-aarch64-unknown-linux-gnu.tar.xz` |
 
 ### 升级
 
@@ -80,19 +80,19 @@ haimen uninstall
 
 ### AI Agent
 
-| 名称 | 类型 | 说明 |
-|------|------|------|
+| 名称        | 类型          | 说明                 |
+| ----------- | ------------- | -------------------- |
 | Claude Code | AgentProvider | 通过 Claude CLI 交互 |
-| Codex | AgentProvider | OpenAI Codex 集成 |
+| Codex       | AgentProvider | OpenAI Codex 集成    |
 
 ### 消息渠道
 
-| 名称 | 类型 | 连接方式 |
-|------|------|----------|
-| 飞书 / Lark | MessageChannel | lark-cli 子进程桥接 |
-| 钉钉 | MessageChannel | 直连 Web API |
-| GitHub | WebhookHandler | Webhook + @mention 触发 |
-| 小智 AI 硬件 | WebSocket | 音频流协议直连 |
+| 名称         | 类型           | 连接方式                |
+| ------------ | -------------- | ----------------------- |
+| 飞书 / Lark  | MessageChannel | lark-cli 子进程桥接     |
+| 钉钉         | MessageChannel | 直连 Web API            |
+| GitHub       | WebhookHandler | Webhook + @mention 触发 |
+| 小智 AI 硬件 | WebSocket      | 音频流协议直连          |
 
 ## 快速开始
 
