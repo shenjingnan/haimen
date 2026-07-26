@@ -5,8 +5,8 @@
 
 use univoice::tts::VoiceId;
 use univoice::tts::provider::{
-    DoubaoTts, DoubaoTtsOption, GlmTts, GlmTtsOption, OpenaiTts, OpenaiTtsOption, QwenTts,
-    QwenTtsOption,
+    DoubaoTts, DoubaoTtsOption, GlmTts, GlmTtsOption, OpenaiTts, OpenaiTtsOption, Qwen3Tts,
+    Qwen3TtsOption,
 };
 use univoice::tts::traits::TtsProvider;
 use univoice::tts::types::BaseTtsOption;
@@ -83,7 +83,7 @@ pub fn create_tts_provider(config: &TtsConfig) -> Result<Box<dyn TtsProvider>, S
             let mut base = build_base_option(config, "qwen");
             base.api_key = Some(api_key);
             base.model = model.or_else(|| Some("cosyvoice-v3-flash".into()));
-            Ok(Box::new(QwenTts::new(QwenTtsOption {
+            Ok(Box::new(Qwen3Tts::new(Qwen3TtsOption {
                 base,
                 ..Default::default()
             })))
@@ -147,7 +147,7 @@ mod tests {
             providers,
         };
         let provider = create_tts_provider(&config).unwrap();
-        assert_eq!(provider.name(), "qwen");
+        assert_eq!(provider.name(), "qwen3-tts");
     }
 
     #[test]
