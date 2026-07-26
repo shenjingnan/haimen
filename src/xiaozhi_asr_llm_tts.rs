@@ -94,6 +94,9 @@ pub struct AsrLlmTtsStrategy {
     vad_notify: Mutex<Arc<Notify>>,
     /// 本地能量检测标记：静音超阈值后关闭 ASR 流，阻止后续帧重新初始化
     silence_closed: AtomicBool,
+    /// ASR 是否已返回非空文本（用于决定是否允许本地 VAD 提前关闭流）
+    /// 使用 Arc 以便在 ASR 后台任务中写入
+    asr_received_text: Arc<AtomicBool>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -149,6 +152,7 @@ impl AsrLlmTtsStrategy {
             streaming_state: Mutex::new(None),
             vad_notify: Mutex::new(Arc::new(Notify::new())),
             silence_closed: AtomicBool::new(false),
+            asr_received_text: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -185,6 +189,7 @@ impl AsrLlmTtsStrategy {
             streaming_state: Mutex::new(None),
             vad_notify: Mutex::new(Arc::new(Notify::new())),
             silence_closed: AtomicBool::new(false),
+            asr_received_text: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -338,8 +343,10 @@ impl AsrLlmTtsStrategy {
             .map(|g| g.clone())
             .unwrap_or_else(|| Arc::new(Notify::new()));
 
-        let asr_handle: tokio::task::JoinHandle<Result<String, String>> =
-            tokio::spawn(async move {
+        let asr_text_received = self.asr_received_text.clone();
+
+        let asr_handle: tokio::task::JoinHandle<Result<String, String>> = tokio::spawn(
+            async move {
                 let mut stream = asr
                     .listen_stream(audio_stream)
                     .await
@@ -348,48 +355,134 @@ impl AsrLlmTtsStrategy {
                 let mut full_text = String::new();
                 let mut chunk_count = 0;
                 let mut vad_triggered = false;
+                // 记录最后一个非空 ASR 文本，用于判断是否已稳定
+                let mut last_nonempty_text = String::new();
+                const TEXT_STABLE_MS: u64 = 1500;
 
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(chunk) => {
-                            chunk_count += 1;
+                loop {
+                    // 如果已识别到非空文本，增加文本稳定超时检测
+                    let needs_stability_check = !last_nonempty_text.is_empty();
 
-                            let is_vad_endpoint = chunk
-                                .segment
-                                .as_ref()
-                                .and_then(|s| s.confidence)
-                                .map(|c| c >= 0.99)
-                                .unwrap_or(false);
+                    if needs_stability_check {
+                        let stability_delay =
+                            tokio::time::sleep(std::time::Duration::from_millis(TEXT_STABLE_MS));
+                        tokio::pin!(stability_delay);
 
-                            let tag = match (chunk.is_final, is_vad_endpoint) {
-                                (true, _) => "最终",
-                                (false, true) => "VAD",
-                                (false, false) => "中间",
-                            };
-                            let display_text = if chunk.text.is_empty() {
-                                "(空)".to_string()
-                            } else {
-                                chunk.text.clone()
-                            };
-                            tracing::info!(
-                                "🎤 [ASR {}] #{}: \"{}\"",
-                                tag,
-                                chunk_count,
-                                display_text,
-                            );
+                        tokio::select! {
+                            chunk_opt = stream.next() => {
+                                match chunk_opt {
+                                    Some(Ok(chunk)) => {
+                                        chunk_count += 1;
 
-                            if is_vad_endpoint && !vad_triggered {
-                                vad_triggered = true;
-                                tracing::info!("🎤 [VAD] 检测到语音结束，通知 ws.rs 开始处理",);
-                                vad_notify.notify_one();
+                                        let is_vad_endpoint = chunk
+                                            .segment
+                                            .as_ref()
+                                            .and_then(|s| s.confidence)
+                                            .map(|c| c >= 0.99)
+                                            .unwrap_or(false);
+
+                                        let tag = match (chunk.is_final, is_vad_endpoint) {
+                                            (true, _) => "最终",
+                                            (false, true) => "VAD",
+                                            (false, false) => "中间",
+                                        };
+                                        let display_text = if chunk.text.is_empty() {
+                                            "(空)".to_string()
+                                        } else {
+                                            chunk.text.clone()
+                                        };
+                                        tracing::info!(
+                                            "🎤 [ASR {}] #{}: \"{}\"",
+                                            tag,
+                                            chunk_count,
+                                            display_text,
+                                        );
+
+                                        if is_vad_endpoint && !vad_triggered {
+                                            vad_triggered = true;
+                                            tracing::info!("🎤 [VAD] 检测到语音结束，通知 ws.rs 开始处理",);
+                                            vad_notify.notify_one();
+                                        }
+
+                                        if chunk.is_final && !chunk.text.is_empty() {
+                                            full_text.push_str(&chunk.text);
+                                        }
+
+                                        if !chunk.text.is_empty() {
+                                            asr_text_received.store(true, Ordering::Release);
+                                            last_nonempty_text = chunk.text.clone();
+                                        }
+                                    }
+                                    Some(Err(e)) => {
+                                        tracing::warn!("🎤 [ASR 错误] {}", e);
+                                    }
+                                    None => {
+                                        break;
+                                    }
+                                }
                             }
-
-                            if chunk.is_final && !chunk.text.is_empty() {
-                                full_text.push_str(&chunk.text);
+                            _ = &mut stability_delay => {
+                                if !vad_triggered {
+                                    tracing::info!(
+                                        "🎤 [文本稳定 VAD] 文本 \"{}\" 已稳定 {}ms，通知 ws.rs 开始处理",
+                                        last_nonempty_text,
+                                        TEXT_STABLE_MS,
+                                    );
+                                    vad_notify.notify_one();
+                                }
+                                break;
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!("🎤 [ASR 错误] {}", e);
+                    } else {
+                        match stream.next().await {
+                            Some(Ok(chunk)) => {
+                                chunk_count += 1;
+
+                                let is_vad_endpoint = chunk
+                                    .segment
+                                    .as_ref()
+                                    .and_then(|s| s.confidence)
+                                    .map(|c| c >= 0.99)
+                                    .unwrap_or(false);
+
+                                let tag = match (chunk.is_final, is_vad_endpoint) {
+                                    (true, _) => "最终",
+                                    (false, true) => "VAD",
+                                    (false, false) => "中间",
+                                };
+                                let display_text = if chunk.text.is_empty() {
+                                    "(空)".to_string()
+                                } else {
+                                    chunk.text.clone()
+                                };
+                                tracing::info!(
+                                    "🎤 [ASR {}] #{}: \"{}\"",
+                                    tag,
+                                    chunk_count,
+                                    display_text,
+                                );
+
+                                if is_vad_endpoint && !vad_triggered {
+                                    vad_triggered = true;
+                                    tracing::info!("🎤 [VAD] 检测到语音结束，通知 ws.rs 开始处理",);
+                                    vad_notify.notify_one();
+                                }
+
+                                if chunk.is_final && !chunk.text.is_empty() {
+                                    full_text.push_str(&chunk.text);
+                                }
+
+                                if !chunk.text.is_empty() {
+                                    asr_text_received.store(true, Ordering::Release);
+                                    last_nonempty_text = chunk.text.clone();
+                                }
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!("🎤 [ASR 错误] {}", e);
+                            }
+                            None => {
+                                break;
+                            }
                         }
                     }
                 }
@@ -405,7 +498,8 @@ impl AsrLlmTtsStrategy {
                 } else {
                     Ok(full_text)
                 }
-            });
+            },
+        );
 
         let sample_rate: u32 = 16000;
         let frame_duration_ms: u32 = 60;
@@ -552,9 +646,12 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 state.silence_count = state.silence_count.saturating_add(1);
             }
 
-            if state.silence_count >= MAX_SILENCE_FRAMES {
-                // 静音超阈值：关闭 ASR 音频流，让服务端完成处理
-                // 替换 sender 使旧的被 drop，从而关闭 ASR 音频流
+            if state.silence_count >= MAX_SILENCE_FRAMES
+                && self.asr_received_text.load(Ordering::Acquire)
+            {
+                // 静音超阈值且 ASR 已经识别到过有效文本：关闭 ASR 流
+                // 如果 ASR 还未返回任何非空文本（用户还没说话），则不触发本地 VAD，
+                // 让系统继续等待（30s 安全超时兜底），避免用户正在思考时被提前中断
                 let (new_tx, _) = mpsc::channel::<Vec<u8>>(1);
                 let _ = std::mem::replace(&mut state.pcm_tx, new_tx);
                 tracing::info!(
