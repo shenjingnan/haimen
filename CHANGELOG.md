@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.0](https://github.com/shenjingnan/haimen/compare/v0.4.0...v0.5.0) - 2026-07-26
+
+### Added
+
+- *(config)* Agent 多服务商配置——后端重构及 Web 管理界面 ([#102](https://github.com/shenjingnan/haimen/pull/102))
+- *(logging)* LLM 回复内容输出到日志 ([#101](https://github.com/shenjingnan/haimen/pull/101))
+- *(config)* TTS 多服务商配置——后端重构及 Web 管理界面 ([#100](https://github.com/shenjingnan/haimen/pull/100))
+- *(deps)* 升级 univoice 依赖至本地 v0.11.0 ([#99](https://github.com/shenjingnan/haimen/pull/99))
+- *(config)* ASR 多服务商配置——后端重构及 Web 管理界面 ([#98](https://github.com/shenjingnan/haimen/pull/98))
+- *(config)* 语音配置管理——ASR/TTS 配置化及 Web 管理界面 ([#96](https://github.com/shenjingnan/haimen/pull/96))
+
+### Fixed
+
+- *(xiaozhi-asr)* 修复流式 ASR VAD 延迟及多轮会话 VAD 残留问题 ([#97](https://github.com/shenjingnan/haimen/pull/97))
+
 ## [0.4.0](https://github.com/shenjingnan/haimen/compare/v0.3.0...v0.4.0) - 2026-07-20
 
 ### Added
