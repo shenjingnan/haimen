@@ -115,11 +115,33 @@ pub struct ConnectorsSection {
 }
 
 /// AI 网关配置
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// # 配置格式
+///
+/// 支持多 Agent 提供商配置，通过 `active_provider` 切换当前使用的提供商：
+///
+/// ```toml
+/// [gateway]
+/// active_provider = "claude-code"
+///
+/// [gateway.providers.claude-code]
+/// # CLI 工具无需额外凭证
+///
+/// [gateway.providers.codex]
+/// # CLI 工具无需额外凭证
+/// ```
+///
+/// # 向后兼容
+///
+/// 旧格式 `agent = "claude-code"` 在加载时自动迁移到 `active_provider = "claude-code"`。
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct GatewayConfig {
-    /// AI Agent 类型（如 "claude-code"）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent: Option<String>,
+    /// 当前激活的 AI Agent 提供商
+    #[serde(default = "default_agent_provider")]
+    pub active_provider: String,
+    /// 所有已配置的 Agent 提供商的参数（{provider_name → {key → value}}）
+    #[serde(default)]
+    pub providers: HashMap<String, HashMap<String, String>>,
     /// API 密钥
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
@@ -144,6 +166,10 @@ pub struct GatewayConfig {
     pub agent_timeout_secs: u64,
 }
 
+fn default_agent_provider() -> String {
+    "claude-code".to_string()
+}
+
 fn default_session_idle_timeout() -> u64 {
     30
 }
@@ -159,7 +185,8 @@ fn default_agent_timeout() -> u64 {
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
-            agent: None,
+            active_provider: default_agent_provider(),
+            providers: HashMap::new(),
             api_key: None,
             model: None,
             work_dir: None,
@@ -168,6 +195,88 @@ impl Default for GatewayConfig {
             mcp_servers: HashMap::new(),
             agent_timeout_secs: default_agent_timeout(),
         }
+    }
+}
+
+/// 旧格式 Gateway 配置（用于向后兼容反序列化）
+#[derive(Debug, Clone, Deserialize)]
+struct GatewayConfigLegacy {
+    agent: Option<String>,
+    active_provider: Option<String>,
+    providers: Option<HashMap<String, HashMap<String, String>>>,
+    api_key: Option<String>,
+    model: Option<String>,
+    work_dir: Option<String>,
+    session_idle_timeout_mins: Option<u64>,
+    session_max_turns: Option<u32>,
+    mcp_servers: Option<HashMap<String, McpServerConfig>>,
+    agent_timeout_secs: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for GatewayConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let legacy = GatewayConfigLegacy::deserialize(deserializer)?;
+
+        // 如果已有新格式字段，直接使用
+        if let Some(active) = legacy.active_provider {
+            return Ok(Self {
+                active_provider: active,
+                providers: legacy.providers.unwrap_or_default(),
+                api_key: legacy.api_key,
+                model: legacy.model,
+                work_dir: legacy.work_dir,
+                session_idle_timeout_mins: legacy
+                    .session_idle_timeout_mins
+                    .unwrap_or_else(default_session_idle_timeout),
+                session_max_turns: legacy
+                    .session_max_turns
+                    .unwrap_or_else(default_session_max_turns),
+                mcp_servers: legacy.mcp_servers.unwrap_or_default(),
+                agent_timeout_secs: legacy
+                    .agent_timeout_secs
+                    .unwrap_or_else(default_agent_timeout),
+            });
+        }
+
+        // 旧格式迁移：agent = "claude-code" → active_provider
+        let active_provider = legacy.agent.unwrap_or_else(|| "claude-code".to_string());
+
+        Ok(Self {
+            active_provider,
+            providers: legacy.providers.unwrap_or_default(),
+            api_key: legacy.api_key,
+            model: legacy.model,
+            work_dir: legacy.work_dir,
+            session_idle_timeout_mins: legacy
+                .session_idle_timeout_mins
+                .unwrap_or_else(default_session_idle_timeout),
+            session_max_turns: legacy
+                .session_max_turns
+                .unwrap_or_else(default_session_max_turns),
+            mcp_servers: legacy.mcp_servers.unwrap_or_default(),
+            agent_timeout_secs: legacy
+                .agent_timeout_secs
+                .unwrap_or_else(default_agent_timeout),
+        })
+    }
+}
+
+impl GatewayConfig {
+    /// 获取当前激活的 Agent 提供商名称
+    pub fn resolved_agent(&self) -> String {
+        self.active_provider.clone()
+    }
+
+    /// 获取当前激活提供商的某个配置值
+    pub fn get_credential(&self, key: &str) -> Option<String> {
+        self.providers
+            .get(&self.active_provider)
+            .and_then(|p| p.get(key))
+            .filter(|v| !v.is_empty())
+            .cloned()
     }
 }
 
@@ -832,7 +941,7 @@ enabled = true
         assert_eq!(config.log_level, "info");
         assert!(config.connectors.lark.is_none());
         assert!(config.connectors.dingtalk.is_none());
-        assert!(config.gateway.agent.is_none());
+        assert_eq!(config.gateway.active_provider, "claude-code");
         assert!(config.http.enabled);
         assert_eq!(config.asr.active_provider, "doubao");
         assert!(config.asr.providers.is_empty());
@@ -852,7 +961,7 @@ enabled = true
             debug: true,
             log_level: "warn".to_string(),
             gateway: GatewayConfig {
-                agent: Some("claude-code".to_string()),
+                active_provider: "claude-code".to_string(),
                 ..Default::default()
             },
             connectors: ConnectorsSection {
@@ -895,7 +1004,7 @@ enabled = true
     #[test]
     fn test_gateway_config_default() {
         let config = GatewayConfig::default();
-        assert!(config.agent.is_none());
+        assert_eq!(config.active_provider, "claude-code");
         assert_eq!(config.session_idle_timeout_mins, 30);
         assert_eq!(config.session_max_turns, 20);
     }
@@ -923,6 +1032,105 @@ enabled = true
         let toml_str = toml::to_string(&config).unwrap();
         let deserialized: GatewayConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(deserialized.agent_timeout_secs, 600);
+    }
+
+    // ─── GatewayConfig 向后兼容测试 ──────────────────────
+
+    #[test]
+    fn test_gateway_old_format_agent_migration() {
+        run_with_temp_home(|home| {
+            write_toml_settings(
+                home,
+                r#"
+[gateway]
+agent = "claude-code"
+"#,
+            );
+            let result = load_settings().unwrap().unwrap();
+            assert_eq!(result.gateway.active_provider, "claude-code");
+        });
+    }
+
+    #[test]
+    fn test_gateway_old_format_agent_migration_to_codex() {
+        run_with_temp_home(|home| {
+            write_toml_settings(
+                home,
+                r#"
+[gateway]
+agent = "codex"
+"#,
+            );
+            let result = load_settings().unwrap().unwrap();
+            assert_eq!(result.gateway.active_provider, "codex");
+        });
+    }
+
+    #[test]
+    fn test_gateway_new_format_active_provider() {
+        run_with_temp_home(|home| {
+            write_toml_settings(
+                home,
+                r#"
+[gateway]
+active_provider = "codex"
+
+[gateway.providers.codex]
+extra = "value"
+"#,
+            );
+            let result = load_settings().unwrap().unwrap();
+            assert_eq!(result.gateway.active_provider, "codex");
+            assert_eq!(
+                result.gateway.get_credential("extra").as_deref(),
+                Some("value")
+            );
+        });
+    }
+
+    #[test]
+    fn test_gateway_resolved_agent() {
+        let config = GatewayConfig {
+            active_provider: "codex".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.resolved_agent(), "codex");
+    }
+
+    #[test]
+    fn test_gateway_get_credential() {
+        let mut providers = HashMap::new();
+        let mut codex_creds = HashMap::new();
+        codex_creds.insert("api_key".to_string(), "test-key".to_string());
+        providers.insert("codex".to_string(), codex_creds);
+
+        let config = GatewayConfig {
+            active_provider: "codex".to_string(),
+            providers,
+            ..Default::default()
+        };
+        assert_eq!(
+            config.get_credential("api_key").as_deref(),
+            Some("test-key")
+        );
+        assert!(config.get_credential("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_gateway_new_format_overrides_legacy() {
+        run_with_temp_home(|home| {
+            // 同时使用新格式和旧格式，新格式优先
+            write_toml_settings(
+                home,
+                r#"
+[gateway]
+active_provider = "codex"
+agent = "claude-code"
+"#,
+            );
+            let result = load_settings().unwrap().unwrap();
+            assert_eq!(result.gateway.active_provider, "codex");
+        });
     }
 
     // ─── AsrConfig 测试 ───────────────────────────────────

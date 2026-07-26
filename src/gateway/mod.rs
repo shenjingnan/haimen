@@ -11,6 +11,7 @@ use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::agents::claude_code::agent::ClaudeAgent;
+use crate::agents::codex::agent::CodexAgent;
 use crate::config::settings::load_settings;
 use crate::connectors::dingtalk::channel::DingTalkChannel;
 use crate::connectors::github::GitHubConnector;
@@ -57,10 +58,11 @@ pub fn build_connectors(
 pub fn build_agent(
     config: &crate::config::settings::AppConfig,
 ) -> Result<Box<dyn AgentProvider>, String> {
-    let agent_name = config.gateway.agent.as_deref().unwrap_or("claude-code");
+    let agent_name = config.gateway.resolved_agent();
 
-    match agent_name {
+    match agent_name.as_str() {
         "claude-code" => Ok(Box::new(ClaudeAgent)),
+        "codex" => Ok(Box::new(CodexAgent)),
         other => Err(format!("不支持的 AI Agent: {}", other)),
     }
 }
@@ -84,7 +86,13 @@ fn build_xiaozhi_strategy(
         }
     };
 
-    let llm_agent: Arc<dyn AgentProvider> = Arc::new(ClaudeAgent);
+    let llm_agent: Arc<dyn AgentProvider> = match build_agent(config) {
+        Ok(a) => Arc::from(a),
+        Err(e) => {
+            tracing::warn!(error = %e, "构建 Agent 失败，xiaozhi WebSocket 不启动");
+            return None;
+        }
+    };
     let tts_config = config.tts.clone();
     Some(Arc::new(
         crate::xiaozhi_asr_llm_tts::AsrLlmTtsStrategy::new(
@@ -140,12 +148,18 @@ pub async fn start_all(cli_no_browser: bool) -> Result<(), String> {
         };
 
         // GitHub Webhook（可选）
-        let webhook_state = config.github.clone().map(|cfg| {
-            let gh_agent: Arc<dyn AgentProvider> = Arc::new(ClaudeAgent);
+        let webhook_state = config.github.clone().and_then(|cfg| {
+            let gh_agent: Arc<dyn AgentProvider> = match build_agent(&config) {
+                Ok(a) => Arc::from(a),
+                Err(e) => {
+                    tracing::warn!(error = %e, "构建 Agent 失败，GitHub Webhook 将不使用 Agent");
+                    return None;
+                }
+            };
             let connector = GitHubConnector::new(cfg, gh_agent);
-            WebhookState {
+            Some(WebhookState {
                 github: Some(Arc::new(connector)),
-            }
+            })
         });
 
         let xiaozhi_strategy = build_xiaozhi_strategy(&config);

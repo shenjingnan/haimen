@@ -63,9 +63,9 @@ pub enum Commands {
         /// ASR-LLM-TTS 模式（默认）：语音识别 → AI 处理 → 语音合成
         #[arg(long)]
         xiaozhi_llm: bool,
-        /// LLM 提供者（仅 LLM 模式有效）
-        #[arg(long, default_value = "claude-code")]
-        xiaozhi_llm_provider: String,
+        /// LLM 提供者（仅 LLM 模式有效，默认从配置读取）
+        #[arg(long)]
+        xiaozhi_llm_provider: Option<String>,
     },
     /// 生成 Shell 补全脚本
     #[command(hide = true)]
@@ -123,13 +123,14 @@ fn create_agent(
         .flatten()
         .unwrap_or_default();
 
-    let agent_name = provider
-        .as_deref()
-        .or(config.gateway.agent.as_deref())
-        .unwrap_or("claude-code");
+    let agent_name = match provider {
+        Some(p) => p,
+        None => config.gateway.resolved_agent(),
+    };
 
-    match agent_name {
+    match agent_name.as_str() {
         "claude-code" => Ok(Box::new(crate::agents::claude_code::agent::ClaudeAgent)),
+        "codex" => Ok(Box::new(crate::agents::codex::agent::CodexAgent)),
         "mcp" => Err("MCP Agent 暂不支持直接调用".to_string()),
         other => Err(format!("不支持的 AI Agent: {}", other)),
     }
@@ -219,11 +220,14 @@ pub async fn run(cli: Cli) -> Result<(), String> {
                 .ok()
                 .flatten()
                 .unwrap_or_default();
-            let agent: Arc<dyn crate::gateway::provider::AgentProvider> =
-                Arc::new(crate::agents::claude_code::agent::ClaudeAgent);
+
+            // 构建 webhook 和 LLM 使用的 Agent
+            let serve_agent: Arc<dyn crate::gateway::provider::AgentProvider> =
+                create_agent(xiaozhi_llm_provider.clone()).map(Arc::from)?;
 
             let webhook_state = settings.github.map(|cfg| {
-                let connector = crate::connectors::github::GitHubConnector::new(cfg, agent.clone());
+                let connector =
+                    crate::connectors::github::GitHubConnector::new(cfg, serve_agent.clone());
                 crate::gateway::webhook::WebhookState {
                     github: Some(Arc::new(connector)),
                 }
@@ -245,13 +249,11 @@ pub async fn run(cli: Cli) -> Result<(), String> {
                 ))
             } else {
                 // 默认 ASR-LLM-TTS 模式
-                let llm_agent: Arc<dyn crate::gateway::provider::AgentProvider> =
-                    create_agent(Some(xiaozhi_llm_provider.clone())).map(Arc::from)?;
                 Arc::new(crate::xiaozhi_asr_llm_tts::AsrLlmTtsStrategy::from_config(
                     &settings.asr,
                     &settings.tts,
                     xiaozhi_tts_voice,
-                    llm_agent,
+                    serve_agent,
                 )?)
             };
 
