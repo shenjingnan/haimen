@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.6.0](https://github.com/shenjingnan/haimen/compare/v0.5.1...v0.6.0) - 2026-07-26
+
+### Added
+
+- *(tts)* 新增固定文本模式，支持跳过 LLM 直接播报预设文本 ([#109](https://github.com/shenjingnan/haimen/pull/109))
+
+### Fixed
+
+- *(voice)* ASR 流式管线增加文本稳定超时 VAD 机制 ([#111](https://github.com/shenjingnan/haimen/pull/111))
+
 ## [0.5.1](https://github.com/shenjingnan/haimen/compare/v0.5.0...v0.5.1) - 2026-07-26
 
 ### Fixed
