@@ -61,6 +61,20 @@ pub async fn start(
             axum::routing::post(api::voice_settings::verify_tts_credentials),
         );
 
+    let agent_routes = axum::Router::new()
+        .route(
+            "/api/v1/settings/agent",
+            axum::routing::get(api::agent_settings::get_agent_settings),
+        )
+        .route(
+            "/api/v1/settings/agent",
+            axum::routing::put(api::agent_settings::update_agent_settings),
+        )
+        .route(
+            "/api/v1/settings/agent/verify",
+            axum::routing::post(api::agent_settings::verify_agent_credentials),
+        );
+
     let app = if let Some(state) = webhook_state {
         let mut r = axum::Router::new()
             .route("/health", axum::routing::get(health_handler))
@@ -74,6 +88,7 @@ pub async fn start(
             r = haimen_xiaozhi::add_routes(r, strategy);
         }
         r = r.merge(voice_routes);
+        r = r.merge(agent_routes);
         r.fallback(r#static::handle)
     } else {
         let mut r = axum::Router::new()
@@ -83,6 +98,7 @@ pub async fn start(
             r = haimen_xiaozhi::add_routes(r, strategy);
         }
         r = r.merge(voice_routes);
+        r = r.merge(agent_routes);
         r.fallback(r#static::handle)
     };
 

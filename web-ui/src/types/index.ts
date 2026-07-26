@@ -106,3 +106,16 @@ export interface TtsVoice {
   name: string;
   language: string;
 }
+
+// ── Agent 配置 ──
+
+export interface AgentSettings {
+  /** 当前激活的 Agent 提供商 */
+  active_provider: string;
+  /** 所有已配置提供商的参数 { provider_name: { key: value } } */
+  providers: Record<string, Record<string, string>>;
+  /** 当前激活提供商的回退解析值 */
+  resolved?: {
+    agent: string;
+  };
+}

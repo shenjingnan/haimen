@@ -9,6 +9,7 @@ import {
   verifyAsrCredentials,
   verifyTtsCredentials,
 } from '@/api/voice';
+import Combobox from '@/components/Combobox';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -16,7 +17,6 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import Combobox from '@/components/Combobox';
 import VoiceSelector from '@/components/VoiceSelector';
 import { ASR_PROVIDERS } from '@/data/asr-providers';
 import { TTS_PROVIDERS } from '@/data/tts-providers';

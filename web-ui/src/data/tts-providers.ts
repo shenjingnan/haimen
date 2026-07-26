@@ -59,9 +59,7 @@ export const TTS_PROVIDERS: ProviderInfo[] = [
   {
     id: 'glm',
     name: '智谱AI',
-    fields: [
-      { key: 'api_key', label: 'API Key', type: 'password' },
-    ],
+    fields: [{ key: 'api_key', label: 'API Key', type: 'password' }],
   },
   {
     id: 'minimax',
