@@ -486,6 +486,12 @@ pub struct TtsConfig {
     /// 所有已配置的 TTS 提供商的凭证（{provider_name → {key → value}}）
     #[serde(default)]
     pub providers: HashMap<String, HashMap<String, String>>,
+    /// 是否启用固定文本模式（开启后忽略 ASR 结果，播报固定文本）
+    #[serde(default)]
+    pub fixed_text_enabled: bool,
+    /// 固定文本内容（仅 fixed_text_enabled 为 true 时生效）
+    #[serde(default)]
+    pub fixed_text: Option<String>,
 }
 
 /// 旧格式 TTS 配置（用于向后兼容反序列化）
@@ -499,6 +505,8 @@ struct TtsConfigLegacy {
     resource_id: Option<String>,
     active_provider: Option<String>,
     providers: Option<HashMap<String, HashMap<String, String>>>,
+    fixed_text_enabled: Option<bool>,
+    fixed_text: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for TtsConfig {
@@ -513,6 +521,8 @@ impl<'de> Deserialize<'de> for TtsConfig {
             return Ok(Self {
                 active_provider: active,
                 providers: legacy.providers.unwrap_or_default(),
+                fixed_text_enabled: legacy.fixed_text_enabled.unwrap_or(false),
+                fixed_text: legacy.fixed_text,
             });
         }
 
@@ -546,6 +556,8 @@ impl<'de> Deserialize<'de> for TtsConfig {
         Ok(Self {
             active_provider: provider,
             providers,
+            fixed_text_enabled: legacy.fixed_text_enabled.unwrap_or(false),
+            fixed_text: legacy.fixed_text,
         })
     }
 }
@@ -559,6 +571,8 @@ impl Default for TtsConfig {
         Self {
             active_provider: default_tts_provider(),
             providers: HashMap::new(),
+            fixed_text_enabled: false,
+            fixed_text: None,
         }
     }
 }
@@ -993,6 +1007,7 @@ enabled = true
                     m.insert("doubao".to_string(), creds);
                     m
                 },
+                ..Default::default()
             },
             github: None,
         };
@@ -1286,6 +1301,7 @@ provider = "doubao"
         let cfg = TtsConfig {
             active_provider: "doubao".to_string(),
             providers,
+            ..Default::default()
         };
         assert_eq!(cfg.resolved_voice(), "zh_female_vv_uranus_bigtts");
     }
@@ -1324,6 +1340,7 @@ provider = "doubao"
         let cfg = TtsConfig {
             active_provider: "doubao".to_string(),
             providers,
+            ..Default::default()
         };
         assert_eq!(cfg.resolved_voice(), "zh_female_vv_uranus_bigtts");
         unsafe {
@@ -1340,6 +1357,7 @@ provider = "doubao"
         let cfg = TtsConfig {
             active_provider: "doubao".to_string(),
             providers,
+            ..Default::default()
         };
         assert_eq!(cfg.resolved_cluster().as_deref(), Some("volcano_icl"));
     }
@@ -1365,6 +1383,7 @@ provider = "doubao"
         let cfg = TtsConfig {
             active_provider: "doubao".to_string(),
             providers: providers.clone(),
+            ..Default::default()
         };
         assert_eq!(cfg.get_credential("app_key").unwrap(), "doubao-app-key");
         assert_eq!(cfg.get_credential("access_token").unwrap(), "doubao-token");
@@ -1374,6 +1393,7 @@ provider = "doubao"
         let cfg = TtsConfig {
             active_provider: "qwen".to_string(),
             providers,
+            ..Default::default()
         };
         assert_eq!(cfg.get_credential("api_key").unwrap(), "qwen-key");
         assert!(cfg.get_credential("app_key").is_none());
@@ -1473,6 +1493,7 @@ api_key = "qwen-api-key"
                         m.insert("doubao".to_string(), creds);
                         m
                     },
+                    ..Default::default()
                 },
                 ..Default::default()
             };

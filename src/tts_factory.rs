@@ -130,6 +130,7 @@ mod tests {
         let config = TtsConfig {
             active_provider: "doubao".to_string(),
             providers,
+            ..Default::default()
         };
         let provider = create_tts_provider(&config).unwrap();
         assert_eq!(provider.name(), "doubao");
@@ -145,6 +146,7 @@ mod tests {
         let config = TtsConfig {
             active_provider: "qwen".to_string(),
             providers,
+            ..Default::default()
         };
         let provider = create_tts_provider(&config).unwrap();
         assert_eq!(provider.name(), "qwen3-tts");
@@ -160,6 +162,7 @@ mod tests {
         let config = TtsConfig {
             active_provider: "glm".to_string(),
             providers,
+            ..Default::default()
         };
         let provider = create_tts_provider(&config).unwrap();
         assert_eq!(provider.name(), "glm");
@@ -175,6 +178,7 @@ mod tests {
         let config = TtsConfig {
             active_provider: "openai".to_string(),
             providers,
+            ..Default::default()
         };
         let provider = create_tts_provider(&config).unwrap();
         assert_eq!(provider.name(), "openai");
@@ -185,6 +189,7 @@ mod tests {
         let config = TtsConfig {
             active_provider: "unknown".to_string(),
             providers: HashMap::new(),
+            ..Default::default()
         };
         let result = create_tts_provider(&config);
         assert!(result.is_err());
@@ -196,6 +201,7 @@ mod tests {
         let config = TtsConfig {
             active_provider: "doubao".to_string(),
             providers: HashMap::new(),
+            ..Default::default()
         };
         let result = create_tts_provider(&config);
         assert!(result.is_err());

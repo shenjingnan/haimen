@@ -93,6 +93,10 @@ export interface TtsSettings {
   active_provider: string;
   /** 所有已配置提供商的凭证 { provider_name: { key: value } } */
   providers: Record<string, Record<string, string>>;
+  /** 是否启用固定文本模式 */
+  fixed_text_enabled: boolean;
+  /** 固定文本内容 */
+  fixed_text: string | null;
   /** 当前激活提供商的回退解析值 */
   resolved?: {
     app_key: string | null;

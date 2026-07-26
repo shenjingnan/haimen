@@ -479,6 +479,7 @@ mod tests {
         crate::config::settings::TtsConfig {
             active_provider: "doubao".to_string(),
             providers,
+            ..Default::default()
         }
     }
 
