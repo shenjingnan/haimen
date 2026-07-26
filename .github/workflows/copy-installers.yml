@@ -10,14 +10,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Copy haimen-installer.sh -> install.sh
+      - name: Copy install.sh -> install.sh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
           echo "Downloading installers from release ${TAG}..."
-          gh release download "$TAG" --pattern "haimen-installer.sh"
-          gh release download "$TAG" --pattern "haimen-installer.ps1"
-          cp haimen-installer.sh install.sh
-          cp haimen-installer.ps1 install.ps1
+          gh release download "$TAG" --pattern "install.sh"
+          gh release download "$TAG" --pattern "install.ps1"
+          cp install.sh install.sh
+          cp install.ps1 install.ps1
           gh release upload "$TAG" install.sh install.ps1 --clobber
