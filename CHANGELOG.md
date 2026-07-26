@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.6.1](https://github.com/shenjingnan/haimen/compare/v0.6.0...v0.6.1) - 2026-07-26
+
+### Fixed
+
+- *(ci)* 修复安装脚本下载模式匹配名称 ([#114](https://github.com/shenjingnan/haimen/pull/114))
+
 ## [0.6.0](https://github.com/shenjingnan/haimen/compare/v0.5.1...v0.6.0) - 2026-07-26
 
 ### Added
