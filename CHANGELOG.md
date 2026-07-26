@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.1](https://github.com/shenjingnan/haimen/compare/v0.5.0...v0.5.1) - 2026-07-26
+
+### Fixed
+
+- *(docs)* 修复安装脚本 URL 和 Markdown 表格格式 ([#107](https://github.com/shenjingnan/haimen/pull/107))
+- *(docs)* 修复安装脚本 URL 并新增 Gitee 国内镜像安装方式 ([#106](https://github.com/shenjingnan/haimen/pull/106))
+
+### Other
+
+- *(readme)* 更新 README 安装方式、CLI 命令和配置示例 ([#104](https://github.com/shenjingnan/haimen/pull/104))
+
 ## [0.5.0](https://github.com/shenjingnan/haimen/compare/v0.4.0...v0.5.0) - 2026-07-26
 
 ### Added
