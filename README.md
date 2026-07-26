@@ -21,11 +21,21 @@
 
 ```bash
 # macOS / Linux
-curl -fsSL https://github.com/shenjingnan/haimen/releases/latest/download/installer.sh | sh
+curl -fsSL https://github.com/shenjingnan/haimen/releases/latest/download/haimen-installer.sh | sh
 
 # Windows PowerShell
-$r = Invoke-WebRequest https://github.com/shenjingnan/haimen/releases/latest/download/installer.ps1; iex $r.Content
+$r = Invoke-WebRequest https://github.com/shenjingnan/haimen/releases/latest/download/haimen-installer.ps1; iex $r.Content
 ```
+
+> **国内用户（中国大陆）**：如果 GitHub 访问缓慢，可使用 Gitee 镜像安装（通过 `ghproxy.com` 加速）：
+>
+> ```bash
+> # macOS / Linux
+> curl -fsSL https://gitee.com/shenjingnan/haimen/raw/main/docs/public/install-gitee.sh | sh
+>
+> # Windows PowerShell
+> $r = Invoke-WebRequest https://gitee.com/shenjingnan/haimen/raw/main/docs/public/install-gitee.ps1; iex $r.Content
+> ```
 
 ### 方式二：cargo install
 
