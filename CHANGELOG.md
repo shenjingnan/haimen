@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.0](https://github.com/shenjingnan/haimen/compare/v0.6.1...v0.7.0) - 2026-07-27
+
+### Added
+
+- *(tts)* 新增 MiniMax TTS 提供商支持 ([#124](https://github.com/shenjingnan/haimen/pull/124))
+- *(web)* ASR 配置支持运行时热加载，TTS 失败时播放内置提示音 ([#123](https://github.com/shenjingnan/haimen/pull/123))
+- *(web)* TTS 配置保存后即时生效，支持运行时热加载 ([#122](https://github.com/shenjingnan/haimen/pull/122))
+- *(start)* 新增 --log-level 和 --open-browser 参数，优化日志与浏览器行为 ([#121](https://github.com/shenjingnan/haimen/pull/121))
+
+### Fixed
+
+- *(tts)* StreamingOpusEncoder 流式编码 + 即时下发，改善长文本延迟 ([#119](https://github.com/shenjingnan/haimen/pull/119))
+
 ## [0.6.1](https://github.com/shenjingnan/haimen/compare/v0.6.0...v0.6.1) - 2026-07-26
 
 ### Fixed
