@@ -83,8 +83,21 @@ fn build_xiaozhi_strategy(
     // 检查 ASR 凭证（所有模式都需要 ASR 用于 VAD 判停）
     {
         let cfg = shared_asr_config.read().unwrap();
-        if cfg.resolved_app_key().is_err() || cfg.resolved_access_token().is_err() {
-            tracing::info!("未配置 ASR 凭证（app_key / access_token），xiaozhi WebSocket 不启动");
+        let has_creds = match cfg.active_provider.as_str() {
+            "doubao" => cfg.resolved_app_key().is_ok() && cfg.resolved_access_token().is_ok(),
+            "xfyun" => {
+                cfg.get_credential("app_id").is_some()
+                    && cfg.get_credential("api_key").is_some()
+                    && cfg.get_credential("api_secret").is_some()
+            }
+            // qwen / glm / mimo 等使用 api_key
+            _ => cfg.get_credential("api_key").is_some(),
+        };
+        if !has_creds {
+            tracing::info!(
+                provider = %cfg.active_provider,
+                "未配置 ASR 凭证，xiaozhi WebSocket 不启动",
+            );
             return None;
         }
     }

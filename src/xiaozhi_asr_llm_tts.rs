@@ -38,8 +38,9 @@ use opus2::{Application, Channels, Decoder};
 use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use univoice::asr::{
-    AsrProvider, AudioInput, AudioStream, BaseProviderOption, DEFAULT_CHUNK_SIZE, DoubaoAsr,
-    DoubaoAsrMode, DoubaoAsrOption, adapt_audio_input,
+    AsrProvider, AudioContainerFormat, AudioInput, AudioStream, BaseProviderOption,
+    DEFAULT_CHUNK_SIZE, DoubaoAsr, DoubaoAsrMode, DoubaoAsrOption, GlmAsr, GlmAsrOption, MimoAsr,
+    MimoAsrOption, QwenAsr, QwenAsrOption, XfyunAsr, XfyunAsrOption, adapt_audio_input,
 };
 use univoice::tts::TtsRequest;
 
@@ -141,6 +142,182 @@ fn compute_pcm_rms(pcm_bytes: &[u8]) -> f64 {
     (sum_sq / samples as f64).sqrt()
 }
 
+/// 根据配置创建 ASR 提供者实例
+///
+/// 支持动态切换 ASR 提供商，通过 `AsrConfig.active_provider` 控制。
+fn create_asr_provider(cfg: &AsrConfig) -> Result<Box<dyn AsrProvider>, String> {
+    match cfg.active_provider.as_str() {
+        "qwen" => {
+            let api_key = cfg
+                .get_credential("api_key")
+                .ok_or_else(|| "ASR API Key 未配置（当前提供商: qwen）".to_string())?;
+            Ok(Box::new(QwenAsr::new(QwenAsrOption {
+                base: BaseProviderOption {
+                    api_key: Some(api_key),
+                    model: Some("paraformer-realtime-v2".into()),
+                    language: Some("zh-CN".into()),
+                    // xiaozhi 管道输出 PCM16 mono，必须显式设置格式（Qwen 默认 Mp3）
+                    format: Some(AudioContainerFormat::Pcm),
+                    ..Default::default()
+                },
+                sample_rate: Some(16000),
+                enable_punctuation_prediction: Some(true),
+                enable_inverse_text_normalization: Some(true),
+                ..Default::default()
+            })))
+        }
+        "glm" => {
+            let api_key = cfg
+                .get_credential("api_key")
+                .ok_or_else(|| "ASR API Key 未配置（当前提供商: glm）".to_string())?;
+            Ok(Box::new(GlmAsr::new(GlmAsrOption {
+                base: BaseProviderOption {
+                    api_key: Some(api_key),
+                    language: Some("zh-CN".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })))
+        }
+        "mimo" => {
+            let api_key = cfg
+                .get_credential("api_key")
+                .ok_or_else(|| "ASR API Key 未配置（当前提供商: mimo）".to_string())?;
+            Ok(Box::new(MimoAsr::new(MimoAsrOption {
+                base: BaseProviderOption {
+                    api_key: Some(api_key),
+                    ..Default::default()
+                },
+                language: Some("zh-CN".into()),
+            })))
+        }
+        "xfyun" => {
+            let app_id = cfg
+                .get_credential("app_id")
+                .ok_or_else(|| "ASR app_id 未配置（当前提供商: xfyun）".to_string())?;
+            let api_key = cfg
+                .get_credential("api_key")
+                .ok_or_else(|| "ASR api_key 未配置（当前提供商: xfyun）".to_string())?;
+            let api_secret = cfg
+                .get_credential("api_secret")
+                .ok_or_else(|| "ASR api_secret 未配置（当前提供商: xfyun）".to_string())?;
+            Ok(Box::new(XfyunAsr::new(XfyunAsrOption {
+                base: BaseProviderOption {
+                    api_key: Some(api_key),
+                    language: Some("zh-CN".into()),
+                    ..Default::default()
+                },
+                app_id: Some(app_id),
+                api_secret: Some(api_secret),
+                sample_rate: Some(16000),
+                ..Default::default()
+            })))
+        }
+        _ => {
+            // doubao（默认）
+            let app_key = cfg
+                .get_credential("app_key")
+                .ok_or_else(|| "ASR App Key 未配置（当前提供商: doubao）".to_string())?;
+            let access_key = cfg
+                .get_credential("access_key")
+                .ok_or_else(|| "ASR Access Token 未配置（当前提供商: doubao）".to_string())?;
+            Ok(Box::new(DoubaoAsr::new(DoubaoAsrOption {
+                base: BaseProviderOption {
+                    language: Some("zh-CN".into()),
+                    ..Default::default()
+                },
+                app_key: Some(app_key),
+                access_key: Some(access_key),
+                mode: DoubaoAsrMode::Streaming,
+                ..Default::default()
+            })))
+        }
+    }
+}
+
+/// 根据配置创建流式 ASR 提供者实例（录音期间实时识别，含 VAD 参数）
+///
+/// 注意：只有 doubao 支持流式 VAD 端点检测参数，其他提供商由服务端控制 VAD。
+fn create_streaming_asr_provider(cfg: &AsrConfig) -> Result<Box<dyn AsrProvider>, String> {
+    match cfg.active_provider.as_str() {
+        "qwen" => {
+            let api_key = cfg
+                .get_credential("api_key")
+                .ok_or_else(|| "ASR API Key 未配置（当前提供商: qwen）".to_string())?;
+            Ok(Box::new(QwenAsr::new(QwenAsrOption {
+                base: BaseProviderOption {
+                    api_key: Some(api_key),
+                    model: Some("paraformer-realtime-v2".into()),
+                    language: Some("zh-CN".into()),
+                    // xiaozhi 管道输出 PCM16 mono，必须显式设置格式（Qwen 默认 Mp3）
+                    format: Some(AudioContainerFormat::Pcm),
+                    ..Default::default()
+                },
+                sample_rate: Some(16000),
+                enable_punctuation_prediction: Some(true),
+                enable_inverse_text_normalization: Some(true),
+                ..Default::default()
+            })))
+        }
+        "glm" => {
+            // GLM 使用 HTTP REST，不支持真正的流式 ASR
+            create_asr_provider(cfg)
+        }
+        "mimo" => {
+            // MIMO 使用 HTTP REST，不支持真正的流式 ASR
+            create_asr_provider(cfg)
+        }
+        "xfyun" => {
+            let app_id = cfg
+                .get_credential("app_id")
+                .ok_or_else(|| "ASR app_id 未配置（当前提供商: xfyun）".to_string())?;
+            let api_key = cfg
+                .get_credential("api_key")
+                .ok_or_else(|| "ASR api_key 未配置（当前提供商: xfyun）".to_string())?;
+            let api_secret = cfg
+                .get_credential("api_secret")
+                .ok_or_else(|| "ASR api_secret 未配置（当前提供商: xfyun）".to_string())?;
+            Ok(Box::new(XfyunAsr::new(XfyunAsrOption {
+                base: BaseProviderOption {
+                    api_key: Some(api_key),
+                    language: Some("zh-CN".into()),
+                    ..Default::default()
+                },
+                app_id: Some(app_id),
+                api_secret: Some(api_secret),
+                sample_rate: Some(16000),
+                ..Default::default()
+            })))
+        }
+        _ => {
+            // doubao（默认）- 流式模式添加 VAD 端点检测参数
+            let app_key = cfg
+                .get_credential("app_key")
+                .ok_or_else(|| "ASR App Key 未配置（当前提供商: doubao）".to_string())?;
+            let access_key = cfg
+                .get_credential("access_key")
+                .ok_or_else(|| "ASR Access Token 未配置（当前提供商: doubao）".to_string())?;
+            Ok(Box::new(DoubaoAsr::new(DoubaoAsrOption {
+                base: BaseProviderOption {
+                    language: Some("zh-CN".into()),
+                    ..Default::default()
+                },
+                app_key: Some(app_key),
+                access_key: Some(access_key),
+                mode: DoubaoAsrMode::Streaming,
+                sample_rate: 16000,
+                bits: 16,
+                channel: 1,
+                // VAD 端点检测：800ms 静音强制判停
+                end_window_size: Some(800),
+                // 至少 1s 音频后才允许判停（避免极短音频误判）
+                force_to_speech_time: Some(1000),
+                ..Default::default()
+            })))
+        }
+    }
+}
+
 impl AsrLlmTtsStrategy {
     /// 创建 ASR → LLM → TTS 策略
     ///
@@ -182,10 +359,31 @@ impl AsrLlmTtsStrategy {
         // 验证当前配置的凭证是否有效（构造时检查一次，运行时也会动态读取）
         {
             let cfg = asr_config.read().unwrap();
-            cfg.resolved_app_key()
-                .map_err(|e| format!("ASR App Key 配置无效: {}", e))?;
-            cfg.resolved_access_token()
-                .map_err(|e| format!("ASR Access Token 配置无效: {}", e))?;
+            match cfg.active_provider.as_str() {
+                "doubao" => {
+                    cfg.resolved_app_key()
+                        .map_err(|e| format!("ASR App Key 配置无效: {}", e))?;
+                    cfg.resolved_access_token()
+                        .map_err(|e| format!("ASR Access Token 配置无效: {}", e))?;
+                }
+                "xfyun" => {
+                    cfg.get_credential("app_id")
+                        .ok_or_else(|| "ASR app_id 未配置（当前提供商: xfyun）".to_string())?;
+                    cfg.get_credential("api_key")
+                        .ok_or_else(|| "ASR api_key 未配置（当前提供商: xfyun）".to_string())?;
+                    cfg.get_credential("api_secret")
+                        .ok_or_else(|| "ASR api_secret 未配置（当前提供商: xfyun）".to_string())?;
+                }
+                // qwen / glm / mimo 等使用 api_key
+                _ => {
+                    cfg.get_credential("api_key").ok_or_else(|| {
+                        format!(
+                            "ASR API Key 配置无效（当前提供商: {}）",
+                            cfg.active_provider
+                        )
+                    })?;
+                }
+            }
         }
 
         Ok(Self {
@@ -281,31 +479,17 @@ impl AsrLlmTtsStrategy {
             return Ok(None);
         }
 
-        // 从共享配置读取最新 ASR 凭证
-        let (app_key, access_token) = {
+        // 从共享配置读取最新 ASR 凭证，动态创建提供商实例
+        let asr = {
             let cfg = self.asr_config.read().unwrap();
-            (
-                cfg.resolved_app_key().unwrap_or_default(),
-                cfg.resolved_access_token().unwrap_or_default(),
-            )
+            create_asr_provider(&cfg)?
         };
-
-        let asr = DoubaoAsr::new(DoubaoAsrOption {
-            base: BaseProviderOption {
-                language: Some("zh-CN".into()),
-                ..Default::default()
-            },
-            app_key: Some(app_key),
-            access_key: Some(access_token),
-            mode: DoubaoAsrMode::Streaming,
-            ..Default::default()
-        });
 
         let audio_stream = adapt_audio_input(AudioInput::Data(pcm_16k), DEFAULT_CHUNK_SIZE);
 
         let text = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            asr_listen_to_text(&asr, audio_stream),
+            asr_listen_to_text(&*asr, audio_stream),
         )
         .await
         .map_err(|_| "ASR 识别超时 (30s)".to_string())?
@@ -330,36 +514,15 @@ impl AsrLlmTtsStrategy {
     /// 后台启动 `listen_stream` 消费 PCM 流并收集识别结果。
     /// 管道状态存入 `streaming_state` 供 `on_audio_frame` 喂入音频。
     async fn init_asr_pipeline(&self) -> Result<(), String> {
-        // 从共享配置读取最新 ASR 凭证
-        let (app_key, access_token) = {
+        // 从共享配置读取最新 ASR 凭证，动态创建流式 ASR 提供商实例
+        let asr = {
             let cfg = self.asr_config.read().unwrap();
-            (
-                cfg.resolved_app_key().unwrap_or_default(),
-                cfg.resolved_access_token().unwrap_or_default(),
-            )
+            create_streaming_asr_provider(&cfg)?
         };
 
         // 创建 mpsc channel：接收端作为 AudioStream 喂给 ASR
         let (pcm_tx, pcm_rx) = mpsc::channel::<Vec<u8>>(32);
         let audio_stream: AudioStream = Box::pin(ReceiverStream::new(pcm_rx));
-
-        let asr = DoubaoAsr::new(DoubaoAsrOption {
-            base: BaseProviderOption {
-                language: Some("zh-CN".into()),
-                ..Default::default()
-            },
-            app_key: Some(app_key),
-            access_key: Some(access_token),
-            mode: DoubaoAsrMode::Streaming,
-            sample_rate: 16000,
-            bits: 16,
-            channel: 1,
-            // VAD 端点检测：800ms 静音强制判停
-            end_window_size: Some(800),
-            // 至少 1s 音频后才允许判停（避免极短音频误判）
-            force_to_speech_time: Some(1000),
-            ..Default::default()
-        });
 
         let vad_notify = self
             .vad_notify
@@ -1168,7 +1331,7 @@ fn decode_opus_frames_to_pcm(
 
 /// 对音频流执行 ASR 识别，返回完整识别文本
 async fn asr_listen_to_text(
-    asr: &DoubaoAsr,
+    asr: &dyn AsrProvider,
     audio_stream: univoice::asr::AudioStream,
 ) -> Result<String, String> {
     let mut stream = asr
@@ -1851,5 +2014,59 @@ mod tests {
         }
         assert_eq!(result, "你好", "process_stream 应返回 process 的结果");
         assert_eq!(sid, "mock-session-id");
+    }
+
+    // ─── ASR 提供者工厂测试 ──────────────────────────
+
+    fn make_qwen_asr_config() -> crate::config::settings::AsrConfig {
+        let mut providers = std::collections::HashMap::new();
+        let mut creds = std::collections::HashMap::new();
+        creds.insert("api_key".to_string(), "test-qwen-api-key".to_string());
+        providers.insert("qwen".to_string(), creds);
+        crate::config::settings::AsrConfig {
+            active_provider: "qwen".to_string(),
+            providers,
+        }
+    }
+
+    #[test]
+    fn test_t34_create_asr_provider_doubao() {
+        let cfg = test_asr_config();
+        let provider = create_asr_provider(&cfg).expect("doubao 提供者创建应成功");
+        assert_eq!(provider.name(), "doubao");
+    }
+
+    #[test]
+    fn test_t35_create_asr_provider_qwen() {
+        let cfg = make_qwen_asr_config();
+        let provider = create_asr_provider(&cfg).expect("qwen 提供者创建应成功");
+        assert_eq!(provider.name(), "qwen");
+    }
+
+    #[test]
+    fn test_t36_create_asr_provider_missing_creds() {
+        let cfg = crate::config::settings::AsrConfig {
+            active_provider: "qwen".to_string(),
+            providers: std::collections::HashMap::new(),
+        };
+        let result = create_asr_provider(&cfg);
+        match result {
+            Err(e) => assert!(e.contains("API Key"), "错误信息应包含 API Key，得到: {}", e),
+            Ok(_) => panic!("缺少凭证时应返回错误"),
+        }
+    }
+
+    #[test]
+    fn test_t37_create_streaming_asr_provider_doubao() {
+        let cfg = test_asr_config();
+        let provider = create_streaming_asr_provider(&cfg).expect("doubao 流式提供者创建应成功");
+        assert_eq!(provider.name(), "doubao");
+    }
+
+    #[test]
+    fn test_t38_create_streaming_asr_provider_qwen() {
+        let cfg = make_qwen_asr_config();
+        let provider = create_streaming_asr_provider(&cfg).expect("qwen 流式提供者创建应成功");
+        assert_eq!(provider.name(), "qwen");
     }
 }
