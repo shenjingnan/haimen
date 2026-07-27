@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.2](https://github.com/shenjingnan/haimen/compare/v0.7.1...v0.7.2) - 2026-07-27
+
+### Fixed
+
+- *(install)* 移除 copy-installers.yml，使用 cargo-dist 默认安装脚本名称 ([#130](https://github.com/shenjingnan/haimen/pull/130))
+
 ## [0.7.1](https://github.com/shenjingnan/haimen/compare/v0.7.0...v0.7.1) - 2026-07-27
 
 ### Added
