@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.7.1](https://github.com/shenjingnan/haimen/compare/v0.7.0...v0.7.1) - 2026-07-27
+
+### Added
+
+- *(asr)* 支持多 ASR 提供商动态切换（Qwen/GLM/MiMo/Xfyun） ([#127](https://github.com/shenjingnan/haimen/pull/127))
+
+### Other
+
+- *(asr)* 移除未使用的智谱AI和小米MiMo ASR 提供商 ([#128](https://github.com/shenjingnan/haimen/pull/128))
+
 ## [0.7.0](https://github.com/shenjingnan/haimen/compare/v0.6.1...v0.7.0) - 2026-07-27
 
 ### Added
