@@ -21,10 +21,10 @@
 
 ```bash
 # macOS / Linux
-curl -fsSL https://github.com/shenjingnan/haimen/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/shenjingnan/haimen/releases/latest/download/haimen-installer.sh | sh
 
 # Windows PowerShell
-$r = Invoke-WebRequest https://github.com/shenjingnan/haimen/releases/latest/download/install.ps1; iex $r.Content
+$r = Invoke-WebRequest https://github.com/shenjingnan/haimen/releases/latest/download/haimen-installer.ps1; iex $r.Content
 ```
 
 **国内用户（中国大陆）**：如果 GitHub 访问缓慢，可使用 Gitee 镜像安装
