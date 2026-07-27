@@ -17,7 +17,7 @@ use crate::config::settings::TtsConfig;
 fn default_voice(provider: &str) -> &'static str {
     match provider {
         "doubao" => "zh_female_xiaohe_uranus_bigtts",
-        "qwen" => "longxiaochun_v3",
+        "qwen" => "Cherry",
         "glm" => "tongtong",
         _ => "",
     }
@@ -79,10 +79,10 @@ pub fn create_tts_provider(config: &TtsConfig) -> Result<Box<dyn TtsProvider>, S
             let api_key = config
                 .get_credential("api_key")
                 .ok_or_else(|| "缺少 Qwen API Key".to_string())?;
-            let model = config.get_credential("model");
             let mut base = build_base_option(config, "qwen");
             base.api_key = Some(api_key);
-            base.model = model.or_else(|| Some("cosyvoice-v3-flash".into()));
+            // Qwen3TTS 使用 DashScope Realtime WebSocket 协议，
+            // 支持模型 "qwen3-tts-instruct-flash-realtime"（默认）和 48 个英文音色。
             Ok(Box::new(Qwen3Tts::new(Qwen3TtsOption {
                 base,
                 ..Default::default()

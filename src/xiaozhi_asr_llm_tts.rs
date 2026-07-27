@@ -801,6 +801,11 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         let mut timestamp: u32 = 0;
         let mut total_audio_bytes: usize = 0;
 
+        // ── Phase 3a: 暂存所有 TTS 音频帧 ──────────────────────────
+        // 先不发送到硬件端，而是全部缓存在内存中，
+        // 待 TTS 合成完成后一次性下发，确保硬件端获得完整连续的音频流。
+        let mut all_frames: Vec<AudioFrame> = Vec::new();
+
         while let Some(result) = audio_stream.next().await {
             match result {
                 Ok(chunk) => {
@@ -811,24 +816,30 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                         .map_err(|e| format!("Opus 编码失败: {}", e))?;
 
                     for opus in opus_frames {
-                        let frame = AudioFrame {
+                        all_frames.push(AudioFrame {
                             timestamp,
                             data: opus,
-                        };
-                        if frame_tx.send(frame).await.is_err() {
-                            // 接收端已关闭（如播放被中断），安全退出
-                            tracing::info!(
-                                session_id = %session_id,
-                                "TTS-STREAM: 回放管道已关闭，停止生成",
-                            );
-                            return Ok(());
-                        }
+                        });
                         timestamp = timestamp.wrapping_add(60);
                     }
                 }
                 Err(e) => {
                     tracing::warn!("流式 TTS 音频块错误: {}", e);
                 }
+            }
+        }
+
+        // ── Phase 3b: TTS 合成完成，一次性下发所有音频帧 ──────────
+        // 此时 `all_frames` 包含完整的 TTS 音频帧序列，
+        // 通过 `frame_tx` 逐帧发送，由上层 `playback_frames_stream`
+        // 以 60ms 间隔陆续推送到硬件端播放。
+        for frame in all_frames {
+            if frame_tx.send(frame).await.is_err() {
+                tracing::info!(
+                    session_id = %session_id,
+                    "TTS-STREAM: 回放管道已关闭，停止下发",
+                );
+                return Ok(());
             }
         }
 
@@ -841,9 +852,10 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         tracing::info!(
             session_id = %session_id,
             total_audio_bytes = total_audio_bytes,
+            frame_count = timestamp / 60,
             response_len = full_response.len(),
             response = %full_response,
-            "TTS-STREAM: 流式合成完成",
+            "TTS-STREAM: 流式合成完成，已暂存并下发全部音频帧",
         );
 
         Ok(())

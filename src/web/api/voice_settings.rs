@@ -422,7 +422,7 @@ pub async fn list_tts_voices(params: Query<HashMap<String, String>>) -> Json<ser
 
     let voices = match provider {
         "doubao" => univoice::tts::voices::doubao::list_voices(),
-        "qwen" => univoice::tts::voices::qwen::list_voices(),
+        "qwen" => univoice::tts::voices::qwen3_tts::list_voices(),
         "glm" => univoice::tts::voices::glm::list_voices(),
         "minimax" => univoice::tts::voices::minimax::list_voices(),
         "qwen_realtime" => univoice::tts::voices::qwen3_tts::list_voices(),
