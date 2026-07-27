@@ -15,7 +15,7 @@ export default function App() {
           <button
             type="button"
             onClick={() => setPage('voice')}
-            className={`px-3 py-1 rounded text-sm ${
+            className={`px-3 py-1 rounded text-sm cursor-pointer ${
               page === 'voice' ? 'bg-primary text-primary-foreground' : 'hover:bg-muted'
             }`}
           >
@@ -24,7 +24,7 @@ export default function App() {
           <button
             type="button"
             onClick={() => setPage('agent')}
-            className={`px-3 py-1 rounded text-sm ${
+            className={`px-3 py-1 rounded text-sm cursor-pointer ${
               page === 'agent' ? 'bg-primary text-primary-foreground' : 'hover:bg-muted'
             }`}
           >
