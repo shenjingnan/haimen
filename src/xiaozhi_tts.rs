@@ -227,6 +227,35 @@ pub(crate) fn pcm_to_opus_frames(
     Ok(frames)
 }
 
+/// 加载内置「失败，请重试」提示音并编码为 Opus 帧
+///
+/// 当 TTS 合成失败时使用此函数生成 fallback 音频，确保设备能播放提示音
+/// 告知用户出错了，而非静默无响应。
+///
+/// WAV 格式：PCM 16-bit mono 24000Hz（与 TTS 引擎输出格式一致），
+/// 通过 `include_bytes!` 在编译时嵌入二进制，无运行时文件依赖。
+pub(crate) fn fallback_error_audio_frames() -> Result<Vec<Vec<u8>>, String> {
+    static FALLBACK_WAV: &[u8] = include_bytes!("resources/try_again.wav");
+    // 跳过 44 字节 WAV 头
+    // RIFF/WAVE 文件头结构：
+    //   [0-3]   "RIFF"
+    //   [4-7]   File size - 8
+    //   [8-11]  "WAVE"
+    //   [12-15] "fmt "
+    //   [16-19] Subchunk1 size (16 for PCM)
+    //   [20-21] Audio format (1 = PCM)
+    //   [22-23] Num channels
+    //   [24-27] Sample rate
+    //   [28-31] Byte rate
+    //   [32-33] Block align
+    //   [34-35] Bits per sample
+    //   [36-39] "data"
+    //   [40-43] Data size
+    //   [44+]   PCM data
+    let pcm = &FALLBACK_WAV[44..];
+    pcm_to_opus_frames(pcm, 24000, 60)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // 测试
 // ═══════════════════════════════════════════════════════════════════════════════

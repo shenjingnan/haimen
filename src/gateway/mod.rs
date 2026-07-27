@@ -73,21 +73,21 @@ pub fn build_agent(
 /// 但跳过 LLM 处理，直接使用预设文本进行 TTS 合成。
 ///
 /// 需要配置 ASR 和 TTS 提供商凭证。环境变量缺失时跳过 xiaozhi 路由（不挂载）。
+///
+/// ASR 配置通过 Arc<RwLock> 共享，Web API 保存时同步更新此对象，实现运行时热加载。
 fn build_xiaozhi_strategy(
     config: &crate::config::settings::AppConfig,
+    shared_asr_config: crate::xiaozhi_asr_llm_tts::SharedAsrConfig,
     shared_tts_config: crate::xiaozhi_asr_llm_tts::SharedTtsConfig,
 ) -> Option<Arc<dyn haimen_xiaozhi::ResponseStrategy>> {
     // 检查 ASR 凭证（所有模式都需要 ASR 用于 VAD 判停）
-    let (app_key, access_token) = match (
-        config.asr.resolved_app_key(),
-        config.asr.resolved_access_token(),
-    ) {
-        (Ok(key), Ok(token)) => (key, token),
-        _ => {
+    {
+        let cfg = shared_asr_config.read().unwrap();
+        if cfg.resolved_app_key().is_err() || cfg.resolved_access_token().is_err() {
             tracing::info!("未配置 ASR 凭证（app_key / access_token），xiaozhi WebSocket 不启动");
             return None;
         }
-    };
+    }
 
     let llm_agent: Arc<dyn AgentProvider> = match build_agent(config) {
         Ok(a) => Arc::from(a),
@@ -98,8 +98,7 @@ fn build_xiaozhi_strategy(
     };
     Some(Arc::new(
         crate::xiaozhi_asr_llm_tts::AsrLlmTtsStrategy::new(
-            app_key,
-            access_token,
+            shared_asr_config,
             shared_tts_config,
             None, // voice_override
             llm_agent,
@@ -165,8 +164,13 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
             })
         });
 
+        let shared_asr_config = Arc::new(RwLock::new(config.asr.clone()));
         let shared_tts_config = Arc::new(RwLock::new(config.tts.clone()));
-        let xiaozhi_strategy = build_xiaozhi_strategy(&config, shared_tts_config.clone());
+        let xiaozhi_strategy = build_xiaozhi_strategy(
+            &config,
+            shared_asr_config.clone(),
+            shared_tts_config.clone(),
+        );
 
         tracing::info!(
             "HTTP 服务器启动于 {}:{}{}",
@@ -184,6 +188,7 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
                 serve_config,
                 webhook_state,
                 xiaozhi_strategy,
+                shared_asr_config,
                 shared_tts_config,
                 http_cancel,
             )

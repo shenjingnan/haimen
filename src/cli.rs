@@ -242,12 +242,14 @@ pub async fn run(cli: Cli) -> Result<(), String> {
 
             // 创建共享 TTS 配置，Web API 保存时同步更新此对象，实现运行时热加载
             let shared_tts_config = Arc::new(RwLock::new(settings.tts.clone()));
+            // 创建共享 ASR 配置，Web API 保存时同步更新此对象，实现运行时热加载
+            let shared_asr_config = Arc::new(RwLock::new(settings.asr.clone()));
 
             let xiaozhi_strategy: Arc<dyn haimen_xiaozhi::ResponseStrategy> = if xiaozhi_echo {
                 Arc::new(haimen_xiaozhi::EchoStrategy)
             } else if xiaozhi_asr_tts {
                 Arc::new(crate::xiaozhi_asr_tts::AsrTtsStrategy::from_config(
-                    &settings.asr,
+                    shared_asr_config.clone(),
                     shared_tts_config.clone(),
                     xiaozhi_tts_voice,
                 )?)
@@ -260,7 +262,7 @@ pub async fn run(cli: Cli) -> Result<(), String> {
             } else {
                 // 默认 ASR-LLM-TTS 模式
                 Arc::new(crate::xiaozhi_asr_llm_tts::AsrLlmTtsStrategy::from_config(
-                    &settings.asr,
+                    shared_asr_config.clone(),
                     shared_tts_config.clone(),
                     xiaozhi_tts_voice,
                     serve_agent,
@@ -276,6 +278,7 @@ pub async fn run(cli: Cli) -> Result<(), String> {
                 serve_config,
                 webhook_state,
                 Some(xiaozhi_strategy),
+                shared_asr_config,
                 shared_tts_config,
                 CancellationToken::new(),
             )

@@ -32,21 +32,22 @@ use univoice::asr::{
 };
 use univoice::tts::TtsRequest;
 
-use crate::config::settings::TtsConfig;
+use crate::config::settings::{AsrConfig, TtsConfig};
 
 use crate::xiaozhi_tts::pcm_to_opus_frames;
 
 /// 共享 TTS 配置类型
 pub type SharedTtsConfig = Arc<RwLock<TtsConfig>>;
 
+/// 共享 ASR 配置类型
+pub type SharedAsrConfig = Arc<RwLock<AsrConfig>>;
+
 /// ASR→TTS 响应策略：将设备录制的语音识别为文字，再合成为语音回传
 ///
 /// 管线：Opus 解码 (16kHz) → Doubao ASR → TTS Provider (24kHz) → Opus 编码
 pub struct AsrTtsStrategy {
-    /// 火山引擎 App Key（ASR 使用）
-    app_key: String,
-    /// 火山引擎 Access Token（ASR 使用）
-    access_token: String,
+    /// ASR 配置（包含活跃提供商和凭证），通过 Arc<RwLock> 支持运行时热加载
+    asr_config: SharedAsrConfig,
     /// TTS 配置（包含活跃提供商和凭证），通过 Arc<RwLock> 支持运行时热加载
     tts_config: SharedTtsConfig,
     /// CLI 音色覆盖（--xiaozhi-tts-voice），叠加到共享配置之上，不写入磁盘
@@ -56,14 +57,12 @@ pub struct AsrTtsStrategy {
 impl AsrTtsStrategy {
     /// 创建 ASR→TTS 策略
     pub fn new(
-        app_key: String,
-        access_token: String,
+        asr_config: SharedAsrConfig,
         tts_config: SharedTtsConfig,
         voice_override: Option<String>,
     ) -> Self {
         Self {
-            app_key,
-            access_token,
+            asr_config,
             tts_config,
             voice_override,
         }
@@ -72,17 +71,24 @@ impl AsrTtsStrategy {
     /// 从 ASR + TTS 配置构建策略
     ///
     /// `voice_override` 可以覆盖配置中的音色（用于 CLI 参数 `--xiaozhi-tts-voice`）。
+    ///
+    /// ASR 配置通过 Arc<RwLock> 共享，Web API 保存时同步更新此对象，实现运行时热加载。
     pub fn from_config(
-        asr: &crate::config::settings::AsrConfig,
+        asr_config: SharedAsrConfig,
         shared_tts_config: SharedTtsConfig,
         voice_override: Option<String>,
     ) -> Result<Self, String> {
-        let app_key = asr.resolved_app_key()?;
-        let access_token = asr.resolved_access_token()?;
+        // 验证当前配置的凭证是否有效（构造时检查一次，运行时也会动态读取）
+        {
+            let cfg = asr_config.read().unwrap();
+            cfg.resolved_app_key()
+                .map_err(|e| format!("ASR App Key 配置无效: {}", e))?;
+            cfg.resolved_access_token()
+                .map_err(|e| format!("ASR Access Token 配置无效: {}", e))?;
+        }
 
         Ok(Self {
-            app_key,
-            access_token,
+            asr_config,
             tts_config: shared_tts_config,
             voice_override,
         })
@@ -175,13 +181,22 @@ impl ResponseStrategy for AsrTtsStrategy {
             "ASR-TTS: 开始语音识别",
         );
 
+        // 从共享配置读取最新 ASR 凭证
+        let (app_key, access_token) = {
+            let cfg = self.asr_config.read().unwrap();
+            (
+                cfg.resolved_app_key().unwrap_or_default(),
+                cfg.resolved_access_token().unwrap_or_default(),
+            )
+        };
+
         let asr = DoubaoAsr::new(DoubaoAsrOption {
             base: BaseProviderOption {
                 language: Some("zh-CN".into()),
                 ..Default::default()
             },
-            app_key: Some(self.app_key.clone()),
-            access_key: Some(self.access_token.clone()),
+            app_key: Some(app_key),
+            access_key: Some(access_token),
             mode: DoubaoAsrMode::Streaming,
             ..Default::default()
         });
@@ -212,72 +227,74 @@ impl ResponseStrategy for AsrTtsStrategy {
 
         // ── Step 3: TTS 语音合成 ──
         // 从共享配置读取最新 TTS 配置，叠加 CLI 音色覆盖
-        let (tts, provider_name) = {
-            let cfg = self.tts_config.read().unwrap();
-            let mut work_cfg = cfg.clone();
-            if let Some(ref voice) = self.voice_override {
-                work_cfg
-                    .providers
-                    .entry(work_cfg.active_provider.clone())
-                    .or_default()
-                    .insert("voice".to_string(), voice.clone());
+        // 如果 TTS 提供者创建或合成失败，返回内置「失败，请重试」提示音
+        let frames = match async {
+            // 在单独的块中获取并释放 TTS 配置锁，避免 RwLockReadGuard 跨越 .await
+            let provider = {
+                let cfg = self.tts_config.read().unwrap();
+                let mut work_cfg = cfg.clone();
+                if let Some(ref voice) = self.voice_override {
+                    work_cfg
+                        .providers
+                        .entry(work_cfg.active_provider.clone())
+                        .or_default()
+                        .insert("voice".to_string(), voice.clone());
+                }
+                crate::tts_factory::create_tts_provider(&work_cfg)? // cfg 在此处释放
+            };
+
+            let response = provider
+                .synthesize(TtsRequest {
+                    text: text.clone(),
+                    options: None,
+                })
+                .await
+                .map_err(|e| format!("TTS 合成失败: {}", e))?;
+
+            if response.audio.is_empty() {
+                return Err::<Vec<AudioFrame>, String>("TTS 返回空音频".to_string());
             }
-            let name = work_cfg.active_provider.clone();
-            let provider = crate::tts_factory::create_tts_provider(&work_cfg)
-                .map_err(|e| format!("创建 TTS 提供者失败: {}", e))?;
-            (provider, name)
+
+            // PCM → Opus 编码 (24kHz, 60ms)
+            let opus_frames = pcm_to_opus_frames(&response.audio, 24000, 60)
+                .map_err(|e| format!("Opus 编码失败: {}", e))?;
+
+            // 封装为 AudioFrame
+            let mut frames = Vec::with_capacity(opus_frames.len());
+            let mut timestamp: u32 = 0;
+            for opus in opus_frames {
+                frames.push(AudioFrame {
+                    timestamp,
+                    data: opus,
+                });
+                timestamp = timestamp.wrapping_add(60);
+            }
+
+            Ok::<_, String>(frames)
+        }
+        .await
+        {
+            Ok(frames) => frames,
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "TTS 合成失败，返回 fallback 提示音",
+                );
+                let opus_frames = crate::xiaozhi_tts::fallback_error_audio_frames()
+                    .map_err(|e| format!("Fallback 音频编码失败: {}", e))?;
+                let mut frames = Vec::with_capacity(opus_frames.len());
+                let mut timestamp: u32 = 0;
+                for opus in opus_frames {
+                    frames.push(AudioFrame {
+                        timestamp,
+                        data: opus,
+                    });
+                    timestamp = timestamp.wrapping_add(60);
+                }
+                frames
+            }
         };
-
-        tracing::info!(
-            session_id = %session_id,
-            text = %text,
-            provider = %provider_name,
-            "ASR-TTS: 开始语音合成",
-        );
-
-        let response = tts
-            .synthesize(TtsRequest {
-                text: text.clone(),
-                options: None,
-            })
-            .await
-            .map_err(|e| format!("TTS 合成失败: {}", e))?;
-
-        tracing::info!(
-            session_id = %session_id,
-            audio_size = response.audio.len(),
-            format = %response.format,
-            "ASR-TTS: 合成完成",
-        );
-
-        if response.audio.is_empty() {
-            tracing::warn!(
-                session_id = %session_id,
-                "ASR-TTS: TTS 返回空音频",
-            );
-            return Ok(Vec::new());
-        }
-
-        // ── Step 4: PCM → Opus 编码 (24kHz, 60ms) ──
-        let opus_frames = pcm_to_opus_frames(&response.audio, 24000, 60)
-            .map_err(|e| format!("Opus 编码失败: {}", e))?;
-
-        tracing::info!(
-            session_id = %session_id,
-            frame_count = opus_frames.len(),
-            "ASR-TTS: Opus 编码完成",
-        );
-
-        // ── Step 5: 封装为 AudioFrame ──
-        let mut frames = Vec::with_capacity(opus_frames.len());
-        let mut timestamp: u32 = 0;
-        for opus in opus_frames {
-            frames.push(AudioFrame {
-                timestamp,
-                data: opus,
-            });
-            timestamp = timestamp.wrapping_add(60);
-        }
 
         tracing::info!(
             session_id = %session_id,
@@ -501,17 +518,28 @@ mod tests {
         }
     }
 
+    fn make_asr_config() -> crate::config::settings::AsrConfig {
+        let mut providers = std::collections::HashMap::new();
+        let mut creds = std::collections::HashMap::new();
+        creds.insert("app_key".to_string(), "test-app-key".to_string());
+        creds.insert("access_key".to_string(), "test-access-token".to_string());
+        providers.insert("doubao".to_string(), creds);
+        crate::config::settings::AsrConfig {
+            active_provider: "doubao".to_string(),
+            providers,
+        }
+    }
+
     fn make_shared_tts_config() -> SharedTtsConfig {
         Arc::new(RwLock::new(make_tts_config()))
     }
 
+    fn make_shared_asr_config() -> SharedAsrConfig {
+        Arc::new(RwLock::new(make_asr_config()))
+    }
+
     fn make_strategy() -> AsrTtsStrategy {
-        AsrTtsStrategy::new(
-            "app_key".into(),
-            "access_token".into(),
-            make_shared_tts_config(),
-            None,
-        )
+        AsrTtsStrategy::new(make_shared_asr_config(), make_shared_tts_config(), None)
     }
 
     #[test]
