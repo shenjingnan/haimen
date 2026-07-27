@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::config;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -240,25 +240,28 @@ pub async fn run(cli: Cli) -> Result<(), String> {
                 }
             });
 
+            // 创建共享 TTS 配置，Web API 保存时同步更新此对象，实现运行时热加载
+            let shared_tts_config = Arc::new(RwLock::new(settings.tts.clone()));
+
             let xiaozhi_strategy: Arc<dyn haimen_xiaozhi::ResponseStrategy> = if xiaozhi_echo {
                 Arc::new(haimen_xiaozhi::EchoStrategy)
             } else if xiaozhi_asr_tts {
                 Arc::new(crate::xiaozhi_asr_tts::AsrTtsStrategy::from_config(
                     &settings.asr,
-                    &settings.tts,
+                    shared_tts_config.clone(),
                     xiaozhi_tts_voice,
                 )?)
             } else if let Some(text) = xiaozhi_tts_text {
                 Arc::new(crate::xiaozhi_tts::TtsStrategy::from_config(
                     text,
                     xiaozhi_tts_voice,
-                    &settings.tts,
+                    shared_tts_config.clone(),
                 ))
             } else {
                 // 默认 ASR-LLM-TTS 模式
                 Arc::new(crate::xiaozhi_asr_llm_tts::AsrLlmTtsStrategy::from_config(
                     &settings.asr,
-                    &settings.tts,
+                    shared_tts_config.clone(),
                     xiaozhi_tts_voice,
                     serve_agent,
                 )?)
@@ -273,6 +276,7 @@ pub async fn run(cli: Cli) -> Result<(), String> {
                 serve_config,
                 webhook_state,
                 Some(xiaozhi_strategy),
+                shared_tts_config,
                 CancellationToken::new(),
             )
             .await

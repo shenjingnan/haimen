@@ -2,10 +2,10 @@ pub mod api;
 pub mod r#static;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
-
+use std::sync::{Arc, RwLock};
 use tokio_util::sync::CancellationToken;
 
+use crate::config::settings::TtsConfig;
 use crate::gateway::webhook::WebhookState;
 
 /// 服务器配置
@@ -21,11 +21,13 @@ pub struct ServeConfig {
 /// - `config`: 服务器地址配置
 /// - `webhook_state`: 可选的 Webhook 处理器（GitHub Webhook）
 /// - `xiaozhi_strategy`: 可选的 xiaozhi WebSocket 响应策略，为 None 时不挂载 xiaozhi 路由
+/// - `tts_config`: 共享的 TTS 配置（Arc<RwLock>），Web API 保存时同步更新，实现运行时热加载
 /// - `cancel`: 共享取消令牌，收到取消信号时触发优雅关闭
 pub async fn start(
     config: ServeConfig,
     webhook_state: Option<WebhookState>,
     xiaozhi_strategy: Option<Arc<dyn haimen_xiaozhi::ResponseStrategy>>,
+    tts_config: Arc<RwLock<TtsConfig>>,
     cancel: CancellationToken,
 ) -> Result<(), String> {
     use haimen_xiaozhi;
@@ -59,7 +61,8 @@ pub async fn start(
         .route(
             "/api/v1/settings/tts/verify",
             axum::routing::post(api::voice_settings::verify_tts_credentials),
-        );
+        )
+        .with_state(tts_config);
 
     let agent_routes = axum::Router::new()
         .route(

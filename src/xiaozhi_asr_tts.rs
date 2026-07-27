@@ -20,6 +20,8 @@
 //!   ↓ BinaryProtocol2 → 设备播放
 //! ```
 
+use std::sync::{Arc, RwLock};
+
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use haimen_xiaozhi::{AudioFrame, AudioParams, ResponseStrategy};
@@ -34,6 +36,9 @@ use crate::config::settings::TtsConfig;
 
 use crate::xiaozhi_tts::pcm_to_opus_frames;
 
+/// 共享 TTS 配置类型
+pub type SharedTtsConfig = Arc<RwLock<TtsConfig>>;
+
 /// ASR→TTS 响应策略：将设备录制的语音识别为文字，再合成为语音回传
 ///
 /// 管线：Opus 解码 (16kHz) → Doubao ASR → TTS Provider (24kHz) → Opus 编码
@@ -42,17 +47,25 @@ pub struct AsrTtsStrategy {
     app_key: String,
     /// 火山引擎 Access Token（ASR 使用）
     access_token: String,
-    /// TTS 配置（包含活跃提供商和凭证）
-    tts_config: TtsConfig,
+    /// TTS 配置（包含活跃提供商和凭证），通过 Arc<RwLock> 支持运行时热加载
+    tts_config: SharedTtsConfig,
+    /// CLI 音色覆盖（--xiaozhi-tts-voice），叠加到共享配置之上，不写入磁盘
+    voice_override: Option<String>,
 }
 
 impl AsrTtsStrategy {
     /// 创建 ASR→TTS 策略
-    pub fn new(app_key: String, access_token: String, tts_config: TtsConfig) -> Self {
+    pub fn new(
+        app_key: String,
+        access_token: String,
+        tts_config: SharedTtsConfig,
+        voice_override: Option<String>,
+    ) -> Self {
         Self {
             app_key,
             access_token,
             tts_config,
+            voice_override,
         }
     }
 
@@ -61,38 +74,29 @@ impl AsrTtsStrategy {
     /// `voice_override` 可以覆盖配置中的音色（用于 CLI 参数 `--xiaozhi-tts-voice`）。
     pub fn from_config(
         asr: &crate::config::settings::AsrConfig,
-        tts: &TtsConfig,
+        shared_tts_config: SharedTtsConfig,
         voice_override: Option<String>,
     ) -> Result<Self, String> {
         let app_key = asr.resolved_app_key()?;
         let access_token = asr.resolved_access_token()?;
 
-        // 用 CLI 覆盖的音色生成一个修改后的 TtsConfig
-        let tts_config = if let Some(ref v) = voice_override {
-            let mut cfg = tts.clone();
-            cfg.providers
-                .entry(cfg.active_provider.clone())
-                .or_default()
-                .insert("voice".to_string(), v.clone());
-            cfg
-        } else {
-            tts.clone()
-        };
-
         Ok(Self {
             app_key,
             access_token,
-            tts_config,
+            tts_config: shared_tts_config,
+            voice_override,
         })
     }
 
     /// 设置 Resource ID（声音克隆等场景）
-    pub fn with_resource_id(mut self, resource_id: String) -> Self {
-        self.tts_config
-            .providers
-            .entry(self.tts_config.active_provider.clone())
-            .or_default()
-            .insert("resource_id".to_string(), resource_id);
+    pub fn with_resource_id(self, resource_id: String) -> Self {
+        if let Ok(mut cfg) = self.tts_config.write() {
+            let active = cfg.active_provider.clone();
+            cfg.providers
+                .entry(active)
+                .or_default()
+                .insert("resource_id".to_string(), resource_id);
+        }
         self
     }
 }
@@ -207,13 +211,27 @@ impl ResponseStrategy for AsrTtsStrategy {
         );
 
         // ── Step 3: TTS 语音合成 ──
-        let tts = crate::tts_factory::create_tts_provider(&self.tts_config)
-            .map_err(|e| format!("创建 TTS 提供者失败: {}", e))?;
+        // 从共享配置读取最新 TTS 配置，叠加 CLI 音色覆盖
+        let (tts, provider_name) = {
+            let cfg = self.tts_config.read().unwrap();
+            let mut work_cfg = cfg.clone();
+            if let Some(ref voice) = self.voice_override {
+                work_cfg
+                    .providers
+                    .entry(work_cfg.active_provider.clone())
+                    .or_default()
+                    .insert("voice".to_string(), voice.clone());
+            }
+            let name = work_cfg.active_provider.clone();
+            let provider = crate::tts_factory::create_tts_provider(&work_cfg)
+                .map_err(|e| format!("创建 TTS 提供者失败: {}", e))?;
+            (provider, name)
+        };
 
         tracing::info!(
             session_id = %session_id,
             text = %text,
-            provider = %self.tts_config.active_provider,
+            provider = %provider_name,
             "ASR-TTS: 开始语音合成",
         );
 
@@ -483,17 +501,28 @@ mod tests {
         }
     }
 
+    fn make_shared_tts_config() -> SharedTtsConfig {
+        Arc::new(RwLock::new(make_tts_config()))
+    }
+
+    fn make_strategy() -> AsrTtsStrategy {
+        AsrTtsStrategy::new(
+            "app_key".into(),
+            "access_token".into(),
+            make_shared_tts_config(),
+            None,
+        )
+    }
+
     #[test]
     fn test_t7_strategy_name() {
-        let strategy =
-            AsrTtsStrategy::new("app_key".into(), "access_token".into(), make_tts_config());
+        let strategy = make_strategy();
         assert_eq!(strategy.name(), "asr-tts");
     }
 
     #[test]
     fn test_t8_hello_audio_params() {
-        let strategy =
-            AsrTtsStrategy::new("app_key".into(), "access_token".into(), make_tts_config());
+        let strategy = make_strategy();
         let client_params = AudioParams {
             format: "opus".into(),
             sample_rate: 16000,
@@ -515,11 +544,15 @@ mod tests {
 
     #[test]
     fn test_t10_with_resource_id() {
-        let strategy = AsrTtsStrategy::new("k".into(), "t".into(), make_tts_config())
-            .with_resource_id("seed-tts-1.0".into());
+        let strategy = make_strategy().with_resource_id("seed-tts-1.0".into());
         // resource_id should be set in tts_config providers
         assert_eq!(
-            strategy.tts_config.get_credential("resource_id").as_deref(),
+            strategy
+                .tts_config
+                .read()
+                .unwrap()
+                .get_credential("resource_id")
+                .as_deref(),
             Some("seed-tts-1.0")
         );
     }

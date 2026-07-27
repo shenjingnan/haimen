@@ -15,6 +15,8 @@
 //!   ↓ BinaryProtocol2 → 设备播放
 //! ```
 
+use std::sync::{Arc, RwLock};
+
 use async_trait::async_trait;
 use haimen_xiaozhi::{AudioFrame, AudioParams, ResponseStrategy};
 use opus2::{self, Application, Channels};
@@ -22,26 +24,29 @@ use univoice::tts::TtsRequest;
 
 use crate::config::settings::TtsConfig;
 
+/// 共享 TTS 配置类型
+pub type SharedTtsConfig = Arc<RwLock<TtsConfig>>;
+
 /// TTS 响应策略：忽略用户录音，将预设文本合成语音发送给设备
 ///
 /// 通过 `TtsConfig.active_provider` 自动选择使用的 TTS 提供商。
 pub struct TtsStrategy {
     /// 要转成语音的文本
     text: String,
-    /// TTS 音色覆盖（优先级高于配置）
-    voice: Option<String>,
-    /// TTS 配置（包含活跃提供商和凭证）
-    tts_config: TtsConfig,
+    /// CLI 音色覆盖（--xiaozhi-tts-voice），叠加到共享配置之上，不写入磁盘
+    voice_override: Option<String>,
+    /// TTS 配置（包含活跃提供商和凭证），通过 Arc<RwLock> 支持运行时热加载
+    tts_config: SharedTtsConfig,
 }
 
 impl TtsStrategy {
     /// 创建 TTS 策略
     ///
     /// 音色未指定时会从 `tts_config` 或默认值读取。
-    pub fn new(text: String, voice: Option<String>, tts_config: TtsConfig) -> Self {
+    pub fn new(text: String, voice_override: Option<String>, tts_config: SharedTtsConfig) -> Self {
         Self {
             text,
-            voice,
+            voice_override,
             tts_config,
         }
     }
@@ -49,23 +54,15 @@ impl TtsStrategy {
     /// 从 TTS 配置构建策略
     ///
     /// `voice_override` 可以覆盖配置中的音色（用于 CLI 参数 `--xiaozhi-tts-voice`）。
-    pub fn from_config(text: String, voice_override: Option<String>, tts: &TtsConfig) -> Self {
-        // 用 CLI 覆盖的音色生成一个修改后的 TtsConfig
-        let tts_config = if let Some(ref v) = voice_override {
-            let mut cfg = tts.clone();
-            cfg.providers
-                .entry(cfg.active_provider.clone())
-                .or_default()
-                .insert("voice".to_string(), v.clone());
-            cfg
-        } else {
-            tts.clone()
-        };
-
+    pub fn from_config(
+        text: String,
+        voice_override: Option<String>,
+        shared_tts_config: SharedTtsConfig,
+    ) -> Self {
         Self {
             text,
-            voice: voice_override,
-            tts_config,
+            voice_override,
+            tts_config: shared_tts_config,
         }
     }
 }
@@ -92,14 +89,27 @@ impl ResponseStrategy for TtsStrategy {
         _audio_buffer: Vec<AudioFrame>,
         session_id: &str,
     ) -> Result<Vec<AudioFrame>, String> {
-        // 1. 通过工厂创建 TTS Provider
-        let tts = crate::tts_factory::create_tts_provider(&self.tts_config)?;
+        // 1. 从共享配置读取最新 TTS 配置，叠加 CLI 音色覆盖
+        let (tts, provider_name) = {
+            let cfg = self.tts_config.read().unwrap();
+            let mut work_cfg = cfg.clone();
+            if let Some(ref voice) = self.voice_override {
+                work_cfg
+                    .providers
+                    .entry(work_cfg.active_provider.clone())
+                    .or_default()
+                    .insert("voice".to_string(), voice.clone());
+            }
+            let name = work_cfg.active_provider.clone();
+            let provider = crate::tts_factory::create_tts_provider(&work_cfg)?;
+            (provider, name)
+        };
 
         tracing::info!(
             session_id = %session_id,
             text = %self.text,
-            voice = ?self.voice,
-            provider = %self.tts_config.active_provider,
+            voice = ?self.voice_override,
+            provider = %provider_name,
             "TTS: 开始语音合成",
         );
 
@@ -307,15 +317,23 @@ mod tests {
         }
     }
 
+    fn make_shared_tts_config() -> SharedTtsConfig {
+        Arc::new(RwLock::new(make_tts_config()))
+    }
+
+    fn make_strategy() -> TtsStrategy {
+        TtsStrategy::new("test".into(), None, make_shared_tts_config())
+    }
+
     #[test]
     fn test_t8_strategy_name() {
-        let strategy = TtsStrategy::new("test".into(), None, make_tts_config());
+        let strategy = make_strategy();
         assert_eq!(strategy.name(), "tts");
     }
 
     #[test]
     fn test_t9_hello_audio_params() {
-        let strategy = TtsStrategy::new("test".into(), None, make_tts_config());
+        let strategy = make_strategy();
         let client_params = AudioParams {
             format: "opus".into(),
             sample_rate: 16000,
