@@ -78,6 +78,9 @@ tempfile = "3"
 # 自动打开浏览器
 webbrowser = "1.0"
 
+# 本地网络 IP 探测
+local-ip-address = "0.6"
+
 # UUID
 uuid = { version = "1", features = ["v4"] }
 
@@ -118,6 +121,7 @@ haimen-xiaozhi = { path = "crates/haimen-xiaozhi", version = "0.1.2" }
 univoice = { version = "0.1.4", features = ["opus-encoder"] }
 opus2 = { workspace = true }
 webbrowser = { workspace = true }
+local-ip-address = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -108,7 +108,19 @@ pub async fn start(
 
     tracing::info!("Web 服务器启动于 http://{addr}");
 
-    // 自动打开浏览器
+    // 打印 Web UI 地址（始终可见，不受日志级别影响）
+    let listen_all = config.host == "0.0.0.0" || config.host == "::";
+    if listen_all {
+        // 监听所有接口时，同时打印 localhost 和真实 LAN IP
+        println!("🌐 Web UI: http://127.0.0.1:{}", config.port);
+        if let Ok(ip) = local_ip_address::local_ip() {
+            println!("🌐 Web UI (LAN): http://{}:{}", ip, config.port);
+        }
+    } else {
+        println!("🌐 Web UI: http://{}:{}", config.host, config.port);
+    }
+
+    // 自动打开浏览器（仅在用户要求时）
     if config.auto_open {
         open_browser(&config.host, config.port);
     }

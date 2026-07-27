@@ -30,9 +30,12 @@ pub enum Commands {
         /// Echo 模式：收消息后直接返回，不经过 Agent 处理
         #[arg(long)]
         echo: bool,
-        /// 不自动打开浏览器
+        /// 启动成功后自动打开浏览器打开 Web 控制台
         #[arg(long)]
-        no_browser: bool,
+        open_browser: bool,
+        /// 终端日志级别（默认关闭终端日志，仅记录到文件）
+        #[arg(long, value_name = "LEVEL")]
+        log_level: Option<String>,
     },
     /// AI Agent 调试
     #[command(subcommand)]
@@ -194,11 +197,15 @@ pub async fn run(cli: Cli) -> Result<(), String> {
             println!("{}", output);
             Ok(())
         }
-        Some(Commands::Start { echo, no_browser }) => {
+        Some(Commands::Start {
+            echo,
+            open_browser,
+            log_level: _,
+        }) => {
             if echo {
                 crate::gateway::start_echo().await
             } else {
-                crate::gateway::start_all(no_browser).await
+                crate::gateway::start_all(open_browser).await
             }
         }
         Some(Commands::Agent(agent_cmd)) => match agent_cmd {
@@ -473,9 +480,14 @@ mod tests {
     fn test_cli_parse_start() {
         let cli = Cli::try_parse_from(["test", "start"]).unwrap();
         match cli.command.unwrap() {
-            Commands::Start { echo, no_browser } => {
+            Commands::Start {
+                echo,
+                open_browser,
+                log_level,
+            } => {
                 assert!(!echo);
-                assert!(!no_browser);
+                assert!(!open_browser);
+                assert!(log_level.is_none());
             }
             _ => panic!("Expected Start command"),
         }
@@ -485,23 +497,50 @@ mod tests {
     fn test_cli_parse_start_echo() {
         let cli = Cli::try_parse_from(["test", "start", "--echo"]).unwrap();
         match cli.command.unwrap() {
-            Commands::Start { echo, no_browser } => {
+            Commands::Start {
+                echo,
+                open_browser,
+                log_level,
+            } => {
                 assert!(echo);
-                assert!(!no_browser);
+                assert!(!open_browser);
+                assert!(log_level.is_none());
             }
             _ => panic!("Expected Start --echo command"),
         }
     }
 
     #[test]
-    fn test_cli_parse_start_no_browser() {
-        let cli = Cli::try_parse_from(["test", "start", "--no-browser"]).unwrap();
+    fn test_cli_parse_start_open_browser() {
+        let cli = Cli::try_parse_from(["test", "start", "--open-browser"]).unwrap();
         match cli.command.unwrap() {
-            Commands::Start { echo, no_browser } => {
+            Commands::Start {
+                echo,
+                open_browser,
+                log_level,
+            } => {
                 assert!(!echo);
-                assert!(no_browser);
+                assert!(open_browser);
+                assert!(log_level.is_none());
             }
-            _ => panic!("Expected Start --no-browser command"),
+            _ => panic!("Expected Start --open-browser command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_start_log_level() {
+        let cli = Cli::try_parse_from(["test", "start", "--log-level", "debug"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Start {
+                echo,
+                open_browser,
+                log_level,
+            } => {
+                assert!(!echo);
+                assert!(!open_browser);
+                assert_eq!(log_level.unwrap(), "debug");
+            }
+            _ => panic!("Expected Start command"),
         }
     }
 
