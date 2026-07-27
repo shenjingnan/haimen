@@ -53,5 +53,5 @@ fn test_datetime_iso_format() {
 #[test]
 fn test_logging_init() {
     // 初始化日志不应 panic
-    haimen::logging::init_logging();
+    haimen::logging::init_logging(None);
 }

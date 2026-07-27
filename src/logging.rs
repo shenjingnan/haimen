@@ -2,7 +2,16 @@
 ///
 /// 初始化双层日志系统：
 /// - 文件日志: 写入 `~/.haimen/logs/app.log`（info 级别以上，无 ANSI 颜色）
-/// - stderr 日志: 受 `RUST_LOG` 环境变量控制（默认 warn 级别以上）
+/// - stderr 日志: 受 `terminal_level` 参数控制
+///
+/// # 参数
+///
+/// - `terminal_level = None` → 使用 `RUST_LOG` 环境变量，未设置则默认 `warn`
+///   （向后兼容非 `start` 命令的行为）
+/// - `terminal_level = Some("off")` → 完全关闭终端日志
+///   （`start` 命令的默认行为，日志仅写入文件）
+/// - `terminal_level = Some("info"|"debug"|"warn"|"error"|"trace")` →
+///   stderr 按指定级别输出
 use std::fs::OpenOptions;
 use std::io;
 use std::path::PathBuf;
@@ -12,7 +21,7 @@ use tracing_subscriber::{EnvFilter, Registry, fmt};
 /// 初始化日志系统
 ///
 /// 使用 `try_init()` 而非 `init()`，以便在测试中多次调用不会 panic。
-pub fn init_logging() {
+pub fn init_logging(terminal_level: Option<&str>) {
     let log_path = get_log_path();
 
     // 确保日志目录存在
@@ -20,21 +29,42 @@ pub fn init_logging() {
         std::fs::create_dir_all(parent).ok();
     }
 
-    // 文件日志层 — 记录 info+，无 ANSI 颜色
+    // 文件日志层 — 记录 info+，无 ANSI 颜色（始终启用）
     let file_layer = fmt::layer()
         .with_writer(make_file_writer(log_path.clone()))
         .with_ansi(false)
         .with_target(true)
         .with_filter(EnvFilter::new("info"));
 
-    // stderr 日志层 — 受 RUST_LOG 控制，默认 info（方便开发调试）
-    let stderr_layer = fmt::layer()
-        .with_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")));
-
-    let _ = Registry::default()
-        .with(file_layer)
-        .with(stderr_layer)
-        .try_init();
+    // 根据 terminal_level 参数决定是否启用 stderr 日志层
+    match terminal_level {
+        Some(level) if !level.is_empty() && !level.eq_ignore_ascii_case("off") => {
+            // 显式指定了级别：按指定级别输出到终端
+            let stderr_layer = fmt::layer().with_filter(EnvFilter::new(level));
+            let _ = Registry::default()
+                .with(file_layer)
+                .with(stderr_layer)
+                .try_init();
+        }
+        _ => {
+            // None 或 "off"：由调用方决定行为
+            // None → 使用 RUST_LOG env var（向后兼容非 start 命令）
+            // Some("off") → 完全跳过 stderr，仅文件日志
+            if terminal_level.is_none() {
+                // 未指定：使用 RUST_LOG 或默认 warn
+                let stderr_layer = fmt::layer().with_filter(
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+                );
+                let _ = Registry::default()
+                    .with(file_layer)
+                    .with(stderr_layer)
+                    .try_init();
+            } else {
+                // Some("off")：仅文件日志
+                let _ = Registry::default().with(file_layer).try_init();
+            }
+        }
+    }
 
     // 全局 panic hook：捕获所有 tokio::spawn 任务的 panic 并记录到日志
     std::panic::set_hook(Box::new(|panic_info| {
@@ -166,7 +196,7 @@ mod tests {
         run_with_temp_home(|home| {
             let log_dir = home.join(".haimen/logs");
             assert!(!log_dir.exists(), "测试前日志目录不应存在");
-            init_logging();
+            init_logging(None);
             assert!(log_dir.exists(), "init_logging 应创建日志目录");
         });
     }
@@ -174,7 +204,7 @@ mod tests {
     #[test]
     fn test_init_logging_does_not_panic() {
         run_with_temp_home(|_home| {
-            init_logging();
+            init_logging(None);
         });
     }
 
