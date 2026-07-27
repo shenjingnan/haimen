@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::settings::TtsConfig;
+use crate::config::settings::{AsrConfig, TtsConfig};
 use crate::gateway::webhook::WebhookState;
 
 /// 服务器配置
@@ -21,19 +21,22 @@ pub struct ServeConfig {
 /// - `config`: 服务器地址配置
 /// - `webhook_state`: 可选的 Webhook 处理器（GitHub Webhook）
 /// - `xiaozhi_strategy`: 可选的 xiaozhi WebSocket 响应策略，为 None 时不挂载 xiaozhi 路由
+/// - `asr_config`: 共享的 ASR 配置（Arc<RwLock>），Web API 保存时同步更新，实现运行时热加载
 /// - `tts_config`: 共享的 TTS 配置（Arc<RwLock>），Web API 保存时同步更新，实现运行时热加载
 /// - `cancel`: 共享取消令牌，收到取消信号时触发优雅关闭
 pub async fn start(
     config: ServeConfig,
     webhook_state: Option<WebhookState>,
     xiaozhi_strategy: Option<Arc<dyn haimen_xiaozhi::ResponseStrategy>>,
+    asr_config: Arc<RwLock<AsrConfig>>,
     tts_config: Arc<RwLock<TtsConfig>>,
     cancel: CancellationToken,
 ) -> Result<(), String> {
     use haimen_xiaozhi;
 
     // 构建路由
-    let voice_routes = axum::Router::new()
+    // ASR 路由使用 asr_config 作为 axum State（独立于 TTS 配置）
+    let asr_routes = axum::Router::new()
         .route(
             "/api/v1/settings/asr",
             axum::routing::get(api::voice_settings::get_asr_settings),
@@ -46,6 +49,10 @@ pub async fn start(
             "/api/v1/settings/asr/verify",
             axum::routing::post(api::voice_settings::verify_asr_credentials),
         )
+        .with_state(asr_config);
+
+    // TTS 路由使用 tts_config 作为 axum State
+    let tts_routes = axum::Router::new()
         .route(
             "/api/v1/settings/tts",
             axum::routing::get(api::voice_settings::get_tts_settings),
@@ -90,7 +97,8 @@ pub async fn start(
         if let Some(strategy) = xiaozhi_strategy {
             r = haimen_xiaozhi::add_routes(r, strategy);
         }
-        r = r.merge(voice_routes);
+        r = r.merge(asr_routes);
+        r = r.merge(tts_routes);
         r = r.merge(agent_routes);
         r.fallback(r#static::handle)
     } else {
@@ -100,7 +108,8 @@ pub async fn start(
         if let Some(strategy) = xiaozhi_strategy {
             r = haimen_xiaozhi::add_routes(r, strategy);
         }
-        r = r.merge(voice_routes);
+        r = r.merge(asr_routes);
+        r = r.merge(tts_routes);
         r = r.merge(agent_routes);
         r.fallback(r#static::handle)
     };
