@@ -5,8 +5,8 @@
 
 use univoice::tts::VoiceId;
 use univoice::tts::provider::{
-    DoubaoTts, DoubaoTtsOption, GlmTts, GlmTtsOption, OpenaiTts, OpenaiTtsOption, Qwen3Tts,
-    Qwen3TtsOption,
+    DoubaoTts, DoubaoTtsOption, GlmTts, GlmTtsOption, MinimaxTts, MinimaxTtsOption, OpenaiTts,
+    OpenaiTtsOption, Qwen3Tts, Qwen3TtsOption,
 };
 use univoice::tts::traits::TtsProvider;
 use univoice::tts::types::BaseTtsOption;
@@ -19,6 +19,7 @@ fn default_voice(provider: &str) -> &'static str {
         "doubao" => "zh_female_xiaohe_uranus_bigtts",
         "qwen" => "Cherry",
         "glm" => "tongtong",
+        "minimax" => "male-qn-qingse",
         _ => "",
     }
 }
@@ -107,6 +108,26 @@ pub fn create_tts_provider(config: &TtsConfig) -> Result<Box<dyn TtsProvider>, S
             base.api_key = Some(api_key);
             Ok(Box::new(OpenaiTts::new(OpenaiTtsOption {
                 base,
+                ..Default::default()
+            })))
+        }
+        "minimax" => {
+            let api_key = config
+                .get_credential("api_key")
+                .ok_or_else(|| "缺少 MiniMax API Key".to_string())?;
+            let mut base = build_base_option(config, "minimax");
+            base.api_key = Some(api_key);
+            if let Some(model) = config.get_credential("model") {
+                base.model = Some(model);
+            }
+            if let Some(speed_str) = config.get_credential("speed") {
+                if let Ok(speed) = speed_str.parse::<f32>() {
+                    base.speed = Some(speed);
+                }
+            }
+            Ok(Box::new(MinimaxTts::new(MinimaxTtsOption {
+                base,
+                sample_rate: Some(24000),
                 ..Default::default()
             })))
         }
@@ -205,5 +226,50 @@ mod tests {
         };
         let result = create_tts_provider(&config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_minimax_provider() {
+        let mut providers = HashMap::new();
+        let mut creds = HashMap::new();
+        creds.insert("api_key".to_string(), "test-api-key".to_string());
+        providers.insert("minimax".to_string(), creds);
+
+        let config = TtsConfig {
+            active_provider: "minimax".to_string(),
+            providers,
+            ..Default::default()
+        };
+        let provider = create_tts_provider(&config).unwrap();
+        assert_eq!(provider.name(), "minimax");
+    }
+
+    #[test]
+    fn test_create_minimax_missing_api_key() {
+        let config = TtsConfig {
+            active_provider: "minimax".to_string(),
+            providers: HashMap::new(),
+            ..Default::default()
+        };
+        let result = create_tts_provider(&config);
+        assert!(result.is_err());
+        assert!(result.err().unwrap().contains("MiniMax API Key"));
+    }
+
+    #[test]
+    fn test_create_minimax_with_model() {
+        let mut providers = HashMap::new();
+        let mut creds = HashMap::new();
+        creds.insert("api_key".to_string(), "test-api-key".to_string());
+        creds.insert("model".to_string(), "speech-2.6-hd".to_string());
+        providers.insert("minimax".to_string(), creds);
+
+        let config = TtsConfig {
+            active_provider: "minimax".to_string(),
+            providers,
+            ..Default::default()
+        };
+        let provider = create_tts_provider(&config).unwrap();
+        assert_eq!(provider.name(), "minimax");
     }
 }
