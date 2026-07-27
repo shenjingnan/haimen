@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use haimen_xiaozhi::{AudioFrame, AudioParams, ResponseStrategy};
-use opus2::{Channels, Decoder};
+use opus2::{Application, Channels, Decoder};
 use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use univoice::asr::{
@@ -798,25 +798,36 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             .await
             .map_err(|e| format!("流式 TTS 启动失败: {}", e))?;
 
-        let mut timestamp: u32 = 0;
+        // ── Phase 3a: 流式 Opus 编码 + 即时下发 ────────────────────
+        // 使用持久化的 StreamingOpusEncoder 处理流式 PCM，
+        // 每完成一帧 Opus 就立即通过 frame_tx 下发到硬件端。
+        // 这样硬件端在 ~600ms（10帧预缓冲）后即可开始播放，
+        // 无需等待全部 TTS 合成完成。
+        let mut frame_count: usize = 0;
         let mut total_audio_bytes: usize = 0;
+        let mut raw_pcm: Vec<u8> = Vec::new();
+        let mut stream_enc = StreamingOpusEncoder::new(24000, 60)?;
+        let mut timestamp: u32 = 0;
 
         while let Some(result) = audio_stream.next().await {
             match result {
                 Ok(chunk) => {
                     total_audio_bytes += chunk.audio_chunk.len();
+                    raw_pcm.extend_from_slice(&chunk.audio_chunk);
 
-                    // 将 PCM 音频块编码为 Opus 帧（24kHz, 60ms）
-                    let opus_frames = pcm_to_opus_frames(&chunk.audio_chunk, 24000, 60)
+                    let opus_frames = stream_enc
+                        .feed(&chunk.audio_chunk)
                         .map_err(|e| format!("Opus 编码失败: {}", e))?;
 
                     for opus in opus_frames {
-                        let frame = AudioFrame {
-                            timestamp,
-                            data: opus,
-                        };
-                        if frame_tx.send(frame).await.is_err() {
-                            // 接收端已关闭（如播放被中断），安全退出
+                        if frame_tx
+                            .send(AudioFrame {
+                                timestamp,
+                                data: opus,
+                            })
+                            .await
+                            .is_err()
+                        {
                             tracing::info!(
                                 session_id = %session_id,
                                 "TTS-STREAM: 回放管道已关闭，停止生成",
@@ -824,12 +835,44 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                             return Ok(());
                         }
                         timestamp = timestamp.wrapping_add(60);
+                        frame_count += 1;
                     }
                 }
                 Err(e) => {
                     tracing::warn!("流式 TTS 音频块错误: {}", e);
                 }
             }
+        }
+
+        // ── Phase 3b: 编码最后残片 ─────────────────────────────────
+        // TTS 合成完成后，flush 缓存中的不足一帧的残片（零填充后编码）
+        {
+            let last_frames = stream_enc
+                .flush()
+                .map_err(|e| format!("Opus 编码失败: {}", e))?;
+            for opus in last_frames {
+                if frame_tx
+                    .send(AudioFrame {
+                        timestamp,
+                        data: opus,
+                    })
+                    .await
+                    .is_err()
+                {
+                    tracing::info!(
+                        session_id = %session_id,
+                        "TTS-STREAM: 回放管道已关闭，停止生成",
+                    );
+                    return Ok(());
+                }
+                timestamp = timestamp.wrapping_add(60);
+                frame_count += 1;
+            }
+        }
+
+        // ── 保存 TTS 音频到本地 ───────────────────────────────────
+        if !raw_pcm.is_empty() {
+            save_tts_audio_as_wav(&raw_pcm, session_id);
         }
 
         let full_response = llm_response_full
@@ -841,6 +884,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         tracing::info!(
             session_id = %session_id,
             total_audio_bytes = total_audio_bytes,
+            frame_count = frame_count,
             response_len = full_response.len(),
             response = %full_response,
             "TTS-STREAM: 流式合成完成",
@@ -1097,6 +1141,165 @@ async fn asr_listen_to_text(
     );
 
     Ok(full_text)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TTS 音频本地存储
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 将 PCM16 mono 24000Hz 音频保存为 WAV 文件
+///
+/// 每次 TTS 合成完成后，在下发到硬件端之前，将原始音频数据存档到
+/// `~/.haimen/tts_recordings/` 目录，文件名为 `tts-{session_id}-{微秒时间戳}.wav`。
+///
+/// WAV 格式：PCM 16-bit mono 24000Hz，无额外依赖。
+fn save_tts_audio_as_wav(pcm: &[u8], session_id: &str) {
+    let dir = crate::config::settings::get_settings_dir().join("tts_recordings");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("无法创建 TTS 录音目录 {}: {}", dir.display(), e);
+        return;
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+
+    let filename = format!("tts-{}-{}.wav", session_id, timestamp);
+    let path = dir.join(&filename);
+
+    const SAMPLE_RATE: u32 = 24000;
+    const BITS_PER_SAMPLE: u16 = 16;
+    const CHANNELS: u16 = 1;
+    let byte_rate = SAMPLE_RATE * CHANNELS as u32 * BITS_PER_SAMPLE as u32 / 8;
+    let block_align = CHANNELS * BITS_PER_SAMPLE / 8;
+    let data_size = pcm.len() as u32;
+
+    // 构建 WAV 文件：44 字节 RIFF/WAVE 头 + PCM 数据
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes()); // subchunk1 size (PCM)
+    wav.extend_from_slice(&1u16.to_le_bytes()); // audio format (PCM = 1)
+    wav.extend_from_slice(&CHANNELS.to_le_bytes());
+    wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&BITS_PER_SAMPLE.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_size.to_le_bytes());
+    wav.extend_from_slice(pcm);
+
+    match std::fs::write(&path, &wav) {
+        Ok(_) => tracing::info!(
+            "TTS 音频已保存: {} ({:.1} KB)",
+            filename,
+            wav.len() as f64 / 1024.0,
+        ),
+        Err(e) => tracing::warn!("保存 TTS 音频失败 {}: {}", filename, e),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 流式 Opus 编码器
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 流式 Opus 编码器
+///
+/// 维护持久的编码器状态和帧间残片缓存，适合 `generate_response_stream` 的流式场景。
+///
+/// # 原理
+///
+/// - **持久编码器**：整个 TTS 合成只创建一次 `opus2::Encoder`，帧间预测状态连续
+/// - **残片缓存**：不足一帧（60ms @ 24kHz = 2880 bytes）的 PCM 残片留在 `partial` 中，
+///   下次 `feed()` 时补齐再编码，避免跨 chunk 边界零填充
+/// - **零填充仅发生在末尾**：`flush()` 时对最终残片零填充一次
+struct StreamingOpusEncoder {
+    /// Opus 编码器（整个合成周期复用）
+    encoder: opus2::Encoder,
+    /// 不足一帧的残片缓存
+    partial: Vec<u8>,
+    /// 编码输出缓冲
+    opus_buf: Vec<u8>,
+    /// 每帧字节数（frame_duration_ms @ sample_rate 16-bit mono）
+    frame_bytes: usize,
+}
+
+impl StreamingOpusEncoder {
+    /// 创建流式 Opus 编码器
+    fn new(sample_rate: u32, frame_duration_ms: u32) -> Result<Self, String> {
+        let frame_samples = (sample_rate as u64 * frame_duration_ms as u64 / 1000) as usize;
+        let frame_bytes = frame_samples * 2; // 16-bit
+
+        let mut encoder = opus2::Encoder::new(sample_rate, Channels::Mono, Application::Audio)
+            .map_err(|e| format!("创建 Opus 编码器失败: {}", e))?;
+        let _ = encoder.set_complexity(10);
+        let _ = encoder.set_vbr(true);
+        let _ = encoder.set_dtx(true);
+
+        Ok(Self {
+            encoder,
+            partial: Vec::new(),
+            opus_buf: vec![0u8; 4000],
+            frame_bytes,
+        })
+    }
+
+    /// 喂入 PCM 数据，返回本次编码完成的 Opus 帧列表
+    ///
+    /// 将新 PCM 追加到残片缓存，从中取出完整的帧编码为 Opus，
+    /// 不足一帧的残片保留在内部供下次 `feed()` 补齐。
+    fn feed(&mut self, pcm: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+        self.partial.extend_from_slice(pcm);
+
+        let complete_len = self.partial.len() / self.frame_bytes * self.frame_bytes;
+        if complete_len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        let to_encode = &self.partial[..complete_len];
+        for chunk in to_encode.chunks(self.frame_bytes) {
+            let pcm_i16: Vec<i16> = chunk
+                .chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                .collect();
+            let encoded_len = self
+                .encoder
+                .encode(&pcm_i16, &mut self.opus_buf)
+                .map_err(|e| format!("Opus 编码错误: {}", e))?;
+            frames.push(self.opus_buf[..encoded_len].to_vec());
+        }
+
+        self.partial = self.partial[complete_len..].to_vec();
+        Ok(frames)
+    }
+
+    /// 编码剩余的残片（零填充后），返回最终的 Opus 帧列表
+    ///
+    /// 如果 `partial` 中有缓存的残片数据，零填充到一帧后编码输出。
+    /// 调用后内部状态清空，编码器不再可用。
+    fn flush(&mut self) -> Result<Vec<Vec<u8>>, String> {
+        if self.partial.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.partial.resize(self.frame_bytes, 0);
+        let pcm_i16: Vec<i16> = self
+            .partial
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        let encoded_len = self
+            .encoder
+            .encode(&pcm_i16, &mut self.opus_buf)
+            .map_err(|e| format!("Opus 编码错误: {}", e))?;
+        self.partial.clear();
+
+        Ok(vec![self.opus_buf[..encoded_len].to_vec()])
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
