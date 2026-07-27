@@ -29,7 +29,7 @@
 //! 实现音色多轮对话的上下文连续性。
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
@@ -43,8 +43,12 @@ use univoice::asr::{
 };
 use univoice::tts::TtsRequest;
 
+use crate::config::settings::TtsConfig;
 use crate::gateway::provider::AgentProvider;
 use crate::xiaozhi_tts::pcm_to_opus_frames;
+
+/// 共享 TTS 配置类型
+pub type SharedTtsConfig = Arc<RwLock<TtsConfig>>;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 流式 ASR 管道状态
@@ -83,7 +87,12 @@ pub struct AsrLlmTtsStrategy {
     /// 火山引擎 Access Token（ASR 使用）
     access_token: String,
     /// TTS 配置（包含活跃提供商和凭证）
-    tts_config: crate::config::settings::TtsConfig,
+    ///
+    /// 使用 Arc<RwLock> 实现运行时热加载：Web UI 保存配置时直接更新此共享对象，
+    /// 策略在每次 TTS 调用时读取最新配置。
+    tts_config: SharedTtsConfig,
+    /// CLI 音色覆盖（--xiaozhi-tts-voice），叠加到共享配置之上，不写入磁盘
+    voice_override: Option<String>,
     /// AI Agent（Claude Code、Codex 等）
     agent: Arc<dyn AgentProvider>,
     /// LLM 会话 ID，用于多轮对话上下文连续
@@ -140,13 +149,15 @@ impl AsrLlmTtsStrategy {
     pub fn new(
         app_key: String,
         access_token: String,
-        tts_config: crate::config::settings::TtsConfig,
+        tts_config: SharedTtsConfig,
+        voice_override: Option<String>,
         agent: Arc<dyn AgentProvider>,
     ) -> Self {
         Self {
             app_key,
             access_token,
             tts_config,
+            voice_override,
             agent,
             llm_session_id: Mutex::new(None),
             streaming_state: Mutex::new(None),
@@ -161,29 +172,18 @@ impl AsrLlmTtsStrategy {
     /// `voice_override` 可以覆盖配置中的音色（用于 CLI 参数 `--xiaozhi-tts-voice`）。
     pub fn from_config(
         asr: &crate::config::settings::AsrConfig,
-        tts: &crate::config::settings::TtsConfig,
+        shared_tts_config: SharedTtsConfig,
         voice_override: Option<String>,
         agent: Arc<dyn AgentProvider>,
     ) -> Result<Self, String> {
         let app_key = asr.resolved_app_key()?;
         let access_token = asr.resolved_access_token()?;
 
-        // 用 CLI 覆盖的音色生成一个修改后的 TtsConfig
-        let tts_config = if let Some(ref v) = voice_override {
-            let mut cfg = tts.clone();
-            cfg.providers
-                .entry(cfg.active_provider.clone())
-                .or_default()
-                .insert("voice".to_string(), v.clone());
-            cfg
-        } else {
-            tts.clone()
-        };
-
         Ok(Self {
             app_key,
             access_token,
-            tts_config,
+            tts_config: shared_tts_config,
+            voice_override,
             agent,
             llm_session_id: Mutex::new(None),
             streaming_state: Mutex::new(None),
@@ -194,12 +194,14 @@ impl AsrLlmTtsStrategy {
     }
 
     /// 设置 Resource ID（声音克隆等场景）
-    pub fn with_resource_id(mut self, resource_id: String) -> Self {
-        self.tts_config
-            .providers
-            .entry(self.tts_config.active_provider.clone())
-            .or_default()
-            .insert("resource_id".to_string(), resource_id);
+    pub fn with_resource_id(self, resource_id: String) -> Self {
+        if let Ok(mut cfg) = self.tts_config.write() {
+            let active = cfg.active_provider.clone();
+            cfg.providers
+                .entry(active)
+                .or_default()
+                .insert("resource_id".to_string(), resource_id);
+        }
         self
     }
 
@@ -728,13 +730,16 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         let llm_response_full = Arc::new(Mutex::new(String::new()));
         let response_for_log = llm_response_full.clone();
 
+        // 从共享配置中读取固定文本模式设置
+        let (fixed_text_enabled, fixed_text) = {
+            let cfg = self.tts_config.read().unwrap();
+            (cfg.fixed_text_enabled, cfg.fixed_text.clone())
+        };
+
         let text_stream: Box<dyn futures_util::Stream<Item = String> + Unpin + Send> =
-            if self.tts_config.fixed_text_enabled {
+            if fixed_text_enabled {
                 // 固定文本模式：跳过 LLM，使用预设文本
-                let fixed_text = self
-                    .tts_config
-                    .fixed_text
-                    .clone()
+                let fixed_text = fixed_text
                     .filter(|t| !t.is_empty())
                     .unwrap_or_else(|| "欢迎使用智能语音助手".to_string());
 
@@ -784,14 +789,28 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         // Phase 3: 流式 TTS 合成 → Opus 编码 → 逐帧发送
         // ════════════════════════════════════════════════════════════════
 
+        // 从共享配置读取最新 TTS 配置，叠加 CLI 音色覆盖
+        let (tts, provider_name) = {
+            let cfg = self.tts_config.read().unwrap();
+            let mut work_cfg = cfg.clone();
+            if let Some(ref voice) = self.voice_override {
+                work_cfg
+                    .providers
+                    .entry(work_cfg.active_provider.clone())
+                    .or_default()
+                    .insert("voice".to_string(), voice.clone());
+            }
+            let name = work_cfg.active_provider.clone();
+            let provider = crate::tts_factory::create_tts_provider(&work_cfg)
+                .map_err(|e| format!("创建 TTS 提供者失败: {}", e))?;
+            (provider, name)
+        };
+
         tracing::info!(
             session_id = %session_id,
-            provider = %self.tts_config.active_provider,
+            provider = %provider_name,
             "TTS-STREAM: 开始流式语音合成",
         );
-
-        let tts = crate::tts_factory::create_tts_provider(&self.tts_config)
-            .map_err(|e| format!("创建 TTS 提供者失败: {}", e))?;
 
         let mut audio_stream = tts
             .speak_stream(Box::pin(text_stream))
@@ -925,12 +944,15 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             "ASR-LLM-TTS: ASR 识别完成",
         );
 
-        let llm_text = if self.tts_config.fixed_text_enabled {
+        // 从共享配置中读取固定文本模式设置
+        let (fixed_text_enabled, fixed_text) = {
+            let cfg = self.tts_config.read().unwrap();
+            (cfg.fixed_text_enabled, cfg.fixed_text.clone())
+        };
+
+        let llm_text = if fixed_text_enabled {
             // 固定文本模式：跳过 LLM，使用预设文本
-            let fixed_text = self
-                .tts_config
-                .fixed_text
-                .clone()
+            let fixed_text = fixed_text
                 .filter(|t| !t.is_empty())
                 .unwrap_or_else(|| "欢迎使用智能语音助手".to_string());
 
@@ -986,14 +1008,28 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         };
 
         // ── Step 4: TTS 语音合成 ──
+        // 从共享配置读取最新 TTS 配置，叠加 CLI 音色覆盖
+        let (tts, provider_name) = {
+            let cfg = self.tts_config.read().unwrap();
+            let mut work_cfg = cfg.clone();
+            if let Some(ref voice) = self.voice_override {
+                work_cfg
+                    .providers
+                    .entry(work_cfg.active_provider.clone())
+                    .or_default()
+                    .insert("voice".to_string(), voice.clone());
+            }
+            let name = work_cfg.active_provider.clone();
+            let provider = crate::tts_factory::create_tts_provider(&work_cfg)
+                .map_err(|e| format!("创建 TTS 提供者失败: {}", e))?;
+            (provider, name)
+        };
+
         tracing::info!(
             session_id = %session_id,
-            provider = %self.tts_config.active_provider,
+            provider = %provider_name,
             "ASR-LLM-TTS: 开始语音合成",
         );
-
-        let tts = crate::tts_factory::create_tts_provider(&self.tts_config)
-            .map_err(|e| format!("创建 TTS 提供者失败: {}", e))?;
 
         let response = tts
             .synthesize(TtsRequest {
@@ -1398,11 +1434,16 @@ mod tests {
         }
     }
 
+    fn make_shared_tts_config() -> crate::xiaozhi_asr_llm_tts::SharedTtsConfig {
+        Arc::new(RwLock::new(test_tts_config()))
+    }
+
     fn make_strategy(agent: Arc<dyn AgentProvider>) -> AsrLlmTtsStrategy {
         AsrLlmTtsStrategy::new(
             "app_key".into(),
             "access_token".into(),
-            test_tts_config(),
+            make_shared_tts_config(),
+            None, // voice_override
             agent,
         )
     }
@@ -1534,7 +1575,12 @@ mod tests {
     fn test_t10_with_resource_id() {
         let strategy = make_strategy(Arc::new(MockAgent)).with_resource_id("seed-tts-1.0".into());
         assert_eq!(
-            strategy.tts_config.get_credential("resource_id").as_deref(),
+            strategy
+                .tts_config
+                .read()
+                .unwrap()
+                .get_credential("resource_id")
+                .as_deref(),
             Some("seed-tts-1.0")
         );
     }
@@ -1651,7 +1697,12 @@ mod tests {
     fn test_t29_with_resource_id_preserves_state() {
         let strategy = make_strategy(Arc::new(MockAgent)).with_resource_id("test-resource".into());
         assert_eq!(
-            strategy.tts_config.get_credential("resource_id").as_deref(),
+            strategy
+                .tts_config
+                .read()
+                .unwrap()
+                .get_credential("resource_id")
+                .as_deref(),
             Some("test-resource")
         );
         // streaming_state 不应受 with_resource_id 影响

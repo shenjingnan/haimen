@@ -1,7 +1,8 @@
 //! ASR / TTS 语音配置 REST API
 //!
 //! 提供对 `settings.toml` 中 `[asr]` 和 `[tts]` 配置的读写接口。
-//! 使用文件直接读写，不依赖 axum State（简化路由注册）。
+//! ASR 端点使用文件直接读写；TTS 端点额外通过 axum State 持有共享 `Arc<RwLock<TtsConfig>>`，
+//! 在保存到磁盘后同步更新内存中的配置，实现运行时热加载。
 //!
 //! # 端点
 //!
@@ -9,15 +10,18 @@
 //! - `PUT /api/v1/settings/asr` — 更新 ASR 全部配置（providers + active_provider）
 //! - `POST /api/v1/settings/asr/verify` — 验证指定提供商的凭证有效性
 //! - `GET /api/v1/settings/tts` — 获取 TTS 配置（所有提供商 + 当前激活）
-//! - `PUT /api/v1/settings/tts` — 更新 TTS 全部配置（providers + active_provider）
+//! - `PUT /api/v1/settings/tts` — 更新 TTS 全部配置（providers + active_provider），
+//!   同时更新内存中的共享配置，使策略热加载
 //! - `GET /api/v1/settings/tts/voices` — 获取可用音色列表（支持 `?provider=` 参数）
 //! - `POST /api/v1/settings/tts/verify` — 验证指定 TTS 提供商的凭证有效性
 
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
-use axum::{Json, extract::Query, http::StatusCode};
+use axum::{Json, extract::Query, extract::State, http::StatusCode};
 
 use crate::config::settings::AppConfig;
+use crate::config::settings::TtsConfig;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 工具函数
@@ -355,6 +359,7 @@ pub async fn get_tts_settings() -> Json<serde_json::Value> {
 /// - `fixed_text_enabled` — 是否启用固定文本模式
 /// - `fixed_text` — 固定文本内容
 pub async fn update_tts_settings(
+    State(tts_config): State<Arc<RwLock<TtsConfig>>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let mut cfg = load_config();
@@ -399,6 +404,9 @@ pub async fn update_tts_settings(
             })),
         ));
     }
+
+    // 更新内存中的共享 TTS 配置，使运行时策略即时感知变更
+    *tts_config.write().unwrap() = cfg.tts.clone();
 
     Ok(Json(serde_json::json!({
         "success": true,

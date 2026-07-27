@@ -5,7 +5,7 @@ pub mod provider;
 pub mod session;
 pub mod webhook;
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -75,6 +75,7 @@ pub fn build_agent(
 /// 需要配置 ASR 和 TTS 提供商凭证。环境变量缺失时跳过 xiaozhi 路由（不挂载）。
 fn build_xiaozhi_strategy(
     config: &crate::config::settings::AppConfig,
+    shared_tts_config: crate::xiaozhi_asr_llm_tts::SharedTtsConfig,
 ) -> Option<Arc<dyn haimen_xiaozhi::ResponseStrategy>> {
     // 检查 ASR 凭证（所有模式都需要 ASR 用于 VAD 判停）
     let (app_key, access_token) = match (
@@ -95,12 +96,12 @@ fn build_xiaozhi_strategy(
             return None;
         }
     };
-    let tts_config = config.tts.clone();
     Some(Arc::new(
         crate::xiaozhi_asr_llm_tts::AsrLlmTtsStrategy::new(
             app_key,
             access_token,
-            tts_config,
+            shared_tts_config,
+            None, // voice_override
             llm_agent,
         ),
     ))
@@ -164,7 +165,8 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
             })
         });
 
-        let xiaozhi_strategy = build_xiaozhi_strategy(&config);
+        let shared_tts_config = Arc::new(RwLock::new(config.tts.clone()));
+        let xiaozhi_strategy = build_xiaozhi_strategy(&config, shared_tts_config.clone());
 
         tracing::info!(
             "HTTP 服务器启动于 {}:{}{}",
@@ -178,8 +180,14 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
         );
 
         let handle = tokio::spawn(async move {
-            let result =
-                crate::web::start(serve_config, webhook_state, xiaozhi_strategy, http_cancel).await;
+            let result = crate::web::start(
+                serve_config,
+                webhook_state,
+                xiaozhi_strategy,
+                shared_tts_config,
+                http_cancel,
+            )
+            .await;
             if let Err(ref e) = result {
                 tracing::error!(error = %e, "HTTP 服务器退出");
             }
