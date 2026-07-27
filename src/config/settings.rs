@@ -427,6 +427,9 @@ impl AsrConfig {
         match (self.active_provider.as_str(), key) {
             ("doubao", "app_key") => std::env::var("DOUBAO_APP_KEY").ok(),
             ("doubao", "access_key") => std::env::var("DOUBAO_ACCESS_TOKEN").ok(),
+            ("qwen", "api_key") => std::env::var("QWEN_API_KEY").ok(),
+            ("glm", "api_key") => std::env::var("GLM_API_KEY").ok(),
+            ("mimo", "api_key") => std::env::var("MIMO_API_KEY").ok(),
             _ => None,
         }
     }
