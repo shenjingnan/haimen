@@ -45,19 +45,6 @@ export const ASR_PROVIDERS: ProviderInfo[] = [
     name: '阿里通义千问',
     fields: [{ key: 'api_key', label: 'API Key', type: 'password' }],
   },
-  {
-    id: 'glm',
-    name: '智谱AI',
-    fields: [{ key: 'api_key', label: 'API Key', type: 'password' }],
-  },
-  {
-    id: 'mimo',
-    name: '小米MiMo',
-    fields: [
-      { key: 'api_key', label: 'API Key', type: 'password' },
-      { key: 'language', label: '语言', type: 'text', placeholder: 'zh' },
-    ],
-  },
 ];
 
 /** 按 id 查找提供商信息 */
