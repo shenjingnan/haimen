@@ -1,8 +1,9 @@
 import { useState } from 'react';
 import AgentSettings from '@/pages/Settings/AgentSettings';
+import ConnectorSettings from '@/pages/Settings/ConnectorSettings';
 import VoiceSettings from '@/pages/Settings/VoiceSettings';
 
-type Page = 'voice' | 'agent';
+type Page = 'voice' | 'agent' | 'connectors';
 
 export default function App() {
   const [page, setPage] = useState<Page>('voice');
@@ -30,9 +31,20 @@ export default function App() {
           >
             Agent 配置
           </button>
+          <button
+            type="button"
+            onClick={() => setPage('connectors')}
+            className={`px-3 py-1 rounded text-sm cursor-pointer ${
+              page === 'connectors' ? 'bg-primary text-primary-foreground' : 'hover:bg-muted'
+            }`}
+          >
+            消息渠道
+          </button>
         </div>
       </nav>
-      {page === 'voice' ? <VoiceSettings /> : <AgentSettings />}
+      {page === 'voice' && <VoiceSettings />}
+      {page === 'agent' && <AgentSettings />}
+      {page === 'connectors' && <ConnectorSettings />}
     </div>
   );
 }

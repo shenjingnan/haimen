@@ -102,6 +102,23 @@ impl TokenManager {
     }
 }
 
+/// 验证钉钉凭据是否有效：尝试用 client_id/client_secret 换取 access_token
+///
+/// 供 Web 控制台的可用性探测使用（不依赖已有的 Channel 实例）。
+pub(crate) async fn verify_credentials(
+    client_id: String,
+    client_secret: String,
+) -> Result<(), String> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+
+    let mgr = TokenManager::new(client_id, client_secret, client);
+    mgr.get_token().await.map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +178,12 @@ mod tests {
         let second = mgr.force_refresh().await;
 
         assert_eq!(first.is_err(), second.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_verify_credentials_network_failure_returns_err() {
+        // 离线/无效凭据环境下应返回 Err 而非 panic
+        let result = verify_credentials("invalid_id".into(), "invalid_secret".into()).await;
+        assert!(result.is_err());
     }
 }

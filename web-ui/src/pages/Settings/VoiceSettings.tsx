@@ -45,14 +45,15 @@ function PasswordInput({
         onChange={(e) => onChange(e.target.value)}
         className="pr-10"
       />
-      <span
+      <button
+        type="button"
+        aria-label={show ? '隐藏' : '显示'}
         onClick={() => setShow(!show)}
-        className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground cursor-pointer select-none"
-        role="button"
         tabIndex={-1}
+        className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground cursor-pointer select-none"
       >
         {show ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-      </span>
+      </button>
     </div>
   );
 }

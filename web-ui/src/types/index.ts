@@ -123,3 +123,36 @@ export interface AgentSettings {
     agent: string;
   };
 }
+
+// ── 消息渠道（Connector）配置 ──
+
+/** 单个渠道的可用状态（L1 配置层 + L2 认证层） */
+export type ConnectorState = 'online' | 'auth_failed' | 'misconfigured' | 'disabled';
+
+export interface ConnectorStatusItem {
+  id: string;
+  name: string;
+  configured: boolean;
+  enabled: boolean;
+  auth_ok: boolean;
+  status: ConnectorState;
+  detail: string;
+}
+
+export interface LarkSettings {
+  enabled: boolean;
+}
+
+export interface DingTalkSettings {
+  enabled: boolean;
+  client_id: string;
+  client_secret: string;
+  allow_from: string;
+  share_session_in_channel: boolean;
+  robot_code: string;
+}
+
+export interface ConnectorSettings {
+  lark: LarkSettings;
+  dingtalk: DingTalkSettings;
+}
