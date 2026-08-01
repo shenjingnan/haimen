@@ -904,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "haimen"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -942,7 +942,7 @@ dependencies = [
 
 [[package]]
 name = "haimen-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -952,7 +952,7 @@ dependencies = [
 
 [[package]]
 name = "haimen-lark"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -966,7 +966,7 @@ dependencies = [
 
 [[package]]
 name = "haimen-xiaozhi"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "axum",

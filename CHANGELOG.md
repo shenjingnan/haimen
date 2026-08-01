@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.9.0](https://github.com/shenjingnan/haimen/compare/v0.8.0...v0.9.0) - 2026-08-01
+
+### Added
+
+- 支持 Windows 发布与 npm shim 子进程启动 ([#140](https://github.com/shenjingnan/haimen/pull/140))
+- 小智设备屏幕文本下发 + 豆包 TTS 模型选择 ([#138](https://github.com/shenjingnan/haimen/pull/138))
+- *(web)* 新增消息渠道页展示飞书可用状态并提供配置 ([#137](https://github.com/shenjingnan/haimen/pull/137))
+
+### Other
+
+- *(agent)* Agent 插件化抽象层，注册表分发替代硬编码 ([#135](https://github.com/shenjingnan/haimen/pull/135))
+
 ## [0.8.0](https://github.com/shenjingnan/haimen/compare/v0.7.2...v0.8.0) - 2026-08-01
 
 ### Added
