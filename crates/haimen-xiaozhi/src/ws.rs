@@ -16,7 +16,8 @@ use uuid::Uuid;
 use crate::protocol::{AudioProtocol, ProtocolError, detect_and_parse, encode_protocol2};
 use crate::strategy::ResponseStrategy;
 use crate::types::{
-    AudioFrame, AudioParams, ClientMessage, ListenState, ServerMessage, SessionState, TtsState,
+    AudioFrame, AudioParams, ClientMessage, ListenState, PlaybackEvent, ServerMessage,
+    SessionState, TtsState,
 };
 
 // ─── 会话结构 ──────────────────────────────────────────────
@@ -538,7 +539,7 @@ async fn strategy_playback(socket: &mut WebSocket, session: &mut Session) {
 
     if session.strategy.supports_streaming_playback() {
         // ── 流式回放路径 ──
-        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<AudioFrame>(16);
+        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<PlaybackEvent>(16);
         let strategy = session.strategy.clone();
         let session_id = session.session_id.clone();
 
@@ -590,7 +591,7 @@ async fn strategy_playback(socket: &mut WebSocket, session: &mut Session) {
 async fn playback_frames_stream(
     socket: &mut WebSocket,
     session: &mut Session,
-    mut frame_rx: tokio::sync::mpsc::Receiver<AudioFrame>,
+    mut frame_rx: tokio::sync::mpsc::Receiver<PlaybackEvent>,
     mut gen_handle: tokio::task::JoinHandle<Result<(), String>>,
 ) {
     session.state = SessionState::Playing;
@@ -598,17 +599,38 @@ async fn playback_frames_stream(
     // ── Phase 1: 预缓冲 ─────────────────────────────────────────
     // 在开始播放前先收集若干帧，给 TTS 生成足够的 head start
     // 10 帧 × 60ms = 600ms 预缓冲，在设备播放完这 600ms 内容之前
-    // TTS 有充足时间生成后续音频
+    // TTS 有充足时间生成后续音频。
+    //
+    // 文本事件不参与预缓冲计数：
+    // - Stt 立即转发（固件对 stt 的处理不依赖状态机，任何状态都会写屏）
+    // - LlmSentence 缓存到 pending_sentences，待 Tts::Start 后统一 flush，
+    //   避免助手文本先于设备进入 Speaking 态上屏
 
     const PREBUFFER_COUNT: usize = 10;
     let mut prebuffer: Vec<AudioFrame> = Vec::with_capacity(PREBUFFER_COUNT);
+    let mut pending_sentences: Vec<String> = Vec::new();
     let mut gen_done = false;
 
     while prebuffer.len() < PREBUFFER_COUNT {
         tokio::select! {
-            frame = frame_rx.recv() => {
-                match frame {
-                    Some(frame) => prebuffer.push(frame),
+            event = frame_rx.recv() => {
+                match event {
+                    Some(event) => {
+                        match &event {
+                            PlaybackEvent::Stt(text) => {
+                                if !send_text_event(socket, session, &PlaybackEvent::Stt(text.clone())).await {
+                                    session.state = SessionState::Ready;
+                                    return;
+                                }
+                            }
+                            PlaybackEvent::LlmSentence(text) => {
+                                pending_sentences.push(text.clone());
+                            }
+                            PlaybackEvent::Audio(frame) => {
+                                prebuffer.push(frame.clone());
+                            }
+                        }
+                    }
                     None => {
                         // 生成任务已经结束，不管预缓冲了多少帧都直接播放
                         break;
@@ -639,8 +661,19 @@ async fn playback_frames_stream(
         }
     }
 
+    // 无音频但有文本时：直接下发缓存的句子文本后返回
     if prebuffer.is_empty() {
-        tracing::warn!("Prebuffer is empty, skipping playback");
+        for sentence in &pending_sentences {
+            if !send_text_event(
+                socket,
+                session,
+                &PlaybackEvent::LlmSentence(sentence.clone()),
+            )
+            .await
+            {
+                break;
+            }
+        }
         session.state = SessionState::Ready;
         return;
     }
@@ -662,6 +695,14 @@ async fn playback_frames_stream(
         tracing::warn!("Failed to send TTS::Start, aborting streaming playback");
         session.state = SessionState::Ready;
         return;
+    }
+
+    // Tts::Start 后立即 flush 预缓冲期间缓存的句子文本
+    for sentence in pending_sentences {
+        if !send_text_event(socket, session, &PlaybackEvent::LlmSentence(sentence)).await {
+            session.state = SessionState::Ready;
+            return;
+        }
     }
 
     let mut frame_count: usize = 0;
@@ -690,22 +731,33 @@ async fn playback_frames_stream(
 
     loop {
         tokio::select! {
-            frame = frame_rx.recv(), if !gen_done => {
-                match frame {
-                    Some(frame) => {
-                        frame_count += 1;
+            event = frame_rx.recv(), if !gen_done => {
+                match event {
+                    Some(event) => {
+                        match &event {
+                            PlaybackEvent::Stt(_) | PlaybackEvent::LlmSentence(_) => {
+                                // 稳态阶段文本事件立即转发（Tts::Start 已发出）
+                                if !send_text_event(socket, session, &event).await {
+                                    session.state = SessionState::Ready;
+                                    return;
+                                }
+                            }
+                            PlaybackEvent::Audio(frame) => {
+                                frame_count += 1;
 
-                        let encoded = encode_protocol2(&frame.data, frame.timestamp);
-                        if socket.send(Message::Binary(encoded.into())).await.is_err() {
-                            tracing::warn!("Streaming playback: connection lost");
-                            session.state = SessionState::Ready;
-                            return;
-                        }
+                                let encoded = encode_protocol2(&frame.data, frame.timestamp);
+                                if socket.send(Message::Binary(encoded.into())).await.is_err() {
+                                    tracing::warn!("Streaming playback: connection lost");
+                                    session.state = SessionState::Ready;
+                                    return;
+                                }
 
-                        // 60ms 帧间隔 + 中断监听（与批处理模式一致）
-                        if interruptible_sleep(socket, session).await {
-                            session.state = SessionState::Ready;
-                            return;
+                                // 60ms 帧间隔 + 中断监听（与批处理模式一致）
+                                if interruptible_sleep(socket, session).await {
+                                    session.state = SessionState::Ready;
+                                    return;
+                                }
+                            }
                         }
                     }
                     None => {
@@ -728,16 +780,26 @@ async fn playback_frames_stream(
         }
 
         if gen_done {
-            // Drain 剩余帧（仍在 channel 中的已完成帧）
-            while let Some(frame) = frame_rx.recv().await {
-                frame_count += 1;
-                let encoded = encode_protocol2(&frame.data, frame.timestamp);
-                if socket.send(Message::Binary(encoded.into())).await.is_err() {
-                    break;
-                }
-                if interruptible_sleep(socket, session).await {
-                    session.state = SessionState::Ready;
-                    return;
+            // Drain 剩余事件（仍在 channel 中的已完成事件）
+            while let Some(event) = frame_rx.recv().await {
+                match &event {
+                    PlaybackEvent::Stt(_) | PlaybackEvent::LlmSentence(_) => {
+                        if !send_text_event(socket, session, &event).await {
+                            break;
+                        }
+                    }
+                    PlaybackEvent::Audio(frame) => {
+                        frame_count += 1;
+                        let encoded = encode_protocol2(&frame.data, frame.timestamp);
+                        if socket.send(Message::Binary(encoded.into())).await.is_err() {
+                            break;
+                        }
+                        // 中断时 interruptible_sleep 已发送 TTS::Stop 并复位状态，
+                        // 直接返回避免重复下发 TTS::Stop。
+                        if interruptible_sleep(socket, session).await {
+                            return;
+                        }
+                    }
                 }
             }
             break;
@@ -765,6 +827,34 @@ async fn playback_frames_stream(
 }
 
 // ─── 工具函数 ──────────────────────────────────────────────
+
+/// 发送文本事件对应的设备消息（`stt` / `tts/sentence_start`）
+///
+/// 返回 `false` 表示发送失败（连接已断开），调用方应停止回放并复位状态。
+async fn send_text_event(socket: &mut WebSocket, session: &Session, event: &PlaybackEvent) -> bool {
+    match event {
+        PlaybackEvent::Stt(text) => send_json(
+            socket,
+            &ServerMessage::Stt {
+                session_id: session.session_id.clone(),
+                text: text.clone(),
+            },
+        )
+        .await
+        .is_ok(),
+        PlaybackEvent::LlmSentence(text) => send_json(
+            socket,
+            &ServerMessage::Tts {
+                session_id: session.session_id.clone(),
+                state: TtsState::SentenceStart,
+                text: Some(text.clone()),
+            },
+        )
+        .await
+        .is_ok(),
+        PlaybackEvent::Audio(_) => true,
+    }
+}
 
 /// 通过 WebSocket 发送 JSON 格式的 ServerMessage
 async fn send_json(socket: &mut WebSocket, msg: &ServerMessage) -> Result<(), ()> {
