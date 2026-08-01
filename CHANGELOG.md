@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.1](https://github.com/shenjingnan/haimen/compare/v0.9.0...v0.9.1) - 2026-08-01
+
+### Fixed
+
+- 修复 Windows 发布构建 libopus __imp_floor 链接错误 ([#141](https://github.com/shenjingnan/haimen/pull/141))
+
 ## [0.9.0](https://github.com/shenjingnan/haimen/compare/v0.8.0...v0.9.0) - 2026-08-01
 
 ### Added
