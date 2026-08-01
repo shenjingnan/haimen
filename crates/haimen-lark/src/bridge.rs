@@ -20,13 +20,16 @@ impl LarkCliBridge {
     }
 
     pub async fn exec(&self, args: &[&str]) -> Result<serde_json::Value, String> {
-        let output = Command::new(&self.lark_cli_path)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .map_err(|e| format!("执行 lark-cli 失败: {} (请确保 lark-cli 已安装)", e))?;
+        // Windows 上 lark-cli 可能是 npm 安装的 .cmd shim，经 build_command 解析包装
+        let output = Command::from(haimen_core::process::build_command(
+            &self.lark_cli_path,
+            args,
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("执行 lark-cli 失败: {} (请确保 lark-cli 已安装)", e))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -66,13 +69,15 @@ impl LarkCliBridge {
         &self,
         args: &[&str],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String, String>> + Send>>, String> {
-        let mut child = Command::new(&self.lark_cli_path)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("启动 lark-cli 失败: {}", e))?;
+        let mut child = Command::from(haimen_core::process::build_command(
+            &self.lark_cli_path,
+            args,
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("启动 lark-cli 失败: {}", e))?;
 
         let stdout = child
             .stdout
@@ -97,14 +102,16 @@ impl LarkCliBridge {
     }
 
     pub async fn health_check(&self) -> BridgeHealth {
-        let lark_cli_found = Command::new(&self.lark_cli_path)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .await
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let lark_cli_found = Command::from(haimen_core::process::build_command(
+            &self.lark_cli_path,
+            &["--version"],
+        ))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
 
         if !lark_cli_found {
             return BridgeHealth {
@@ -114,14 +121,16 @@ impl LarkCliBridge {
             };
         }
 
-        let authenticated = Command::new(&self.lark_cli_path)
-            .args(["auth", "status", "--json"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .await
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let authenticated = Command::from(haimen_core::process::build_command(
+            &self.lark_cli_path,
+            &["auth", "status", "--json"],
+        ))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
 
         BridgeHealth {
             lark_cli_found: true,

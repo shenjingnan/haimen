@@ -79,8 +79,8 @@ async fn process_with_claude_stream(
 
     args.push(prompt.to_string());
 
-    let mut child = Command::new("claude")
-        .args(&args)
+    // Windows 上 claude 是 npm 安装的 .cmd shim，需经 build_command 解析包装
+    let mut child = Command::from(haimen_core::process::build_command("claude", &args))
         .current_dir(work_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -207,10 +207,12 @@ fn extract_text_from_flat(json: &serde_json::Value) -> Option<String> {
 
 /// 检查 claude CLI 是否可用
 async fn check_claude_available() -> bool {
-    Command::new("claude")
-        .arg("--version")
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    Command::from(haimen_core::process::build_command(
+        "claude",
+        &["--version".to_string()],
+    ))
+    .output()
+    .await
+    .map(|o| o.status.success())
+    .unwrap_or(false)
 }

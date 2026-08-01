@@ -88,8 +88,8 @@ async fn process_with_codex_stream(
 
     tracing::debug!(args = ?args, "启动 codex 子进程");
 
-    let mut child = Command::new("codex")
-        .args(&args)
+    // Windows 上 codex 是 npm 安装的 .cmd shim，需经 build_command 解析包装
+    let mut child = Command::from(haimen_core::process::build_command("codex", &args))
         .current_dir(work_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -334,12 +334,14 @@ fn extract_assistant_message_text(json: &serde_json::Value) -> Option<String> {
 
 /// 检查 codex CLI 是否可用
 async fn check_codex_available() -> bool {
-    Command::new("codex")
-        .arg("--version")
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    Command::from(haimen_core::process::build_command(
+        "codex",
+        &["--version".to_string()],
+    ))
+    .output()
+    .await
+    .map(|o| o.status.success())
+    .unwrap_or(false)
 }
 
 #[cfg(test)]
