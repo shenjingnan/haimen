@@ -57,3 +57,36 @@ fn internal_error() -> Response {
         .body(Body::from("内部错误"))
         .unwrap()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 校验 rust-embed 确实嵌入了完整的前端产物（而非占位/空产物）。
+    /// 占位 index.html 引用的资源未被嵌入时，本测试失败。
+    #[test]
+    fn web_assets_are_embedded() {
+        let files: Vec<String> = Assets::iter().map(|s| s.to_string()).collect();
+
+        assert!(
+            files.iter().any(|f| f == "index.html"),
+            "index.html 必须被嵌入"
+        );
+
+        let html = Assets::get("index.html").expect("index.html 应被嵌入").data;
+        let html = String::from_utf8_lossy(&html).to_string();
+        assert!(
+            html.contains("assets/"),
+            "index.html 必须引用 /assets/* 资源"
+        );
+
+        let js_assets = files
+            .iter()
+            .filter(|f| f.starts_with("assets/") && f.ends_with(".js"))
+            .count();
+        assert!(
+            js_assets >= 1,
+            "必须嵌入至少一个 JS 资源（占位/空产物会导致 Web 控制台白屏）"
+        );
+    }
+}
