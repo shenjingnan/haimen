@@ -89,6 +89,21 @@ pub async fn start(
             axum::routing::get(api::agent_settings::list_agent_providers),
         );
 
+    // 消息渠道（Connector）：飞书/钉钉配置读写 + 可用状态
+    let connectors_routes = axum::Router::new()
+        .route(
+            "/api/v1/settings/connectors",
+            axum::routing::get(api::connectors::get_connectors_settings),
+        )
+        .route(
+            "/api/v1/settings/connectors",
+            axum::routing::put(api::connectors::update_connectors_settings),
+        )
+        .route(
+            "/api/v1/connectors/status",
+            axum::routing::get(api::connectors::get_connectors_status),
+        );
+
     let app = if let Some(state) = webhook_state {
         let mut r = axum::Router::new()
             .route("/health", axum::routing::get(health_handler))
@@ -104,6 +119,7 @@ pub async fn start(
         r = r.merge(asr_routes);
         r = r.merge(tts_routes);
         r = r.merge(agent_routes);
+        r = r.merge(connectors_routes);
         r.fallback(r#static::handle)
     } else {
         let mut r = axum::Router::new()
@@ -115,6 +131,7 @@ pub async fn start(
         r = r.merge(asr_routes);
         r = r.merge(tts_routes);
         r = r.merge(agent_routes);
+        r = r.merge(connectors_routes);
         r.fallback(r#static::handle)
     };
 

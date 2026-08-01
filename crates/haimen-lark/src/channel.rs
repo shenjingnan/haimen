@@ -9,6 +9,7 @@ use haimen_core::Message;
 use haimen_core::MessageChannel;
 
 use crate::bridge::LarkCliBridge;
+use crate::types::BridgeHealth;
 use crate::types::FeishuEvent;
 
 pub struct LarkChannel {
@@ -20,6 +21,11 @@ impl LarkChannel {
         Self {
             bridge: LarkCliBridge::new(lark_cli_path),
         }
+    }
+
+    /// 结构化健康探测（供 Web 控制台区分 CLI 未安装 / 未认证）
+    pub async fn probe(&self) -> BridgeHealth {
+        self.bridge.health_check().await
     }
 }
 

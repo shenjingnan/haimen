@@ -67,6 +67,15 @@ fn default_lark_cli_path() -> String {
     "lark-cli".to_string()
 }
 
+impl Default for LarkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            lark_cli_path: default_lark_cli_path(),
+        }
+    }
+}
+
 /// DingTalk 连接器配置（TOML 配置层）
 ///
 /// 转换到 dingtalk::config::DingTalkConfig 传递给 Channel。
@@ -76,8 +85,10 @@ pub struct DingTalkConnectorConfig {
     #[serde(default)]
     pub enabled: bool,
     /// 钉钉应用 Client ID
+    #[serde(default)]
     pub client_id: String,
     /// 钉钉应用 Client Secret
+    #[serde(default)]
     pub client_secret: String,
     /// 允许的用户 ID 白名单，"," 分隔。"*" 表示全部允许。
     #[serde(default = "default_dingtalk_allow_from")]
@@ -92,6 +103,19 @@ pub struct DingTalkConnectorConfig {
 
 fn default_dingtalk_allow_from() -> String {
     "*".to_string()
+}
+
+impl Default for DingTalkConnectorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            client_id: String::new(),
+            client_secret: String::new(),
+            allow_from: default_dingtalk_allow_from(),
+            share_session_in_channel: false,
+            robot_code: String::new(),
+        }
+    }
 }
 
 impl From<DingTalkConnectorConfig> for crate::connectors::dingtalk::config::DingTalkConfig {
