@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.8.0](https://github.com/shenjingnan/haimen/compare/v0.7.2...v0.8.0) - 2026-08-01
+
+### Added
+
+- *(gateway)* Agent 子进程支持指定工作目录，默认使用 ~/.haimen/workspace ([#132](https://github.com/shenjingnan/haimen/pull/132))
+
+### Fixed
+
+- *(release)* 修复发布二进制 Web 控制台白屏（前端产物未嵌入） ([#134](https://github.com/shenjingnan/haimen/pull/134))
+
 ## [0.7.2](https://github.com/shenjingnan/haimen/compare/v0.7.1...v0.7.2) - 2026-07-27
 
 ### Fixed
