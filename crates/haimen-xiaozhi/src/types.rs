@@ -256,8 +256,22 @@ pub struct OtaInfo {
 // ─── 音频帧 ────────────────────────────────────────────────
 
 /// 缓冲的音频帧
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AudioFrame {
     pub timestamp: u32,
     pub data: Vec<u8>,
+}
+
+/// 回放通道事件：策略层通过该事件流既发送音频帧，也发送文本消息。
+///
+/// 单个通道天然保持事件顺序，策略侧「先 Stt、后句子、穿插音频」的发送顺序
+/// 会原样到达 ws.rs，无需额外的顺序协调。
+#[derive(Debug, Clone)]
+pub enum PlaybackEvent {
+    /// 用户语音识别文本（ASR 结果）→ 设备 `stt` 消息
+    Stt(String),
+    /// LLM 回复文本（句级）→ 设备 `tts/sentence_start` 消息
+    LlmSentence(String),
+    /// TTS 音频帧 → Opus 二进制帧
+    Audio(AudioFrame),
 }

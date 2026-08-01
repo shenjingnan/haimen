@@ -324,9 +324,7 @@ function TtsSettingsPanel() {
       setFixedText(data.fixed_text ?? '');
       setActiveProvider(data.active_provider ?? 'doubao');
       setSelectedTab(data.active_provider ?? 'doubao');
-      // 加载当前选中提供商的音色
-      const voiceList = await listTtsVoices(data.active_provider ?? 'doubao');
-      setVoices(voiceList);
+      // 音色列表由下方 effect（依赖 selectedTab / currentModel）加载
     } catch {
       setError('加载 TTS 配置失败');
     } finally {
@@ -338,11 +336,20 @@ function TtsSettingsPanel() {
     load();
   }, [load]);
 
-  // 切换 Tab 时加载对应提供商的音色
+  // 切换 Tab 时加载对应提供商的音色。
+  // 豆包返回全部音色（VoiceSelector 按所属模型分组展示），
+  // 选择音色时自动设置对应的 resource_id，无需用户手动切换模型。
   useEffect(() => {
+    let cancelled = false;
     listTtsVoices(selectedTab)
-      .then(setVoices)
+      .then((list) => {
+        if (cancelled) return;
+        setVoices(list);
+      })
       .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, [selectedTab]);
 
   const handleFieldChange = (key: string, value: string) => {
@@ -535,7 +542,14 @@ function TtsSettingsPanel() {
                     <VoiceSelector
                       voices={voices}
                       selectedVoice={editState[p.id]?.voice ?? null}
-                      onChange={(voiceId) => handleFieldChange('voice', voiceId)}
+                      onChange={(voiceId) => {
+                        handleFieldChange('voice', voiceId);
+                        // 音色决定模型：选择音色时自动把 resource_id 设为该音色所属模型
+                        const voice = voices.find((v) => v.id === voiceId);
+                        if (voice?.model) {
+                          handleFieldChange('resource_id', voice.model);
+                        }
+                      }}
                     />
                   </div>
                 </div>

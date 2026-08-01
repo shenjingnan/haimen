@@ -59,9 +59,19 @@ pub fn create_tts_provider(config: &TtsConfig) -> Result<Box<dyn TtsProvider>, S
                         Some("volcano_icl") => Some("seed-tts-1.0".into()),
                         _ => Some("seed-tts-2.0".into()),
                     });
+            // 未配置音色时，按模型（resource_id）选择默认音色，
+            // 避免「1.0 模型配 2.0 默认音色」触发火山引擎 55000000 资源不匹配。
             let voice = config
                 .get_credential("voice")
-                .or_else(|| Some("zh_female_xiaohe_uranus_bigtts".into()))
+                .or_else(|| {
+                    Some(
+                        match resource_id.as_deref() {
+                            Some("seed-tts-1.0") => "zh_female_tianmeixiaoyuan_moon_bigtts",
+                            _ => "zh_female_xiaohe_uranus_bigtts",
+                        }
+                        .into(),
+                    )
+                })
                 .map(|v| VoiceId::from(v.as_str()));
 
             Ok(Box::new(DoubaoTts::new(DoubaoTtsOption {

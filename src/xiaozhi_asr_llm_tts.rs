@@ -23,6 +23,13 @@
 //!   ↓ BinaryProtocol2 → 设备播放
 //! ```
 //!
+//! # 文本下发
+//!
+//! 流式回放路径（`generate_response_stream`）下，除音频帧外还会下发两类文本消息
+//! 供设备 OLED/LCD 屏幕显示对话内容：
+//! - `stt`：用户语音识别文本（ASR 结果），录音结束识别完成后立即下发
+//! - `tts/sentence_start`：LLM 回复文本，按句末标点切分，随音频节奏逐句上屏
+//!
 //! # 多轮对话
 //!
 //! 策略内部维护 LLM 的 `session_id`，每次 `generate_response` 调用后更新，
@@ -33,7 +40,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
-use haimen_xiaozhi::{AudioFrame, AudioParams, ResponseStrategy};
+use haimen_xiaozhi::{AudioFrame, AudioParams, PlaybackEvent, ResponseStrategy};
 use opus2::{Application, Channels, Decoder};
 use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -53,6 +60,41 @@ pub type SharedTtsConfig = Arc<RwLock<TtsConfig>>;
 
 /// 共享 ASR 配置类型
 pub type SharedAsrConfig = Arc<RwLock<AsrConfig>>;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 句切分工具
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 从句子缓冲区提取一个完整句子（含结尾标点），并消费掉它。
+///
+/// 找不到句末标点时返回 `None`（残句留在 `buf` 中，等待后续 chunk 累积）。
+/// ASCII `.` 不纳入句末标点，避免拆分 `Mr.` / `3.14` 等缩写与数字。
+fn take_sentence(buf: &mut String) -> Option<String> {
+    let mut end = None;
+    for (i, ch) in buf.char_indices() {
+        if matches!(ch, '。' | '！' | '？' | '；' | '!' | '?' | ';' | '\n') {
+            end = Some(i + ch.len_utf8());
+            break;
+        }
+    }
+    let end = end?;
+    // 吞并紧跟的连续标点，避免产出如 "！" 这样的空句
+    let mut cut = end;
+    for ch in buf[end..].chars() {
+        if matches!(ch, '。' | '！' | '？' | '；' | '!' | '?' | ';') {
+            cut += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let sentence = buf[..cut].trim().to_string();
+    buf.drain(..cut);
+    if sentence.is_empty() {
+        None
+    } else {
+        Some(sentence)
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 流式 ASR 管道状态
@@ -896,7 +938,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         &self,
         audio_buffer: Vec<AudioFrame>,
         session_id: &str,
-        frame_tx: tokio::sync::mpsc::Sender<AudioFrame>,
+        frame_tx: tokio::sync::mpsc::Sender<PlaybackEvent>,
     ) -> Result<(), String> {
         // ════════════════════════════════════════════════════════════════
         // Phase 1: 获取用户语音识别文本
@@ -915,6 +957,16 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             "TTS-STREAM: ASR 识别完成",
         );
 
+        // 将 ASR 识别文本下发给设备，供屏幕显示「用户」侧消息
+        if frame_tx
+            .send(PlaybackEvent::Stt(user_text.clone()))
+            .await
+            .is_err()
+        {
+            tracing::info!(session_id = %session_id, "TTS-STREAM: 回放管道已关闭，停止生成");
+            return Ok(());
+        }
+
         // ════════════════════════════════════════════════════════════════
         // Phase 2: 生成回复文本（AI Agent 或固定文本）
         // ════════════════════════════════════════════════════════════════
@@ -922,6 +974,12 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         // 在流式转发的同时收集完整回复内容以便日志记录
         let llm_response_full = Arc::new(Mutex::new(String::new()));
         let response_for_log = llm_response_full.clone();
+
+        // 句级文本事件旁路通道 + 残句共享态：
+        // 句切分器把完整句写入无界旁路通道，音频循环再 `.await` 转发到回放管道，
+        // 避免在同步闭包内 try_send 16 容量通道导致丢事件。
+        let (text_evt_tx, mut text_evt_rx) = mpsc::unbounded_channel::<String>();
+        let residual_shared: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
 
         // 从共享配置中读取固定文本模式设置
         let (fixed_text_enabled, fixed_text) = {
@@ -942,9 +1000,6 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                     "TTS-STREAM: 固定文本模式，跳过 LLM",
                 );
 
-                if let Ok(mut full) = response_for_log.lock() {
-                    full.push_str(&fixed_text);
-                }
                 Box::new(stream::iter(vec![fixed_text]))
             } else {
                 // 普通模式：走 AI Agent 流式处理
@@ -971,12 +1026,30 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                     "TTS-STREAM: Agent 流式输出已启动",
                 );
 
-                Box::new(text_stream_inner.inspect(move |chunk| {
-                    if let Ok(mut full) = response_for_log.lock() {
-                        full.push_str(chunk);
-                    }
-                }))
+                Box::new(text_stream_inner)
             };
+
+        // ── 句切分：按句末标点把文本流切分为句子，逐句下发设备屏幕 ──
+        // speak_stream 惰性消费 text_stream（边合成边按需拉取文本），因此句子事件
+        // 在 TTS 拉取文本的瞬间产生，与音频节奏天然近似同步，且先于该句音频
+        // 进入回放通道。残句（未闭合标点）留在共享态，由音频循环结束后补发。
+        let text_evt_tx2 = text_evt_tx.clone();
+        let residual_shared2 = residual_shared.clone();
+        let response_for_log2 = response_for_log.clone();
+        let text_stream: Box<dyn futures_util::Stream<Item = String> + Unpin + Send> =
+            Box::new(text_stream.map(move |chunk: String| {
+                if let Ok(mut full) = response_for_log2.lock() {
+                    full.push_str(&chunk);
+                }
+                // 残句缓冲：累积文本并按句末标点切分，完整句经旁路通道发出。
+                // guard 在闭包末尾释放，修改已持久化到共享态，无需二次加锁写回。
+                let mut buf = residual_shared2.lock().unwrap_or_else(|e| e.into_inner());
+                buf.push_str(&chunk);
+                while let Some(s) = take_sentence(&mut buf) {
+                    let _ = text_evt_tx2.send(s);
+                }
+                chunk
+            }));
 
         // ════════════════════════════════════════════════════════════════
         // Phase 3: 流式 TTS 合成 → Opus 编码 → 逐帧发送
@@ -1030,6 +1103,18 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         let mut timestamp: u32 = 0;
 
         while let Some(result) = audio_stream.next().await {
+            // 排空句切分器产生的句子事件（先于本块音频进入通道，保持文本先于语音）
+            while let Ok(sentence) = text_evt_rx.try_recv() {
+                if frame_tx
+                    .send(PlaybackEvent::LlmSentence(sentence))
+                    .await
+                    .is_err()
+                {
+                    tracing::info!(session_id = %session_id, "TTS-STREAM: 回放管道已关闭，停止生成");
+                    return Ok(());
+                }
+            }
+
             match result {
                 Ok(chunk) => {
                     total_audio_bytes += chunk.audio_chunk.len();
@@ -1041,10 +1126,10 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
 
                     for opus in opus_frames {
                         if frame_tx
-                            .send(AudioFrame {
+                            .send(PlaybackEvent::Audio(AudioFrame {
                                 timestamp,
                                 data: opus,
-                            })
+                            }))
                             .await
                             .is_err()
                         {
@@ -1064,6 +1149,11 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             }
         }
 
+        // 音频流已结束，释放 text_stream 与旁路发送端，使下方 text_evt_rx.recv()
+        // 能收到 None 正常退出（否则发送端存活会阻塞）。
+        drop(audio_stream);
+        drop(text_evt_tx);
+
         // ── Phase 3b: 编码最后残片 ─────────────────────────────────
         // TTS 合成完成后，flush 缓存中的不足一帧的残片（零填充后编码）
         {
@@ -1072,10 +1162,10 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 .map_err(|e| format!("Opus 编码失败: {}", e))?;
             for opus in last_frames {
                 if frame_tx
-                    .send(AudioFrame {
+                    .send(PlaybackEvent::Audio(AudioFrame {
                         timestamp,
                         data: opus,
-                    })
+                    }))
                     .await
                     .is_err()
                 {
@@ -1087,6 +1177,30 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 }
                 timestamp = timestamp.wrapping_add(60);
                 frame_count += 1;
+            }
+        }
+
+        // ── 排空剩余句子事件 + 补发最后残句 ──────────────────────
+        // 确保所有 LLM 文本在 Ok(()) 返回前进入回放通道，先于 ws.rs 的 Tts::Stop。
+        while let Some(sentence) = text_evt_rx.recv().await {
+            if frame_tx
+                .send(PlaybackEvent::LlmSentence(sentence))
+                .await
+                .is_err()
+            {
+                tracing::info!(session_id = %session_id, "TTS-STREAM: 回放管道已关闭，停止生成");
+                return Ok(());
+            }
+        }
+        let residual = residual_shared
+            .lock()
+            .ok()
+            .map(|g| g.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(s) = residual {
+            if frame_tx.send(PlaybackEvent::LlmSentence(s)).await.is_err() {
+                tracing::info!(session_id = %session_id, "TTS-STREAM: 回放管道已关闭，停止生成");
+                return Ok(());
             }
         }
 
@@ -1540,7 +1654,7 @@ impl StreamingOpusEncoder {
 /// 当 TTS 提供者创建或语音合成失败时调用此函数，确保设备能播放提示音
 /// 告知用户出错了，而非静默无响应。
 async fn send_fallback_audio(
-    frame_tx: &tokio::sync::mpsc::Sender<AudioFrame>,
+    frame_tx: &tokio::sync::mpsc::Sender<PlaybackEvent>,
     session_id: &str,
 ) -> Result<(), String> {
     let opus_frames = crate::xiaozhi_tts::fallback_error_audio_frames()
@@ -1549,10 +1663,10 @@ async fn send_fallback_audio(
     let mut timestamp: u32 = 0;
     for opus in &opus_frames {
         if frame_tx
-            .send(AudioFrame {
+            .send(PlaybackEvent::Audio(AudioFrame {
                 timestamp,
                 data: opus.clone(),
-            })
+            }))
             .await
             .is_err()
         {
@@ -2082,5 +2196,84 @@ mod tests {
         let cfg = make_qwen_asr_config();
         let provider = create_streaming_asr_provider(&cfg).expect("qwen 流式提供者创建应成功");
         assert_eq!(provider.name(), "qwen");
+    }
+
+    // ─── take_sentence 句切分测试 ──────────────────────────
+
+    #[test]
+    fn test_t40_take_sentence_chinese_punctuation() {
+        let mut buf = "今天天气不错。我们出去玩吧！".to_string();
+        let s1 = take_sentence(&mut buf).expect("第一句应可切出");
+        assert_eq!(s1, "今天天气不错。");
+        let s2 = take_sentence(&mut buf).expect("第二句应可切出");
+        assert_eq!(s2, "我们出去玩吧！");
+        assert!(take_sentence(&mut buf).is_none(), "无剩余内容时返回 None");
+    }
+
+    #[test]
+    fn test_t41_take_sentence_cross_chunk() {
+        // 一句话横跨多个 chunk：句末标点在第二个 chunk
+        let mut buf = String::new();
+        buf.push_str("今天是");
+        assert!(take_sentence(&mut buf).is_none(), "未闭合的句子应留在缓冲");
+        buf.push_str("星期二。");
+        let s = take_sentence(&mut buf).expect("跨 chunk 累积后应可切出");
+        assert_eq!(s, "今天是星期二。");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_t42_take_sentence_multiple_in_one_chunk() {
+        let mut buf = "你好！再见？".to_string();
+        let s1 = take_sentence(&mut buf).expect("第一句");
+        assert_eq!(s1, "你好！");
+        let s2 = take_sentence(&mut buf).expect("第二句");
+        assert_eq!(s2, "再见？");
+    }
+
+    #[test]
+    fn test_t43_take_sentence_consecutive_punctuation_merged() {
+        // 连续标点应被吞并，避免产出空句
+        let mut buf = "真的吗？！太好了".to_string();
+        let s1 = take_sentence(&mut buf).expect("第一句");
+        assert_eq!(s1, "真的吗？！");
+        assert!(take_sentence(&mut buf).is_none(), "无标点的残句留在缓冲");
+        assert_eq!(buf, "太好了");
+    }
+
+    #[test]
+    fn test_t44_take_sentence_ascii_dot_not_boundary() {
+        // ASCII 句点不应作为边界（避免拆分 Mr. / 3.14）
+        let mut buf = "单价3.14元。谢谢。".to_string();
+        let s1 = take_sentence(&mut buf).expect("第一句");
+        assert_eq!(s1, "单价3.14元。");
+        let s2 = take_sentence(&mut buf).expect("第二句");
+        assert_eq!(s2, "谢谢。");
+    }
+
+    #[test]
+    fn test_t45_take_sentence_ascii_question_and_exclaim() {
+        let mut buf = "Really?Yes!".to_string();
+        let s1 = take_sentence(&mut buf).expect("第一句");
+        assert_eq!(s1, "Really?");
+        let s2 = take_sentence(&mut buf).expect("第二句");
+        assert_eq!(s2, "Yes!");
+    }
+
+    #[test]
+    fn test_t46_take_sentence_newline_boundary() {
+        let mut buf = "第一行\n第二行".to_string();
+        let s1 = take_sentence(&mut buf).expect("第一行");
+        assert_eq!(s1, "第一行");
+        assert!(take_sentence(&mut buf).is_none(), "无标点的第二行留在缓冲");
+        assert_eq!(buf, "第二行");
+    }
+
+    #[test]
+    fn test_t47_take_sentence_empty_and_whitespace() {
+        let mut buf = String::new();
+        assert!(take_sentence(&mut buf).is_none(), "空缓冲返回 None");
+        let mut buf2 = "   \n  ".to_string();
+        assert!(take_sentence(&mut buf2).is_none(), "纯空白返回 None");
     }
 }

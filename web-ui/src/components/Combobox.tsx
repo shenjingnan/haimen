@@ -18,8 +18,17 @@ interface ComboboxOption {
   label: string;
 }
 
-interface ComboboxProps {
+interface ComboboxGroup {
+  /** 分组标题（如模型名称） */
+  label: string;
   options: ComboboxOption[];
+}
+
+interface ComboboxProps {
+  /** 平铺选项（与 groups 二选一） */
+  options?: ComboboxOption[];
+  /** 分组选项（与 options 二选一） */
+  groups?: ComboboxGroup[];
   value: string | null;
   onChange: (value: string) => void;
   placeholder?: string;
@@ -30,6 +39,7 @@ interface ComboboxProps {
 
 export default function Combobox({
   options,
+  groups,
   value,
   onChange,
   placeholder = '请选择...',
@@ -39,7 +49,8 @@ export default function Combobox({
 }: ComboboxProps) {
   const [open, setOpen] = useState(false);
 
-  const selected = options.find((opt) => opt.value === value);
+  const allOptions = groups ? groups.flatMap((g) => g.options) : (options ?? []);
+  const selected = allOptions.find((opt) => opt.value === value);
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -59,30 +70,51 @@ export default function Combobox({
           <CommandInput placeholder={searchPlaceholder} />
           <CommandEmpty>{emptyText}</CommandEmpty>
           <CommandList>
-            <CommandGroup>
-              {options.map((opt) => (
-                <CommandItem
-                  key={opt.value}
-                  value={opt.value}
-                  onSelect={(currentValue) => {
-                    onChange(currentValue);
-                    setOpen(false);
-                  }}
-                >
-                  <Check
-                    className={cn(
-                      'mr-2 h-4 w-4',
-                      value === opt.value ? 'opacity-100' : 'opacity-0',
-                    )}
-                  />
-                  {opt.label}
-                </CommandItem>
-              ))}
-            </CommandGroup>
+            {groups
+              ? groups.map((group) => (
+                  <CommandGroup key={group.label} heading={group.label}>
+                    {group.options.map((opt) => (
+                      <CommandItem
+                        key={opt.value}
+                        value={opt.value}
+                        onSelect={(currentValue) => {
+                          onChange(currentValue);
+                          setOpen(false);
+                        }}
+                      >
+                        <Check
+                          className={cn(
+                            'mr-2 h-4 w-4',
+                            value === opt.value ? 'opacity-100' : 'opacity-0',
+                          )}
+                        />
+                        {opt.label}
+                      </CommandItem>
+                    ))}
+                  </CommandGroup>
+                ))
+              : (options ?? []).map((opt) => (
+                  <CommandItem
+                    key={opt.value}
+                    value={opt.value}
+                    onSelect={(currentValue) => {
+                      onChange(currentValue);
+                      setOpen(false);
+                    }}
+                  >
+                    <Check
+                      className={cn(
+                        'mr-2 h-4 w-4',
+                        value === opt.value ? 'opacity-100' : 'opacity-0',
+                      )}
+                    />
+                    {opt.label}
+                  </CommandItem>
+                ))}
           </CommandList>
           {showCount && (
             <div className="border-t border-border px-3 py-1.5 text-xs text-muted-foreground">
-              共 {options.length} 项
+              共 {allOptions.length} 项
             </div>
           )}
         </Command>

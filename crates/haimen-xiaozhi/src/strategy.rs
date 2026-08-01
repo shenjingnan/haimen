@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};
 
-use crate::types::{AudioFrame, AudioParams};
+use crate::types::{AudioFrame, AudioParams, PlaybackEvent};
 
 /// WebSocket 响应策略：决定录音结束后如何生成回放音频
 ///
@@ -104,31 +104,35 @@ pub trait ResponseStrategy: Send + Sync {
         false
     }
 
-    /// 流式生成音频帧并发送到回放管道
+    /// 流式生成回放事件并发送到回放管道
     ///
     /// 与 [`generate_response`] 不同，此方法不返回所有帧，而是通过 `frame_tx`
-    /// 逐帧发送生成的音频。调用方在 `frame_tx` 的 Receiver 端逐帧读取并发送给设备。
+    /// 逐帧发送生成的[`PlaybackEvent`]（音频帧或文本消息）。调用方在 `frame_tx`
+    /// 的 Receiver 端逐帧读取并发送给设备。
+    ///
+    /// 策略可通过发送文本事件（[`PlaybackEvent::Stt`] / [`PlaybackEvent::LlmSentence`]）
+    /// 让设备屏幕显示 ASR 识别文本和 LLM 回复文本。
     ///
     /// # 参数
     ///
     /// * `audio_buffer` — 设备录音阶段缓冲的音频帧
     /// * `session_id` — 当前 WebSocket 会话 ID
-    /// * `frame_tx` — 音频帧发送端，实现边合成边播放
+    /// * `frame_tx` — 回放事件发送端，实现边合成边播放
     ///
     /// # 约定
     ///
     /// - 方法返回时，`frame_tx` 已被 drop（Receiver 端收到 None）
-    /// - 返回前应确保所有必要的帧已发送完毕
-    /// - 默认实现调用 [`generate_response`] 后逐帧发送
+    /// - 返回前应确保所有必要的事件已发送完毕
+    /// - 默认实现调用 [`generate_response`] 后将每帧包装为 [`PlaybackEvent::Audio`] 发送
     async fn generate_response_stream(
         &self,
         audio_buffer: Vec<AudioFrame>,
         session_id: &str,
-        frame_tx: mpsc::Sender<AudioFrame>,
+        frame_tx: mpsc::Sender<PlaybackEvent>,
     ) -> Result<(), String> {
         let frames = self.generate_response(audio_buffer, session_id).await?;
         for frame in frames {
-            if frame_tx.send(frame).await.is_err() {
+            if frame_tx.send(PlaybackEvent::Audio(frame)).await.is_err() {
                 break;
             }
         }
@@ -343,5 +347,28 @@ mod tests {
         let frame = make_frame(0, &[0x01]);
         let result = strategy.on_audio_frame(&frame).await;
         assert!(result.is_ok());
+    }
+
+    /// 验证流式默认实现把帧包装为 PlaybackEvent::Audio 后逐帧发送
+    #[tokio::test]
+    async fn test_t14_generate_response_stream_emits_audio_events() {
+        let strategy = EchoStrategy;
+        let buffer = vec![make_frame(0, &[0x01, 0x02])];
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<PlaybackEvent>(16);
+
+        let result = strategy
+            .generate_response_stream(buffer, "test-session", tx)
+            .await;
+        assert!(result.is_ok(), "默认 generate_response_stream 应返回 Ok");
+
+        let event = rx.recv().await.expect("应收到一个事件");
+        match event {
+            PlaybackEvent::Audio(frame) => {
+                assert_eq!(frame.timestamp, 0);
+                assert_eq!(frame.data, vec![0x01, 0x02]);
+            }
+            other => panic!("默认实现应发送 Audio 事件，得到 {:?}", other),
+        }
+        assert!(rx.recv().await.is_none(), "发送端 drop 后应收到 None");
     }
 }

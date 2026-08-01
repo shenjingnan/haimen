@@ -109,6 +109,8 @@ export interface TtsVoice {
   id: string;
   name: string;
   language: string;
+  /** 所属模型（豆包为 seed-tts-1.0 / seed-tts-2.0，其他提供商可能缺失） */
+  model?: string;
 }
 
 // ── Agent 配置 ──
