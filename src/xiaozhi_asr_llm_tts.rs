@@ -100,6 +100,8 @@ pub struct AsrLlmTtsStrategy {
     voice_override: Option<String>,
     /// AI Agent（Claude Code、Codex 等）
     agent: Arc<dyn AgentProvider>,
+    /// Agent 子进程工作目录
+    work_dir: String,
     /// LLM 会话 ID，用于多轮对话上下文连续
     llm_session_id: Mutex<Option<String>>,
     /// 流式 ASR 管道状态（录音期间启用，录音结束时消耗）
@@ -326,17 +328,20 @@ impl AsrLlmTtsStrategy {
     /// * `asr_config` — ASR 配置（Arc<RwLock>，支持运行时热加载）
     /// * `tts_config` — TTS 配置
     /// * `agent` — AI Agent 实例
+    /// * `work_dir` — Agent 子进程工作目录
     pub fn new(
         asr_config: SharedAsrConfig,
         tts_config: SharedTtsConfig,
         voice_override: Option<String>,
         agent: Arc<dyn AgentProvider>,
+        work_dir: String,
     ) -> Self {
         Self {
             asr_config,
             tts_config,
             voice_override,
             agent,
+            work_dir,
             llm_session_id: Mutex::new(None),
             streaming_state: Mutex::new(None),
             vad_notify: Mutex::new(Arc::new(Notify::new())),
@@ -355,6 +360,7 @@ impl AsrLlmTtsStrategy {
         shared_tts_config: SharedTtsConfig,
         voice_override: Option<String>,
         agent: Arc<dyn AgentProvider>,
+        work_dir: String,
     ) -> Result<Self, String> {
         // 验证当前配置的凭证是否有效（构造时检查一次，运行时也会动态读取）
         {
@@ -391,6 +397,7 @@ impl AsrLlmTtsStrategy {
             tts_config: shared_tts_config,
             voice_override,
             agent,
+            work_dir,
             llm_session_id: Mutex::new(None),
             streaming_state: Mutex::new(None),
             vad_notify: Mutex::new(Arc::new(Notify::new())),
@@ -949,7 +956,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
 
                 let (text_stream_inner, new_llm_session_id) = self
                     .agent
-                    .process_stream(&user_text, current_llm_session.as_deref())
+                    .process_stream(&user_text, current_llm_session.as_deref(), &self.work_dir)
                     .await
                     .map_err(|e| format!("AI Agent 流式处理失败: {}", e))?;
 
@@ -1174,7 +1181,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             let llm_response = tokio::time::timeout(
                 std::time::Duration::from_secs(60),
                 self.agent
-                    .process(&user_text, current_llm_session.as_deref()),
+                    .process(&user_text, current_llm_session.as_deref(), &self.work_dir),
             )
             .await
             .map_err(|_| "AI Agent 响应超时 (60s)".to_string())?
@@ -1605,6 +1612,7 @@ mod tests {
             &self,
             message: &str,
             session_id: Option<&str>,
+            _work_dir: &str,
         ) -> Result<(String, String), String> {
             // 如果提供了 session_id，追加 "(continued)" 表示恢复了上下文
             let response = if session_id.is_some() {
@@ -1633,6 +1641,7 @@ mod tests {
             &self,
             _message: &str,
             _session_id: Option<&str>,
+            _work_dir: &str,
         ) -> Result<(String, String), String> {
             Err("模拟 Agent 失败".to_string())
         }
@@ -1655,6 +1664,7 @@ mod tests {
             &self,
             _message: &str,
             _session_id: Option<&str>,
+            _work_dir: &str,
         ) -> Result<(String, String), String> {
             Ok((String::new(), "empty-session".to_string()))
         }
@@ -1703,6 +1713,7 @@ mod tests {
             make_shared_tts_config(),
             None, // voice_override
             agent,
+            "/tmp".to_string(),
         )
     }
 
@@ -1896,7 +1907,10 @@ mod tests {
     #[tokio::test]
     async fn test_t22_mock_agent_no_session() {
         let agent = MockAgent;
-        let (response, session_id) = agent.process("你好", None).await.expect("MockAgent 应成功");
+        let (response, session_id) = agent
+            .process("你好", None, "/tmp")
+            .await
+            .expect("MockAgent 应成功");
         assert_eq!(response, "你好");
         assert_eq!(session_id, "mock-session-id");
     }
@@ -1905,7 +1919,7 @@ mod tests {
     async fn test_t23_mock_agent_with_session() {
         let agent = MockAgent;
         let (response, session_id) = agent
-            .process("你好", Some("prev-session"))
+            .process("你好", Some("prev-session"), "/tmp")
             .await
             .expect("MockAgent 应成功");
         assert_eq!(response, "你好 (continued)");
@@ -1915,7 +1929,7 @@ mod tests {
     #[tokio::test]
     async fn test_t24_failing_agent_process() {
         let agent = FailingAgent;
-        let result = agent.process("你好", None).await;
+        let result = agent.process("你好", None, "/tmp").await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "模拟 Agent 失败");
     }
@@ -2005,7 +2019,7 @@ mod tests {
     async fn test_t33_mock_agent_process_stream() {
         let agent = MockAgent;
         let (mut stream, sid) = agent
-            .process_stream("你好", None)
+            .process_stream("你好", None, "/tmp")
             .await
             .expect("MockAgent process_stream 应成功");
         let mut result = String::new();

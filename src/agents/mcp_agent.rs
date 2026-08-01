@@ -29,6 +29,7 @@ impl AgentProvider for McpAgent {
         &self,
         message: &str,
         _session_id: Option<&str>,
+        _work_dir: &str,
     ) -> Result<(String, String), String> {
         let response = self
             .client

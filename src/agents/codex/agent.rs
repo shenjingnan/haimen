@@ -32,8 +32,9 @@ impl AgentProvider for CodexAgent {
         &self,
         message: &str,
         session_id: Option<&str>,
+        work_dir: &str,
     ) -> Result<(String, String), String> {
-        let (mut stream, sid) = self.process_stream(message, session_id).await?;
+        let (mut stream, sid) = self.process_stream(message, session_id, work_dir).await?;
         let mut full_text = String::new();
         while let Some(chunk) = stream.next().await {
             full_text.push_str(&chunk);
@@ -50,8 +51,9 @@ impl AgentProvider for CodexAgent {
         &self,
         message: &str,
         session_id: Option<&str>,
+        work_dir: &str,
     ) -> Result<(TextStream, String), String> {
-        process_with_codex_stream(message, session_id).await
+        process_with_codex_stream(message, session_id, work_dir).await
     }
 
     async fn check_available(&self) -> Result<(), String> {
@@ -67,6 +69,7 @@ impl AgentProvider for CodexAgent {
 async fn process_with_codex_stream(
     prompt: &str,
     resume_session_id: Option<&str>,
+    work_dir: &str,
 ) -> Result<(TextStream, String), String> {
     let mut args: Vec<String> = vec![];
 
@@ -87,6 +90,7 @@ async fn process_with_codex_stream(
 
     let mut child = Command::new("codex")
         .args(&args)
+        .current_dir(work_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()

@@ -50,12 +50,7 @@ where
     // 2. 加载会话配置
     let idle_timeout = config.session_idle_timeout_mins;
     let max_turns = config.session_max_turns;
-    let work_dir = config.work_dir.clone().unwrap_or_else(|| {
-        std::env::current_dir()
-            .ok()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| ".".to_string())
-    });
+    let work_dir = resolve_work_dir(config.work_dir.clone());
     let mut session_mgr = SessionManager::new(idle_timeout, max_turns);
 
     // 3. 启动消息流
@@ -100,10 +95,10 @@ where
 
         // 调用 Agent 处理
         let result = if need_new_session {
-            agent.process(&message.content, None).await
+            agent.process(&message.content, None, &work_dir).await
         } else {
             agent
-                .process(&message.content, existing_session_id.as_deref())
+                .process(&message.content, existing_session_id.as_deref(), &work_dir)
                 .await
         };
 
@@ -132,7 +127,7 @@ where
                     tracing::warn!(chat_id = %chat_id, error = %e, "Resume 失败，降级为新会话重试");
                     session_mgr.remove_session(&chat_id);
 
-                    match agent.process(&message.content, None).await {
+                    match agent.process(&message.content, None, &work_dir).await {
                         Ok((response, new_session_id)) => {
                             session_mgr.create_session(&chat_id, &new_session_id, &work_dir);
                             tracing::info!(
@@ -188,12 +183,7 @@ pub async fn run_unified_gateway(
     // 1. 加载会话配置
     let idle_timeout = config.session_idle_timeout_mins;
     let max_turns = config.session_max_turns;
-    let work_dir = config.work_dir.clone().unwrap_or_else(|| {
-        std::env::current_dir()
-            .ok()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| ".".to_string())
-    });
+    let work_dir = resolve_work_dir(config.work_dir.clone());
     let mut session_mgr = SessionManager::new(idle_timeout, max_turns);
 
     // 2. 创建全局 mpsc 通道（替代 select_all）
@@ -320,9 +310,9 @@ pub async fn run_unified_gateway(
 
         // 调用 Agent 处理（带超时）
         let process_fut = if need_new_session {
-            agent.process(&message.content, None)
+            agent.process(&message.content, None, &work_dir)
         } else {
-            agent.process(&message.content, existing_session_id.as_deref())
+            agent.process(&message.content, existing_session_id.as_deref(), &work_dir)
         };
 
         let result = tokio::time::timeout(timeout_duration, process_fut).await;
@@ -356,7 +346,7 @@ pub async fn run_unified_gateway(
                     tracing::warn!(chat_id = %chat_id, error = %e, "Resume 失败，降级为新会话重试");
                     session_mgr.remove_session(&chat_id);
 
-                    let retry_fut = agent.process(&message.content, None);
+                    let retry_fut = agent.process(&message.content, None, &work_dir);
                     let retry_result = tokio::time::timeout(timeout_duration, retry_fut).await;
 
                     match retry_result {
@@ -602,6 +592,40 @@ async fn handle_command_for_channel(
     }
 }
 
+/// 默认 Agent 工作目录（`[gateway] work_dir` 未配置时使用）
+///
+/// 使用 `~/.haimen/workspace` 作为固定工作区，而非 `haimen start` 的启动目录，
+/// 使 Agent 子进程的工作目录不随服务进程的 cwd 变化。
+pub const DEFAULT_WORK_DIR: &str = "~/.haimen/workspace";
+
+/// 解析 Agent 工作目录
+///
+/// 优先级：
+/// 1. `[gateway] work_dir` 显式配置（自动展开 `~`）
+/// 2. 默认 `~/.haimen/workspace`
+///
+/// 无论哪种来源，都会确保目录存在（不存在时自动创建）。
+pub fn resolve_work_dir(configured: Option<String>) -> String {
+    let wd = configured.unwrap_or_else(|| DEFAULT_WORK_DIR.to_string());
+    let expanded = expand_tilde(&wd);
+    if let Err(e) = std::fs::create_dir_all(&expanded) {
+        tracing::warn!(path = %expanded, error = %e, "创建工作目录失败，Agent 子进程可能无法启动");
+    }
+    expanded
+}
+
+/// 展开路径中的 `~` 为 home 目录
+///
+/// 仅处理以 `~/` 开头的路径，其他情况原样返回。
+pub fn expand_tilde(path: &str) -> String {
+    if path.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{}{}", home.trim_end_matches('/'), &path[1..]);
+        }
+    }
+    path.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -762,6 +786,7 @@ mod tests {
             &self,
             _msg: &str,
             _session_id: Option<&str>,
+            _work_dir: &str,
         ) -> Result<(String, String), String> {
             // delay simulation
             if !self.delay.is_zero() {

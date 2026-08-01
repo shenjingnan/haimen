@@ -18,6 +18,8 @@ pub struct GitHubConnector {
     config: GitHubConfig,
     /// 使用 Arc 而非 Box：handle() 中需要 clone 到 tokio::spawn 的异步闭包
     agent: Arc<dyn AgentProvider>,
+    /// Agent 子进程工作目录
+    work_dir: String,
     /// Webhook 幂等性去重缓存（最多保留 1000 条 delivery_id）
     dedup: DedupCache,
 }
@@ -51,10 +53,11 @@ impl DedupCache {
 }
 
 impl GitHubConnector {
-    pub fn new(config: GitHubConfig, agent: Arc<dyn AgentProvider>) -> Self {
+    pub fn new(config: GitHubConfig, agent: Arc<dyn AgentProvider>, work_dir: String) -> Self {
         Self {
             config,
             agent,
+            work_dir,
             dedup: DedupCache::new(1000),
         }
     }
@@ -127,6 +130,7 @@ impl WebhookHandler for GitHubConnector {
         let agent = self.agent.clone();
         let token = self.config.token.clone();
         let issue = parsed.issue.clone();
+        let work_dir = self.work_dir.clone();
         tokio::spawn(async move {
             // 5. 获取 Issue 上下文
             let context = format!(
@@ -141,6 +145,7 @@ impl WebhookHandler for GitHubConnector {
                 .process(
                     &format!("Context:\n{}\n\nRequest:\n{}", context, prompt),
                     None,
+                    &work_dir,
                 )
                 .await
             {

@@ -25,8 +25,9 @@ impl AgentProvider for ClaudeAgent {
         &self,
         message: &str,
         session_id: Option<&str>,
+        work_dir: &str,
     ) -> Result<(String, String), String> {
-        let (mut stream, sid) = self.process_stream(message, session_id).await?;
+        let (mut stream, sid) = self.process_stream(message, session_id, work_dir).await?;
         let mut full_text = String::new();
         while let Some(chunk) = stream.next().await {
             full_text.push_str(&chunk);
@@ -43,8 +44,9 @@ impl AgentProvider for ClaudeAgent {
         &self,
         message: &str,
         session_id: Option<&str>,
+        work_dir: &str,
     ) -> Result<(TextStream, String), String> {
-        process_with_claude_stream(message, session_id).await
+        process_with_claude_stream(message, session_id, work_dir).await
     }
 
     async fn check_available(&self) -> Result<(), String> {
@@ -60,6 +62,7 @@ impl AgentProvider for ClaudeAgent {
 async fn process_with_claude_stream(
     prompt: &str,
     resume_session_id: Option<&str>,
+    work_dir: &str,
 ) -> Result<(TextStream, String), String> {
     let mut args: Vec<String> = vec![
         "--print".to_string(),
@@ -78,6 +81,7 @@ async fn process_with_claude_stream(
 
     let mut child = Command::new("claude")
         .args(&args)
+        .current_dir(work_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()

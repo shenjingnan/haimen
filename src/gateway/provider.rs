@@ -19,11 +19,13 @@ pub trait AgentProvider: Send + Sync {
     ///
     /// - message: 用户消息文本
     /// - session_id: Some(id) 表示继续已有会话，None 表示新会话
+    /// - work_dir: Agent 子进程的工作目录
     /// 返回: (完整回复文本, 新的 session_id)
     async fn process(
         &self,
         message: &str,
         session_id: Option<&str>,
+        work_dir: &str,
     ) -> Result<(String, String), String>;
 
     /// 流式处理消息
@@ -36,8 +38,9 @@ pub trait AgentProvider: Send + Sync {
         &self,
         message: &str,
         session_id: Option<&str>,
+        work_dir: &str,
     ) -> Result<(TextStream, String), String> {
-        let (text, sid) = self.process(message, session_id).await?;
+        let (text, sid) = self.process(message, session_id, work_dir).await?;
         let stream: TextStream = Box::pin(futures_util::stream::once(async move { text }));
         Ok((stream, sid))
     }
