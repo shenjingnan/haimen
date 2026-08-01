@@ -96,17 +96,30 @@ fn build_frontend(web_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// 执行命令，失败返回错误。
+///
+/// Windows 上通过 `cmd /C` 执行：npm 生态工具（pnpm/corepack/npx）是
+/// `.cmd` 批处理脚本，直接 `Command::new` 无法找到，需要交给 cmd.exe。
 fn run(
     cmd: &str,
     pre: &[String],
     args: &[&str],
     cwd: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let status = Command::new(cmd)
-        .args(pre)
-        .args(args)
-        .current_dir(cwd)
-        .status()?;
+    let status = if cfg!(target_os = "windows") {
+        Command::new("cmd")
+            .arg("/C")
+            .arg(cmd)
+            .args(pre)
+            .args(args)
+            .current_dir(cwd)
+            .status()?
+    } else {
+        Command::new(cmd)
+            .args(pre)
+            .args(args)
+            .current_dir(cwd)
+            .status()?
+    };
     if !status.success() {
         return Err(format!("`{cmd} {args:?}` 失败 (exit={status})").into());
     }
@@ -115,11 +128,16 @@ fn run(
 
 /// 检查命令是否可用。
 fn have_cmd(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    let output = if cfg!(target_os = "windows") {
+        Command::new("cmd")
+            .arg("/C")
+            .arg(cmd)
+            .arg("--version")
+            .output()
+    } else {
+        Command::new(cmd).arg("--version").output()
+    };
+    output.map(|o| o.status.success()).unwrap_or(false)
 }
 
 /// 检查 Node 版本是否满足 Vite 8 要求（>= 20.19 或 >= 22.12）。

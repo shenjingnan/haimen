@@ -1,1 +1,7 @@
+# 忽略第三方构建产物（压缩 JS/CSS 中的 minifier 产物会被误报为 typo）
+[files]
+extend-exclude = [
+  "web-ui/dist/**",
+]
+
 [default.extend-words]
