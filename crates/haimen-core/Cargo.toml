@@ -1,6 +1,6 @@
 [package]
 name = "haimen-core"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 description = "AI 网关共享抽象层 - Message 消息模型、MessageChannel 消息通道与 AgentProvider Agent 契约 trait"
