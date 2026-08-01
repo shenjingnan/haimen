@@ -11,3 +11,7 @@ repository = "https://github.com/shenjingnan/haimen"
 async-trait = { workspace = true }
 chrono = { workspace = true }
 futures-util = { workspace = true }
+
+# 仅 Windows：解析 npm 安装的 CLI shim（.cmd/.bat）
+[target.'cfg(windows)'.dependencies]
+which = { workspace = true }

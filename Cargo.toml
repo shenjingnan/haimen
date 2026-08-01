@@ -87,6 +87,9 @@ uuid = { version = "1", features = ["v4"] }
 # Opus 音频编码
 opus2 = { version = "0.4", features = ["bundled"] }
 
+# 可执行文件路径解析（Windows 下按 PATHEXT 命中 npm 的 .cmd/.bat shim）
+which = "8"
+
 
 [dependencies]
 clap = { workspace = true }

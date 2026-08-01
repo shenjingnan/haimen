@@ -47,12 +47,15 @@ cargo install haimen
 
 从 [GitHub Releases](https://github.com/shenjingnan/haimen/releases) 下载对应平台的压缩包，解压后放入 `PATH`。
 
-| 平台  | 架构          | 文件名                                    |
-| ----- | ------------- | ----------------------------------------- |
-| macOS | Intel         | `haimen-x86_64-apple-darwin.tar.xz`       |
-| macOS | Apple Silicon | `haimen-aarch64-apple-darwin.tar.xz`      |
-| Linux | x86_64        | `haimen-x86_64-unknown-linux-gnu.tar.xz`  |
-| Linux | ARM64         | `haimen-aarch64-unknown-linux-gnu.tar.xz` |
+| 平台    | 架构          | 文件名                                    |
+| ------- | ------------- | ----------------------------------------- |
+| macOS   | Intel         | `haimen-x86_64-apple-darwin.tar.xz`       |
+| macOS   | Apple Silicon | `haimen-aarch64-apple-darwin.tar.xz`      |
+| Linux   | x86_64        | `haimen-x86_64-unknown-linux-gnu.tar.xz`  |
+| Linux   | ARM64         | `haimen-aarch64-unknown-linux-gnu.tar.xz` |
+| Windows | x86_64        | `haimen-x86_64-pc-windows-msvc.zip`       |
+
+> Windows on ARM（aarch64）暂不支持，`haimen upgrade` 会明确报错。
 
 ### 升级
 
