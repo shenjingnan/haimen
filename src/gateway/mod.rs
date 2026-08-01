@@ -109,14 +109,21 @@ fn build_xiaozhi_strategy(
             return None;
         }
     };
+    let work_dir = resolve_work_dir_from_config(config);
     Some(Arc::new(
         crate::xiaozhi_asr_llm_tts::AsrLlmTtsStrategy::new(
             shared_asr_config,
             shared_tts_config,
             None, // voice_override
             llm_agent,
+            work_dir,
         ),
     ))
+}
+
+/// 从 AppConfig 解析工作目录
+fn resolve_work_dir_from_config(config: &crate::config::settings::AppConfig) -> String {
+    crate::gateway::chat_loop::resolve_work_dir(config.gateway.work_dir.clone())
 }
 
 /// 统一入口：启动所有启用的连接器 + Agent + HTTP 服务器
@@ -162,6 +169,8 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
             auto_open: cli_open_browser,
         };
 
+        let work_dir = resolve_work_dir_from_config(&config);
+
         // GitHub Webhook（可选）
         let webhook_state = config.github.clone().and_then(|cfg| {
             let gh_agent: Arc<dyn AgentProvider> = match build_agent(&config) {
@@ -171,7 +180,7 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
                     return None;
                 }
             };
-            let connector = GitHubConnector::new(cfg, gh_agent);
+            let connector = GitHubConnector::new(cfg, gh_agent, work_dir.clone());
             Some(WebhookState {
                 github: Some(Arc::new(connector)),
             })

@@ -144,8 +144,10 @@ async fn cmd_agent_run(provider: Option<String>, prompt: String) -> Result<(), S
     let agent = create_agent(provider)?;
     agent.check_available().await?;
 
+    let work_dir = resolve_work_dir();
+
     println!("🤖 正在调用 {}...", agent.name());
-    let (response, session_id) = agent.process(&prompt, None).await?;
+    let (response, session_id) = agent.process(&prompt, None, &work_dir).await?;
 
     println!("{}", response);
     tracing::info!(response_len = response.len(), session_id = %session_id, "Agent 处理完成");
@@ -156,6 +158,8 @@ async fn cmd_agent_run(provider: Option<String>, prompt: String) -> Result<(), S
 async fn cmd_agent_chat(provider: Option<String>) -> Result<(), String> {
     let agent = create_agent(provider)?;
     agent.check_available().await?;
+
+    let work_dir = resolve_work_dir();
 
     println!("🤖 {} 交互模式已启动（输入 /quit 退出）", agent.name());
     let mut session_id: Option<String> = None;
@@ -180,13 +184,24 @@ async fn cmd_agent_chat(provider: Option<String>) -> Result<(), String> {
             continue;
         }
 
-        let (response, new_session_id) = agent.process(&input, session_id.as_deref()).await?;
+        let (response, new_session_id) = agent
+            .process(&input, session_id.as_deref(), &work_dir)
+            .await?;
         session_id = Some(new_session_id);
 
         println!("{}", response);
     }
 
     Ok(())
+}
+
+/// 从配置或默认 workspace 解析工作目录
+fn resolve_work_dir() -> String {
+    let config = config::settings::load_settings()
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    crate::gateway::chat_loop::resolve_work_dir(config.gateway.work_dir.clone())
 }
 
 /// CLI 入口
@@ -232,9 +247,14 @@ pub async fn run(cli: Cli) -> Result<(), String> {
             let serve_agent: Arc<dyn crate::gateway::provider::AgentProvider> =
                 create_agent(xiaozhi_llm_provider.clone()).map(Arc::from)?;
 
+            let work_dir = resolve_work_dir();
+
             let webhook_state = settings.github.map(|cfg| {
-                let connector =
-                    crate::connectors::github::GitHubConnector::new(cfg, serve_agent.clone());
+                let connector = crate::connectors::github::GitHubConnector::new(
+                    cfg,
+                    serve_agent.clone(),
+                    work_dir.clone(),
+                );
                 crate::gateway::webhook::WebhookState {
                     github: Some(Arc::new(connector)),
                 }
@@ -266,6 +286,7 @@ pub async fn run(cli: Cli) -> Result<(), String> {
                     shared_tts_config.clone(),
                     xiaozhi_tts_voice,
                     serve_agent,
+                    work_dir,
                 )?)
             };
 
