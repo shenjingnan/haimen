@@ -276,28 +276,9 @@ async fn handle_listen(
         ListenState::Start => {
             tracing::debug!(
                 device_id = %session.device_id,
-                "Listen::Start — recording started (5s timeout)",
+                "Listen::Start — recording started",
             );
-            session.audio_buffer.clear();
-            session.cumulated_timestamp = 0;
-            session.recording_deadline = None;
-            session.state = SessionState::Recording;
-
-            // 如果策略支持流式 ASR，通知其录音开始
-            if session.strategy.supports_streaming_asr() {
-                if let Err(e) = session
-                    .strategy
-                    .on_recording_start(&session.session_id)
-                    .await
-                {
-                    tracing::warn!(
-                        device_id = %session.device_id,
-                        session_id = %session.session_id,
-                        error = %e,
-                        "Streaming ASR on_recording_start 失败，将继续使用批处理模式",
-                    );
-                }
-            }
+            enter_recording(session).await;
         }
         ListenState::Stop => {
             tracing::debug!(
@@ -330,6 +311,35 @@ async fn handle_abort(socket: &mut WebSocket, session: &mut Session) {
     )
     .await;
     session.state = SessionState::Ready;
+}
+
+// ─── 录音状态迁移 ──────────────────────────────────────────
+
+/// 将会话切换到录音状态（`Listen::Start` 的公共逻辑）
+///
+/// 供 [`handle_listen`] 和播放中断路径（[`handle_playback_interrupt`]）复用，
+/// 保证「开始录音」这一状态迁移在任何入口下行为一致。
+async fn enter_recording(session: &mut Session) {
+    session.audio_buffer.clear();
+    session.cumulated_timestamp = 0;
+    session.recording_deadline = None;
+    session.state = SessionState::Recording;
+
+    // 如果策略支持流式 ASR，通知其新一轮录音开始
+    if session.strategy.supports_streaming_asr() {
+        if let Err(e) = session
+            .strategy
+            .on_recording_start(&session.session_id)
+            .await
+        {
+            tracing::warn!(
+                device_id = %session.device_id,
+                session_id = %session.session_id,
+                error = %e,
+                "Streaming ASR on_recording_start 失败，将继续使用批处理模式",
+            );
+        }
+    }
 }
 
 // ─── 二进制音频消息 ────────────────────────────────────────
@@ -469,42 +479,9 @@ async fn playback_frames(socket: &mut WebSocket, session: &mut Session, frames: 
         }
 
         // 60ms 帧间隔 + 中断监听
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(60)) => {
-                // 正常等待，继续下一帧
-            }
-            msg = socket.recv() => {
-                let interrupted = match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        if let Ok(cmd) = serde_json::from_str::<ClientMessage>(&text) {
-                            matches!(cmd, ClientMessage::Listen { state: ListenState::Start, .. } | ClientMessage::Abort)
-                        } else {
-                            false
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
-                        tracing::debug!("Connection closed during playback");
-                        session.state = SessionState::Ready;
-                        return;
-                    }
-                    _ => false,
-                };
-
-                if interrupted {
-                    tracing::debug!("Playback interrupted by client command");
-                    let _ = send_json(
-                        socket,
-                        &ServerMessage::Tts {
-                            session_id: session.session_id.clone(),
-                            state: TtsState::Stop,
-                            text: None,
-                        },
-                    )
-                    .await;
-                    session.state = SessionState::Ready;
-                    return;
-                }
-            }
+        if let Some(interrupt) = wait_frame_interrupt(socket).await {
+            handle_playback_interrupt(socket, session, interrupt).await;
+            return;
         }
     }
 
@@ -543,8 +520,8 @@ async fn strategy_playback(socket: &mut WebSocket, session: &mut Session) {
         let strategy = session.strategy.clone();
         let session_id = session.session_id.clone();
 
-        // 后台生成音频帧
-        let gen_handle: tokio::task::JoinHandle<Result<(), String>> = tokio::spawn(async move {
+        // 后台生成音频帧（中断时由 playback_frames_stream 内的守卫自动取消）
+        let gen_handle = tokio::spawn(async move {
             strategy
                 .generate_response_stream(buffer, &session_id, frame_tx)
                 .await
@@ -594,6 +571,9 @@ async fn playback_frames_stream(
     mut frame_rx: tokio::sync::mpsc::Receiver<PlaybackEvent>,
     mut gen_handle: tokio::task::JoinHandle<Result<(), String>>,
 ) {
+    // 所有提前退出路径都会取消生成任务，避免播放被中断后 ASR/LLM/TTS 继续白跑
+    let mut cancel_on_drop = CancelGuard(Some(gen_handle.abort_handle()));
+
     session.state = SessionState::Playing;
 
     // ── Phase 1: 预缓冲 ─────────────────────────────────────────
@@ -639,6 +619,7 @@ async fn playback_frames_stream(
             }
             result = &mut gen_handle => {
                 gen_done = true;
+                cancel_on_drop.disarm();
                 match result {
                     Ok(Ok(())) => {
                         // 生成正常完成
@@ -753,8 +734,8 @@ async fn playback_frames_stream(
                                 }
 
                                 // 60ms 帧间隔 + 中断监听（与批处理模式一致）
-                                if interruptible_sleep(socket, session).await {
-                                    session.state = SessionState::Ready;
+                                if let Some(interrupt) = wait_frame_interrupt(socket).await {
+                                    handle_playback_interrupt(socket, session, interrupt).await;
                                     return;
                                 }
                             }
@@ -767,6 +748,7 @@ async fn playback_frames_stream(
             }
             result = &mut gen_handle, if !gen_done => {
                 gen_done = true;
+                cancel_on_drop.disarm();
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
@@ -794,9 +776,10 @@ async fn playback_frames_stream(
                         if socket.send(Message::Binary(encoded.into())).await.is_err() {
                             break;
                         }
-                        // 中断时 interruptible_sleep 已发送 TTS::Stop 并复位状态，
+                        // 中断时 handle_playback_interrupt 已发送 TTS::Stop 并复位状态，
                         // 直接返回避免重复下发 TTS::Stop。
-                        if interruptible_sleep(socket, session).await {
+                        if let Some(interrupt) = wait_frame_interrupt(socket).await {
+                            handle_playback_interrupt(socket, session, interrupt).await;
                             return;
                         }
                     }
@@ -867,42 +850,152 @@ async fn send_json(socket: &mut WebSocket, msg: &ServerMessage) -> Result<(), ()
     Ok(())
 }
 
+/// 播放期间设备发送的中断信号
+enum PlaybackInterrupt {
+    /// 连接关闭
+    Closed,
+    /// 收到 `Abort` 指令
+    Abort,
+    /// 收到 `Listen::Start` 指令（中断播放并开始新一轮录音）
+    ListenStart,
+}
+
 /// 等待 60ms 帧间隔，同时监听设备中断信号
 ///
-/// 返回 `true` 表示需要中断播放
-async fn interruptible_sleep(socket: &mut WebSocket, session: &mut Session) -> bool {
+/// 返回 `Some` 表示收到中断信号（此时本函数未改动会话状态，状态迁移
+/// 统一由 [`handle_playback_interrupt`] 完成）；返回 `None` 表示正常帧间隔
+/// 结束，继续播放。
+async fn wait_frame_interrupt(socket: &mut WebSocket) -> Option<PlaybackInterrupt> {
     tokio::select! {
         _ = tokio::time::sleep(Duration::from_millis(60)) => {
-            false // 正常等待，继续播放
+            None // 正常等待，继续播放
         }
-        msg = socket.recv() => {
-            match msg {
-                Some(Ok(Message::Text(text))) => {
-                    if let Ok(cmd) = serde_json::from_str::<ClientMessage>(&text) {
-                        if matches!(cmd, ClientMessage::Listen { state: ListenState::Start, .. } | ClientMessage::Abort) {
-                            tracing::debug!("Playback interrupted by client command");
-                            let _ = send_json(
-                                socket,
-                                &ServerMessage::Tts {
-                                    session_id: session.session_id.clone(),
-                                    state: TtsState::Stop,
-                                    text: None,
-                                },
-                            )
-                            .await;
-                            session.state = SessionState::Ready;
-                            return true;
+        msg = socket.recv() => match msg {
+            Some(Ok(Message::Text(text))) => {
+                if let Ok(cmd) = serde_json::from_str::<ClientMessage>(&text) {
+                    match cmd {
+                        ClientMessage::Abort => Some(PlaybackInterrupt::Abort),
+                        ClientMessage::Listen { state: ListenState::Start, .. } => {
+                            Some(PlaybackInterrupt::ListenStart)
                         }
+                        // 其他消息（如 Listen::Stop/Detect）忽略，继续等待下一帧间隔
+                        _ => None,
                     }
+                } else {
+                    None
                 }
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
-                    tracing::debug!("Connection closed during playback");
-                    session.state = SessionState::Ready;
-                    return true;
-                }
-                _ => {}
             }
-            false
+            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+                tracing::debug!("Connection closed during playback");
+                Some(PlaybackInterrupt::Closed)
+            }
+            _ => None,
+        },
+    }
+}
+
+/// 处理播放期间的中断信号，统一完成状态迁移并停止播放
+///
+/// - 连接关闭 / `Abort`：会话回到 `Ready`
+/// - `Listen::Start`：中断播放并进入新一轮录音（`Recording`），
+///   使设备随后发送的音频帧能被正常缓冲，避免对话在中断后静默失效
+async fn handle_playback_interrupt(
+    socket: &mut WebSocket,
+    session: &mut Session,
+    interrupt: PlaybackInterrupt,
+) {
+    // 无论何种中断，先停止播放并告知设备
+    let _ = send_json(
+        socket,
+        &ServerMessage::Tts {
+            session_id: session.session_id.clone(),
+            state: TtsState::Stop,
+            text: None,
+        },
+    )
+    .await;
+
+    match interrupt {
+        PlaybackInterrupt::ListenStart => {
+            tracing::debug!(
+                device_id = %session.device_id,
+                "Playback interrupted by Listen::Start, entering recording",
+            );
+            enter_recording(session).await;
         }
+        PlaybackInterrupt::Abort => {
+            tracing::debug!(
+                device_id = %session.device_id,
+                "Playback interrupted by Abort",
+            );
+            session.state = SessionState::Ready;
+        }
+        PlaybackInterrupt::Closed => {
+            session.state = SessionState::Ready;
+        }
+    }
+}
+
+/// 生成任务取消守卫：drop 时自动取消未完成的任务
+///
+/// 播放被中断（Abort / Listen::Start / 连接关闭）时，若生成任务仍在运行，
+/// 需要主动取消，避免 ASR/LLM/TTS 继续白跑。生成任务正常结束后通过
+/// [`disarm`](Self::disarm) 解除取消（已结束的任务 abort 也无害，但显式解除更清晰）。
+struct CancelGuard(Option<tokio::task::AbortHandle>);
+
+impl CancelGuard {
+    /// 生成任务已正常完成，解除取消守卫
+    fn disarm(&mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 测试
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::strategy::EchoStrategy;
+
+    fn make_session() -> Session {
+        Session {
+            device_id: "test-device".into(),
+            session_id: "test-session".into(),
+            audio_params: AudioParams::default(),
+            state: SessionState::Ready,
+            audio_buffer: vec![AudioFrame {
+                timestamp: 0,
+                data: vec![0x01, 0x02],
+            }],
+            cumulated_timestamp: 60,
+            recording_deadline: Some(Instant::now()),
+            strategy: Arc::new(EchoStrategy),
+        }
+    }
+
+    /// `enter_recording` 应重置录音上下文并切换到 `Recording` 状态
+    #[tokio::test]
+    async fn test_enter_recording_resets_and_enters_recording() {
+        let mut session = make_session();
+
+        enter_recording(&mut session).await;
+
+        assert_eq!(session.state, SessionState::Recording);
+        assert!(session.audio_buffer.is_empty(), "应清空缓冲的音频帧");
+        assert_eq!(session.cumulated_timestamp, 0, "应重置累计时间戳");
+        assert!(
+            session.recording_deadline.is_none(),
+            "应清除旧的录音截止时刻"
+        );
     }
 }
