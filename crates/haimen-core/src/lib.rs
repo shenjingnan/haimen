@@ -1,8 +1,12 @@
+pub mod provider;
+
 use std::pin::Pin;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::Stream;
+
+pub use provider::{AgentProvider, TextStream};
 
 /// 统一消息模型
 #[derive(Debug, Clone)]

@@ -10,8 +10,7 @@ use std::sync::{Arc, RwLock};
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::agents::claude_code::agent::ClaudeAgent;
-use crate::agents::codex::agent::CodexAgent;
+use crate::agents::registry::registry;
 use crate::config::settings::load_settings;
 use crate::connectors::dingtalk::channel::DingTalkChannel;
 use crate::connectors::github::GitHubConnector;
@@ -55,16 +54,14 @@ pub fn build_connectors(
 }
 
 /// 根据配置构建 Agent
+///
+/// 通过 [`crate::agents::registry::registry`] 按 `active_provider` 分发，
+/// 新增 Agent 无需改动此处。
 pub fn build_agent(
     config: &crate::config::settings::AppConfig,
 ) -> Result<Box<dyn AgentProvider>, String> {
     let agent_name = config.gateway.resolved_agent();
-
-    match agent_name.as_str() {
-        "claude-code" => Ok(Box::new(ClaudeAgent)),
-        "codex" => Ok(Box::new(CodexAgent)),
-        other => Err(format!("不支持的 AI Agent: {}", other)),
-    }
+    registry().build(&agent_name, &config.gateway)
 }
 
 /// 根据配置和环境变量构造 xiaozhi WebSocket 响应策略

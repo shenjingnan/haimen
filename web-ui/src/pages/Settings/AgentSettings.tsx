@@ -1,12 +1,17 @@
 import { useCallback, useEffect, useState } from 'react';
-import { getAgentSettings, updateAgentSettings, verifyAgentCredentials } from '@/api/agent';
+import {
+  getAgentProviders,
+  getAgentSettings,
+  updateAgentSettings,
+  verifyAgentCredentials,
+} from '@/api/agent';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { AGENT_PROVIDERS } from '@/data/agent-providers';
+import { AGENT_PROVIDERS, type ProviderInfo } from '@/data/agent-providers';
 
 function AgentSettingsPanel() {
   const [loading, setLoading] = useState(true);
@@ -20,6 +25,20 @@ function AgentSettingsPanel() {
   const [verifyResult, setVerifyResult] = useState<{ valid: boolean; message: string } | null>(
     null,
   );
+  // 提供商列表：后端注册表驱动，加载失败/未就绪时回退到静态列表
+  const [providers, setProviders] = useState<ProviderInfo[]>(AGENT_PROVIDERS);
+
+  /** 从后端拉取提供商列表，失败时静默回退到静态 AGENT_PROVIDERS（防白屏） */
+  const loadProviders = useCallback(async () => {
+    try {
+      const list = await getAgentProviders();
+      if (list.length > 0) {
+        setProviders(list);
+      }
+    } catch {
+      // 后端不可达时保留静态兜底
+    }
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -38,7 +57,8 @@ function AgentSettingsPanel() {
 
   useEffect(() => {
     load();
-  }, [load]);
+    loadProviders();
+  }, [load, loadProviders]);
 
   /** 重新加载 Agent 配置数据 */
   const reloadData = useCallback(async () => {
@@ -140,7 +160,7 @@ function AgentSettingsPanel() {
         <Tabs value={selectedTab} onValueChange={setSelectedTab} className="w-full">
           {/* Tab 栏 */}
           <TabsList>
-            {AGENT_PROVIDERS.map((p) => {
+            {providers.map((p) => {
               const isActive = p.id === activeProvider;
 
               return (
@@ -157,7 +177,7 @@ function AgentSettingsPanel() {
           </TabsList>
 
           {/* 每个服务商的配置面板 */}
-          {AGENT_PROVIDERS.map((p) => (
+          {providers.map((p) => (
             <TabsContent key={p.id} value={p.id} className="space-y-4 mt-4">
               {/* 服务商名称和状态 */}
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -222,8 +242,7 @@ export default function AgentSettings() {
       <div>
         <h1 className="text-2xl font-bold tracking-tight">Agent 配置</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          选择用于处理消息的 AI Agent。Claude Code 和 Codex 均使用本地安装的 CLI 工具，
-          无需额外配置凭证。
+          选择用于处理消息的 AI Agent。各 Agent 均使用本地安装的 CLI 工具， 无需额外配置凭证。
         </p>
       </div>
       <AgentSettingsPanel />

@@ -118,6 +118,8 @@ fn cmd_completion<W: std::io::Write>(shell: clap_complete::Shell, writer: &mut W
 }
 
 /// 根据 provider 名称构造 AgentProvider
+///
+/// 通过 [`crate::agents::registry`] 按名称分发，新增 Agent 无需改动此处。
 fn create_agent(
     provider: Option<String>,
 ) -> Result<Box<dyn crate::gateway::provider::AgentProvider>, String> {
@@ -131,12 +133,7 @@ fn create_agent(
         None => config.gateway.resolved_agent(),
     };
 
-    match agent_name.as_str() {
-        "claude-code" => Ok(Box::new(crate::agents::claude_code::agent::ClaudeAgent)),
-        "codex" => Ok(Box::new(crate::agents::codex::agent::CodexAgent)),
-        "mcp" => Err("MCP Agent 暂不支持直接调用".to_string()),
-        other => Err(format!("不支持的 AI Agent: {}", other)),
-    }
+    crate::agents::registry::registry().build(&agent_name, &config.gateway)
 }
 
 /// agent run 命令：单次调用 Agent
