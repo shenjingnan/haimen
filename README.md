@@ -27,6 +27,8 @@ curl -fsSL https://github.com/shenjingnan/haimen/releases/latest/download/haimen
 $r = Invoke-WebRequest https://github.com/shenjingnan/haimen/releases/latest/download/haimen-installer.ps1; iex $r.Content
 ```
 
+> Windows 二进制依赖 **Microsoft Visual C++ Redistributable**（大多数系统已内置），若运行时报缺少 `vcruntime140.dll`，请先安装 [VC++ 运行库](https://aka.ms/vs/17/release/vc_redist.x64.exe)。
+
 **国内用户（中国大陆）**：如果 GitHub 访问缓慢，可使用 Gitee 镜像安装
 
 ```bash

@@ -16,6 +16,12 @@ installers = ["shell", "powershell"]
 # 注：x86_64-pc-windows-msvc 会同时产出 Windows zip 与 haimen-installer.ps1；
 # Windows on ARM（aarch64-pc-windows-msvc）暂不支持，upgrade 会明确报错。
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# MSVC 目标是否静态链接 CRT。
+# 默认 true（cargo-dist 注入 +crt-static），但 libopus_sys 用 CMake 以 /MD（动态 CRT）
+# 编译 opus，其 .obj 引用 __imp_floor 等动态导入符号，静态 CRT 下无法解析，
+# 导致 LNK2001/LNK1120（见 .cargo/config.toml 注释）。设为 false 使用动态 CRT 保持一致。
+# 代价：Windows 二进制需目标机器安装 Microsoft Visual C++ Redistributable。
+msvc-crt-static = false
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Whether to install an updater program

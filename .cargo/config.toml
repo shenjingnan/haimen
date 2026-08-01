@@ -2,4 +2,6 @@
 # libopus_sys 的 cmake build 使用 /MD（动态 CRT）编译 Opus C 代码。
 # 如果使用 +crt-static，Rust 端使用静态 CRT，但 Opus 目标文件仍引用
 # __imp_floor 等动态 CRT 导入符号，导致 LNK2001/LNK1120 链接错误。
-# 不使用 +crt-static，与 libopus_sys 保持一致使用动态 CRT，通过 VC++ 运行时分发。
+# 已通过 dist-workspace.toml 的 `msvc-crt-static = false` 落地（不使用 +crt-static，
+# 与 libopus_sys 保持一致使用动态 CRT，通过 VC++ 运行时分发）。
+# 此段仅作诊断说明，不设置 rustflags，避免与构建期 RUSTFLAGS 冲突。
