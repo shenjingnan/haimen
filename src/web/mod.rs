@@ -83,6 +83,10 @@ pub async fn start(
         .route(
             "/api/v1/settings/agent/verify",
             axum::routing::post(api::agent_settings::verify_agent_credentials),
+        )
+        .route(
+            "/api/v1/agent/providers",
+            axum::routing::get(api::agent_settings::list_agent_providers),
         );
 
     let app = if let Some(state) = webhook_state {

@@ -7,6 +7,7 @@
 //!
 //! - `GET /api/v1/settings/agent` — 获取 Agent 配置（active_provider + providers）
 //! - `PUT /api/v1/settings/agent` — 更新 Agent 配置
+//! - `GET /api/v1/agent/providers` — 列出注册表中所有 Agent 提供商
 //! - `POST /api/v1/settings/agent/verify` — 验证指定 Agent CLI 是否可用
 
 use std::collections::HashMap;
@@ -108,13 +109,35 @@ pub async fn update_agent_settings(
     })))
 }
 
+/// `GET /api/v1/agent/providers`
+///
+/// 返回注册表中所有可用的 Agent 提供商（id + display_name）。
+/// 前端据此动态渲染提供商 Tab，新增 Agent 后无需改动前端。
+pub async fn list_agent_providers() -> Json<serde_json::Value> {
+    let providers: Vec<serde_json::Value> = crate::agents::registry::registry()
+        .list()
+        .into_iter()
+        .map(|info| {
+            serde_json::json!({
+                "id": info.id,
+                "display_name": info.display_name,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "success": true,
+        "data": { "providers": providers }
+    }))
+}
+
 /// `POST /api/v1/settings/agent/verify`
 ///
 /// 验证指定 Agent 提供商是否可用。
 ///
-/// 请求体包含 `provider` 字段：
-/// - `claude-code` — 检查 `claude --version`
-/// - `codex` — 检查 `codex --version`
+/// 请求体包含 `provider` 字段。统一通过注册表构造 Agent 并调用其
+/// `check_available()`（如 `claude --version` / `codex --version`），
+/// 新增 Agent 无需改动此处。
 pub async fn verify_agent_credentials(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
@@ -123,60 +146,27 @@ pub async fn verify_agent_credentials(
         .and_then(|v| v.as_str())
         .unwrap_or("claude-code");
 
-    match provider {
-        "claude-code" => {
-            let available = check_claude_available().await;
-            Ok(Json(serde_json::json!({
+    let cfg = load_config();
+    let agent = match crate::agents::registry::registry().build(provider, &cfg.gateway) {
+        Ok(agent) => agent,
+        Err(e) => {
+            return Ok(Json(serde_json::json!({
                 "success": true,
-                "data": {
-                    "valid": available,
-                    "message": if available {
-                        "Claude Code CLI 可用"
-                    } else {
-                        "Claude CLI 未安装或不可用，请执行: npm install -g @anthropic-ai/claude-code"
-                    }
-                }
-            })))
+                "data": { "valid": false, "message": e }
+            })));
         }
-        "codex" => {
-            let available = check_codex_available().await;
-            Ok(Json(serde_json::json!({
-                "success": true,
-                "data": {
-                    "valid": available,
-                    "message": if available {
-                        "Codex CLI 可用"
-                    } else {
-                        "Codex CLI 未安装或不可用，请执行: npm install -g @openai/codex"
-                    }
-                }
-            })))
-        }
-        _ => Ok(Json(serde_json::json!({
+    };
+
+    match agent.check_available().await {
+        Ok(()) => Ok(Json(serde_json::json!({
             "success": true,
-            "data": { "valid": false, "message": format!("暂不支持验证 {} 提供商", provider) }
+            "data": { "valid": true, "message": format!("{} CLI 可用", agent.name()) }
+        }))),
+        Err(e) => Ok(Json(serde_json::json!({
+            "success": true,
+            "data": { "valid": false, "message": e }
         }))),
     }
-}
-
-/// 检查 claude CLI 是否可用
-async fn check_claude_available() -> bool {
-    tokio::process::Command::new("claude")
-        .arg("--version")
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// 检查 codex CLI 是否可用
-async fn check_codex_available() -> bool {
-    tokio::process::Command::new("codex")
-        .arg("--version")
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
