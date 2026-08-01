@@ -29,13 +29,6 @@ export const TTS_PROVIDERS: ProviderInfo[] = [
     name: '火山引擎',
     fields: [
       {
-        key: 'resource_id',
-        label: '模型（resource_id）',
-        type: 'select',
-        placeholder: 'seed-tts-2.0',
-        options: ['seed-tts-2.0', 'seed-tts-1.0'],
-      },
-      {
         key: 'app_key',
         label: 'App Key',
         type: 'password',

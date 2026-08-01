@@ -73,36 +73,6 @@ fn doubao_voice_model(id: &str) -> &'static str {
     }
 }
 
-/// 从配置推导豆包当前模型（resource_id → cluster → 默认 2.0）
-///
-/// 与 `tts_factory` 中 `create_tts_provider` 的推导规则保持一致。
-fn doubao_model_from_config(cfg: &AppConfig) -> &'static str {
-    if let Some(rid) = cfg
-        .tts
-        .providers
-        .get("doubao")
-        .and_then(|p| p.get("resource_id"))
-        .filter(|s| !s.is_empty())
-    {
-        if rid == "seed-tts-1.0" {
-            return "seed-tts-1.0";
-        }
-        if rid == "seed-tts-2.0" {
-            return "seed-tts-2.0";
-        }
-    }
-    match cfg
-        .tts
-        .providers
-        .get("doubao")
-        .and_then(|p| p.get("cluster"))
-        .map(String::as_str)
-    {
-        Some("volcano_icl") => "seed-tts-1.0",
-        _ => "seed-tts-2.0",
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // ASR 端点
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -491,8 +461,9 @@ pub async fn update_tts_settings(
 /// 获取指定提供商的可用音色列表。通过 `?provider=doubao` 查询参数指定。
 /// 默认返回当前激活提供商的音色。
 ///
-/// 支持 `?provider=` 和 `?model=` 查询参数。豆包按模型过滤音色，
-/// 每个音色响应附带 `model` 字段；其他提供商的 `model` 参数被忽略。
+/// 支持 `?provider=` 和 `?model=` 查询参数。豆包每个音色响应附带 `model` 字段；
+/// 提供 `model` 参数时按模型过滤，缺省时返回全部音色（由前端按音色所属模型分组，
+/// 选择音色即自动确定模型）；其他提供商的 `model` 参数被忽略。
 pub async fn list_tts_voices(params: Query<HashMap<String, String>>) -> Json<serde_json::Value> {
     let cfg = load_config();
     let provider = params
@@ -504,12 +475,15 @@ pub async fn list_tts_voices(params: Query<HashMap<String, String>>) -> Json<ser
 
     let (voices, resp_model, is_doubao) = match provider {
         "doubao" => {
-            let target = model.unwrap_or_else(|| doubao_model_from_config(&cfg));
-            let list = univoice::tts::voices::doubao::list_voices()
-                .into_iter()
-                .filter(|v| doubao_voice_model(&v.id) == target)
-                .collect::<Vec<_>>();
-            (list, Some(target), true)
+            let list = univoice::tts::voices::doubao::list_voices();
+            let list = match model {
+                Some(m) => list
+                    .into_iter()
+                    .filter(|v| doubao_voice_model(&v.id) == m)
+                    .collect::<Vec<_>>(),
+                None => list,
+            };
+            (list, model, true)
         }
         "qwen" => (univoice::tts::voices::qwen3_tts::list_voices(), None, false),
         "glm" => (univoice::tts::voices::glm::list_voices(), None, false),
@@ -770,49 +744,5 @@ mod tests {
             doubao_voice_model("zh_male_xudong_conversation_wvae_bigtts"),
             "seed-tts-1.0"
         );
-    }
-
-    // ─── doubao_model_from_config 推导 ──────────────────────
-
-    fn make_doubao_cfg(resource_id: Option<&str>, cluster: Option<&str>) -> AppConfig {
-        let mut creds = HashMap::new();
-        if let Some(r) = resource_id {
-            creds.insert("resource_id".to_string(), r.to_string());
-        }
-        if let Some(c) = cluster {
-            creds.insert("cluster".to_string(), c.to_string());
-        }
-        let mut providers = HashMap::new();
-        providers.insert("doubao".to_string(), creds);
-        AppConfig {
-            tts: TtsConfig {
-                active_provider: "doubao".to_string(),
-                providers,
-                fixed_text_enabled: false,
-                fixed_text: None,
-            },
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn test_doubao_model_from_config_resource_id_priority() {
-        let cfg = make_doubao_cfg(Some("seed-tts-1.0"), Some("volcano_icl"));
-        assert_eq!(doubao_model_from_config(&cfg), "seed-tts-1.0");
-
-        let cfg = make_doubao_cfg(Some("seed-tts-2.0"), Some("volcano_icl"));
-        assert_eq!(doubao_model_from_config(&cfg), "seed-tts-2.0");
-    }
-
-    #[test]
-    fn test_doubao_model_from_config_cluster_fallback() {
-        let cfg = make_doubao_cfg(None, Some("volcano_icl"));
-        assert_eq!(doubao_model_from_config(&cfg), "seed-tts-1.0");
-
-        let cfg = make_doubao_cfg(None, None);
-        assert_eq!(doubao_model_from_config(&cfg), "seed-tts-2.0");
-
-        let cfg = make_doubao_cfg(None, Some("other_cluster"));
-        assert_eq!(doubao_model_from_config(&cfg), "seed-tts-2.0");
     }
 }

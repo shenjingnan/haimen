@@ -1,5 +1,5 @@
 import { Eye, EyeOff } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   getAsrSettings,
   getTtsSettings,
@@ -336,36 +336,21 @@ function TtsSettingsPanel() {
     load();
   }, [load]);
 
-  // 当前 Tab 的模型选择（豆包的 resource_id；其他提供商无则 undefined）
-  const currentModel = editState[selectedTab]?.resource_id || undefined;
-
-  // 保持 editState 最新引用供音色 effect 读取（避免 exhaustive-deps 告警）
-  const editStateRef = useRef(editState);
-  useEffect(() => {
-    editStateRef.current = editState;
-  }, [editState]);
-
-  // 切换 Tab 或模型变化时，加载对应提供商（及模型）的音色；
-  // 若已选音色不属于新列表则自动清空，避免模型与音色不匹配触发 55000000
+  // 切换 Tab 时加载对应提供商的音色。
+  // 豆包返回全部音色（VoiceSelector 按所属模型分组展示），
+  // 选择音色时自动设置对应的 resource_id，无需用户手动切换模型。
   useEffect(() => {
     let cancelled = false;
-    listTtsVoices(selectedTab, currentModel)
+    listTtsVoices(selectedTab)
       .then((list) => {
         if (cancelled) return;
         setVoices(list);
-        const currentVoice = editStateRef.current[selectedTab]?.voice;
-        if (currentVoice && !list.some((v) => v.id === currentVoice)) {
-          setEditState((prev) => ({
-            ...prev,
-            [selectedTab]: { ...(prev[selectedTab] ?? {}), voice: '' },
-          }));
-        }
       })
       .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [selectedTab, currentModel]);
+  }, [selectedTab]);
 
   const handleFieldChange = (key: string, value: string) => {
     setEditState((prev) => ({
@@ -557,7 +542,14 @@ function TtsSettingsPanel() {
                     <VoiceSelector
                       voices={voices}
                       selectedVoice={editState[p.id]?.voice ?? null}
-                      onChange={(voiceId) => handleFieldChange('voice', voiceId)}
+                      onChange={(voiceId) => {
+                        handleFieldChange('voice', voiceId);
+                        // 音色决定模型：选择音色时自动把 resource_id 设为该音色所属模型
+                        const voice = voices.find((v) => v.id === voiceId);
+                        if (voice?.model) {
+                          handleFieldChange('resource_id', voice.model);
+                        }
+                      }}
                     />
                   </div>
                 </div>
