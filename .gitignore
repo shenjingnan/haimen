@@ -1,9 +1,9 @@
 /target
 
-# Web UI 前端构建产物（由 build.rs 在 cargo build 时自动生成）
-# 只忽略构建产物文件，但保留占位 index.html 用于 crates.io 发布
-/web-ui/dist/*
-!/web-ui/dist/index.html
+# Web UI 前端构建产物（web-ui/dist/）已提交入库：
+#  - crates.io 包直接嵌入提交的产物，cargo install 无需 Node
+#  - 前端源码变更后需重新构建并提交 dist（ci.yml 会校验 dist 新鲜度）
+#  - web-ui/.gitignore 仍负责忽略 node_modules/.vite 等
 
 # Coverage
 /coverage

@@ -3,10 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
-    paths: ['Cargo.toml', 'Cargo.lock', 'src/**/*.rs', 'tests/**']
+    paths: ['Cargo.toml', 'Cargo.lock', 'src/**/*.rs', 'tests/**', 'web-ui/**', 'build.rs']
   pull_request:
     branches: [main]
-    paths: ['Cargo.toml', 'Cargo.lock', 'src/**/*.rs', 'tests/**']
+    paths: ['Cargo.toml', 'Cargo.lock', 'src/**/*.rs', 'tests/**', 'web-ui/**', 'build.rs']
 
 env:
   CARGO_TERM_COLOR: always
@@ -29,6 +29,19 @@ jobs:
       - name: Ensure components for project toolchain
         run: rustup component add rustfmt clippy
 
+      # build.rs 会在 cargo build 时构建前端，必须提供 Node + pnpm
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.5.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: web-ui/pnpm-lock.yaml
+
       - name: Format check
         run: cargo fmt --check
 
@@ -48,6 +61,18 @@ jobs:
 
       - name: Build
         run: cargo build
+
+      # 校验提交的 dist 与源码一致（crates.io 通道依赖入库产物）
+      - name: Verify committed dist is fresh
+        run: |
+          cd web-ui && pnpm install --frozen-lockfile && pnpm build
+          git diff --exit-code -- dist || {
+            echo "::error::web-ui/dist 与源码不一致，请先运行 pnpm build 并提交 dist"
+            exit 1
+          }
+
+      # 前端产物嵌入完整性由上方 Tests 步骤中的 web_assets_are_embedded 测试校验
+      # （勿用 strings 断言：debug 二进制下 rust-embed 内容不可被 strings 搜索）
 
       - name: Install cargo-tarpaulin
         uses: taiki-e/install-action@v2
@@ -76,6 +101,19 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      # build.rs 会在 cargo test 时构建前端，必须提供 Node + pnpm
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.5.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: web-ui/pnpm-lock.yaml
 
       - name: Tests
         run: cargo test -- --test-threads=1

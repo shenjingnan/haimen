@@ -2,6 +2,9 @@
 members = ["cargo:."]
 
 # Config for 'dist'
+# 注：Web 前端由 build.rs 在 cargo 编译期构建（pnpm → corepack → npx 回退），
+# 发布 runner 需要 Node >= 22.12（Vite 8 要求）；构建失败时 build.rs 会让发布失败，
+# 避免发布未嵌入前端产物的损坏二进制。
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.32.0"
