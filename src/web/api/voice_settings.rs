@@ -55,6 +55,55 @@ fn load_config() -> AppConfig {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// 豆包 TTS 模型 / 音色分类
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 依据豆包音色 ID 后缀判断所属模型（火山引擎命名约定）
+///
+/// 2.0 线音色后缀为 `_uranus_bigtts` / `_jupiter_bigtts`，以及 `saturn_*_tob`；
+/// 其余（`_moon_bigtts` / `_mars_bigtts` / `_emo_*` / `_conversation_*` 等）为 1.0 线。
+fn doubao_voice_model(id: &str) -> &'static str {
+    if id.ends_with("_uranus_bigtts")
+        || id.ends_with("_jupiter_bigtts")
+        || id.starts_with("saturn_")
+    {
+        "seed-tts-2.0"
+    } else {
+        "seed-tts-1.0"
+    }
+}
+
+/// 从配置推导豆包当前模型（resource_id → cluster → 默认 2.0）
+///
+/// 与 `tts_factory` 中 `create_tts_provider` 的推导规则保持一致。
+fn doubao_model_from_config(cfg: &AppConfig) -> &'static str {
+    if let Some(rid) = cfg
+        .tts
+        .providers
+        .get("doubao")
+        .and_then(|p| p.get("resource_id"))
+        .filter(|s| !s.is_empty())
+    {
+        if rid == "seed-tts-1.0" {
+            return "seed-tts-1.0";
+        }
+        if rid == "seed-tts-2.0" {
+            return "seed-tts-2.0";
+        }
+    }
+    match cfg
+        .tts
+        .providers
+        .get("doubao")
+        .and_then(|p| p.get("cluster"))
+        .map(String::as_str)
+    {
+        Some("volcano_icl") => "seed-tts-1.0",
+        _ => "seed-tts-2.0",
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // ASR 端点
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -285,7 +334,15 @@ async fn verify_doubao(
             )
         })?;
 
-    match verify_doubao_token(app_key, access_key).await {
+    // ASR 侧仅验证 token 有效性，使用默认 TTS 资源与音色
+    match verify_doubao_token(
+        app_key,
+        access_key,
+        "seed-tts-2.0",
+        "zh_female_xiaohe_uranus_bigtts",
+    )
+    .await
+    {
         Ok(()) => Ok(Json(serde_json::json!({
             "success": true,
             "data": { "valid": true, "message": "凭证验证成功" }
@@ -298,19 +355,24 @@ async fn verify_doubao(
 }
 
 /// 用提供的凭证调用 Doubao TTS 合成测试音频验证有效性
-async fn verify_doubao_token(app_key: &str, access_token: &str) -> Result<(), String> {
+async fn verify_doubao_token(
+    app_key: &str,
+    access_token: &str,
+    resource_id: &str,
+    voice: &str,
+) -> Result<(), String> {
     use univoice::tts::provider::{DoubaoTts, DoubaoTtsOption};
-    use univoice::tts::{BaseTtsOption, TtsProvider, TtsRequest};
+    use univoice::tts::{BaseTtsOption, TtsProvider, TtsRequest, VoiceId};
 
     let tts = DoubaoTts::new(DoubaoTtsOption {
         base: BaseTtsOption {
             format: Some("pcm".into()),
-            voice: Some("zh_female_xiaohe_uranus_bigtts".into()),
+            voice: Some(VoiceId::from(voice)),
             ..Default::default()
         },
         app_id: Some(app_key.to_string()),
         access_token: Some(access_token.to_string()),
-        resource_id: Some("seed-tts-2.0".into()),
+        resource_id: Some(resource_id.to_string()),
         ..Default::default()
     });
 
@@ -428,6 +490,9 @@ pub async fn update_tts_settings(
 ///
 /// 获取指定提供商的可用音色列表。通过 `?provider=doubao` 查询参数指定。
 /// 默认返回当前激活提供商的音色。
+///
+/// 支持 `?provider=` 和 `?model=` 查询参数。豆包按模型过滤音色，
+/// 每个音色响应附带 `model` 字段；其他提供商的 `model` 参数被忽略。
 pub async fn list_tts_voices(params: Query<HashMap<String, String>>) -> Json<serde_json::Value> {
     let cfg = load_config();
     let provider = params
@@ -435,24 +500,40 @@ pub async fn list_tts_voices(params: Query<HashMap<String, String>>) -> Json<ser
         .map(String::as_str)
         .unwrap_or_else(|| cfg.tts.active_provider.as_str());
 
-    let voices = match provider {
-        "doubao" => univoice::tts::voices::doubao::list_voices(),
-        "qwen" => univoice::tts::voices::qwen3_tts::list_voices(),
-        "glm" => univoice::tts::voices::glm::list_voices(),
-        "minimax" => univoice::tts::voices::minimax::list_voices(),
-        "qwen_realtime" => univoice::tts::voices::qwen3_tts::list_voices(),
-        _ => Vec::new(),
+    let model = params.get("model").map(String::as_str);
+
+    let (voices, resp_model, is_doubao) = match provider {
+        "doubao" => {
+            let target = model.unwrap_or_else(|| doubao_model_from_config(&cfg));
+            let list = univoice::tts::voices::doubao::list_voices()
+                .into_iter()
+                .filter(|v| doubao_voice_model(&v.id) == target)
+                .collect::<Vec<_>>();
+            (list, Some(target), true)
+        }
+        "qwen" => (univoice::tts::voices::qwen3_tts::list_voices(), None, false),
+        "glm" => (univoice::tts::voices::glm::list_voices(), None, false),
+        "minimax" => (univoice::tts::voices::minimax::list_voices(), None, false),
+        "qwen_realtime" => (univoice::tts::voices::qwen3_tts::list_voices(), None, false),
+        _ => (Vec::new(), None, false),
     };
 
     Json(serde_json::json!({
         "success": true,
         "data": {
             "provider": provider,
-            "voices": voices.iter().map(|v| serde_json::json!({
-                "id": v.id,
-                "name": v.name,
-                "language": v.language,
-            })).collect::<Vec<_>>(),
+            "model": resp_model,
+            "voices": voices.iter().map(|v| {
+                let mut obj = serde_json::json!({
+                    "id": v.id,
+                    "name": v.name,
+                    "language": v.language,
+                });
+                if is_doubao {
+                    obj["model"] = serde_json::json!(doubao_voice_model(&v.id));
+                }
+                obj
+            }).collect::<Vec<_>>(),
         }
     }))
 }
@@ -573,8 +654,20 @@ async fn verify_tts_doubao(
                 })),
             )
         })?;
+    // 用表单里配置的模型（resource_id）与音色做真实合成验证，
+    // 避免硬编码 2.0 导致「验证通过但实际合成 55000000」的假通过。
+    let resource_id = body
+        .get("resource_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("seed-tts-2.0");
+    let voice = body
+        .get("voice")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("zh_female_xiaohe_uranus_bigtts");
 
-    match verify_doubao_token(app_key, access_token).await {
+    match verify_doubao_token(app_key, access_token, resource_id, voice).await {
         Ok(()) => Ok(Json(serde_json::json!({
             "success": true,
             "data": { "valid": true, "message": "凭证验证成功" }
@@ -639,5 +732,87 @@ mod tests {
     fn test_parse_providers_missing() {
         let json = serde_json::json!({"other": "value"});
         assert!(parse_providers(&json).is_none());
+    }
+
+    // ─── doubao_voice_model 分类器 ──────────────────────────
+
+    #[test]
+    fn test_doubao_voice_model_2_0_suffixes() {
+        assert_eq!(
+            doubao_voice_model("zh_female_xiaohe_uranus_bigtts"),
+            "seed-tts-2.0"
+        );
+        assert_eq!(
+            doubao_voice_model("zh_female_vv_jupiter_bigtts"),
+            "seed-tts-2.0"
+        );
+        assert_eq!(
+            doubao_voice_model("saturn_zh_female_keainvsheng_tob"),
+            "seed-tts-2.0"
+        );
+    }
+
+    #[test]
+    fn test_doubao_voice_model_1_0_suffixes() {
+        assert_eq!(
+            doubao_voice_model("zh_female_wanwanxiaohe_moon_bigtts"),
+            "seed-tts-1.0"
+        );
+        assert_eq!(
+            doubao_voice_model("zh_male_zhubajie_mars_bigtts"),
+            "seed-tts-1.0"
+        );
+        assert_eq!(
+            doubao_voice_model("zh_male_lengkugege_emo_v2_mars_bigtts"),
+            "seed-tts-1.0"
+        );
+        assert_eq!(
+            doubao_voice_model("zh_male_xudong_conversation_wvae_bigtts"),
+            "seed-tts-1.0"
+        );
+    }
+
+    // ─── doubao_model_from_config 推导 ──────────────────────
+
+    fn make_doubao_cfg(resource_id: Option<&str>, cluster: Option<&str>) -> AppConfig {
+        let mut creds = HashMap::new();
+        if let Some(r) = resource_id {
+            creds.insert("resource_id".to_string(), r.to_string());
+        }
+        if let Some(c) = cluster {
+            creds.insert("cluster".to_string(), c.to_string());
+        }
+        let mut providers = HashMap::new();
+        providers.insert("doubao".to_string(), creds);
+        AppConfig {
+            tts: TtsConfig {
+                active_provider: "doubao".to_string(),
+                providers,
+                fixed_text_enabled: false,
+                fixed_text: None,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_doubao_model_from_config_resource_id_priority() {
+        let cfg = make_doubao_cfg(Some("seed-tts-1.0"), Some("volcano_icl"));
+        assert_eq!(doubao_model_from_config(&cfg), "seed-tts-1.0");
+
+        let cfg = make_doubao_cfg(Some("seed-tts-2.0"), Some("volcano_icl"));
+        assert_eq!(doubao_model_from_config(&cfg), "seed-tts-2.0");
+    }
+
+    #[test]
+    fn test_doubao_model_from_config_cluster_fallback() {
+        let cfg = make_doubao_cfg(None, Some("volcano_icl"));
+        assert_eq!(doubao_model_from_config(&cfg), "seed-tts-1.0");
+
+        let cfg = make_doubao_cfg(None, None);
+        assert_eq!(doubao_model_from_config(&cfg), "seed-tts-2.0");
+
+        let cfg = make_doubao_cfg(None, Some("other_cluster"));
+        assert_eq!(doubao_model_from_config(&cfg), "seed-tts-2.0");
     }
 }

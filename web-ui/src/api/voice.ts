@@ -59,10 +59,13 @@ export async function updateTtsSettings(settings: {
   return ensureData(res);
 }
 
-export async function listTtsVoices(provider?: string): Promise<TtsVoice[]> {
-  const query = provider ? `?provider=${encodeURIComponent(provider)}` : '';
+export async function listTtsVoices(provider?: string, model?: string): Promise<TtsVoice[]> {
+  const params = new URLSearchParams();
+  if (provider) params.set('provider', provider);
+  if (model) params.set('model', model);
+  const qs = params.toString();
   const res = await apiFetch<ApiResponse<{ provider: string; voices: TtsVoice[] }>>(
-    `/api/v1/settings/tts/voices${query}`,
+    `/api/v1/settings/tts/voices${qs ? `?${qs}` : ''}`,
   );
   return ensureData(res).voices;
 }
