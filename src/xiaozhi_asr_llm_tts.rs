@@ -97,6 +97,307 @@ fn take_sentence(buf: &mut String) -> Option<String> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// TTS 文本聚合与 markdown 清洗
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 清洗后残句超过该字符数（chars 计数）即强制整块发出，避免长句无限滞留
+const TTS_AGGREGATE_THRESHOLD: usize = 180;
+
+/// 定时 flush 周期：保证 doubao 会话存活 + 有增量音频。
+///
+/// 服务端约 25.8s 闲置回收会话，6s 远低于该值；同时避免残句长时间滞留。
+const TTS_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// 首个可播文本块的等待上限（与批处理路径 LLM 超时口径一致）。
+/// 超过该时长（模型思考/调用工具过久）则播放 fallback 提示音，避免设备静默。
+const TTS_FIRST_TEXT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 聚合文本通道容量（有界，提供背压）
+const TTS_AGG_CHANNEL_CAPACITY: usize = 16;
+
+/// 从 markdown 中提取一段可作为 TTS 输入纯文本。
+///
+/// 逐块纯函数（不跨块维护状态）：只针对 ASCII markdown 符号，
+/// 不触碰中文标点与普通文本；`.`, `+`（C++）、行内 `-`（well-known）均不受影响。
+fn clean_markdown_for_tts(raw: &str) -> String {
+    let mut out = String::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        // 代码围栏定界行整体删除（正文保留，读出来比静音好）
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            continue;
+        }
+        // 整行分隔线删除
+        if is_horizontal_rule(trimmed) {
+            continue;
+        }
+        let mut body = line.trim_start();
+        // 引用：`> ` 行首剥离
+        if let Some(rest) = body.strip_prefix('>') {
+            body = rest.trim_start();
+        }
+        // 标题：行首 1-6 个 `#` + 空白剥离
+        let hash_len = body.chars().take_while(|&c| c == '#').count();
+        if hash_len > 0
+            && hash_len <= 6
+            && body[hash_len..]
+                .chars()
+                .next()
+                .is_some_and(|c| c == ' ' || c == '\t')
+        {
+            body = body[hash_len..].trim_start();
+        }
+        // 列表标记（仅行首；正文 `C++` / `well-known` 不动）
+        body = strip_list_marker(body);
+        // 行内清洗：链接/反引号/强调/转义
+        let cleaned = clean_inline_markdown(body);
+        if !cleaned.trim().is_empty() {
+            out.push_str(&cleaned);
+            out.push('\n');
+        }
+    }
+    // 折叠连续换行并 trim 首尾
+    let mut result = String::with_capacity(out.len());
+    let mut prev_newline = false;
+    for ch in out.chars() {
+        if ch == '\n' {
+            if !prev_newline {
+                result.push(ch);
+            }
+            prev_newline = true;
+        } else {
+            result.push(ch);
+            prev_newline = false;
+        }
+    }
+    result.trim().to_string()
+}
+
+/// 判断是否为整行水平分隔线（仅由 3+ 个相同 `-`/`*`/`_` 组成）
+fn is_horizontal_rule(trimmed: &str) -> bool {
+    let mut chars = trimmed.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !matches!(first, '-' | '*' | '_') {
+        return false;
+    }
+    let mut count = 1;
+    for c in chars {
+        if c != first {
+            return false;
+        }
+        count += 1;
+    }
+    count >= 3
+}
+
+/// 剥离行首列表标记：`- ` / `* ` / `+ ` / `1. ` / `1) `
+fn strip_list_marker(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    for prefix in ["- ", "* ", "+ "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return rest.trim_start();
+        }
+    }
+    // 有序列表：数字 + `.` / `)` + 空白
+    let bytes = trimmed.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    if idx > 0 && idx < bytes.len() && (bytes[idx] == b'.' || bytes[idx] == b')') {
+        let after = &trimmed[idx + 1..];
+        if after.is_empty() || after.starts_with(' ') {
+            return after.trim_start();
+        }
+    }
+    line
+}
+
+/// 行内 markdown 清洗：链接/图片、反引号、强调/删除线、转义还原
+fn clean_inline_markdown(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                // 转义还原：\X -> X
+                if i + 1 < chars.len() {
+                    out.push(chars[i + 1]);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            '!' if i + 1 < chars.len() && chars[i + 1] == '[' => {
+                // 图片 ![alt](url) -> alt
+                if let Some((alt, consumed)) = try_extract_link(&chars, i + 1) {
+                    out.push_str(&alt);
+                    i = consumed;
+                } else {
+                    out.push('!');
+                    i += 1;
+                }
+            }
+            '[' => {
+                // 链接 [label](url) -> label
+                if let Some((label, consumed)) = try_extract_link(&chars, i) {
+                    out.push_str(&label);
+                    i = consumed;
+                } else {
+                    out.push('[');
+                    i += 1;
+                }
+            }
+            // 强调/删除线/反引号标记：直接丢弃符号，保留内容
+            '*' | '~' | '_' | '`' => i += 1,
+            _ => {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// 尝试从 `chars[open_bracket] == '['` 处提取 `[label](url)`，返回 (清洗后 label, 消费后的下标)
+fn try_extract_link(chars: &[char], open_bracket: usize) -> Option<(String, usize)> {
+    let close = chars[open_bracket..].iter().position(|&c| c == ']')? + open_bracket;
+    if close + 1 >= chars.len() || chars[close + 1] != '(' {
+        return None;
+    }
+    let close_paren = chars[close + 1..].iter().position(|&c| c == ')')? + close + 1;
+    let label: String = chars[open_bracket + 1..close].iter().collect();
+    let cleaned = clean_inline_markdown(&label);
+    Some((cleaned, close_paren + 1))
+}
+
+/// 同步聚合器：跨 chunk 聚句 + 阈值强发 + 残句 flush（纯同步，可单测）
+struct TtsTextAggregator {
+    raw_buf: String,
+    threshold: usize,
+    emitted_first: bool,
+}
+
+impl TtsTextAggregator {
+    fn new(threshold: usize) -> Self {
+        Self {
+            raw_buf: String::new(),
+            threshold,
+            emitted_first: false,
+        }
+    }
+
+    /// 追加一段 LLM delta，返回本次应发射的清洗后文本块（0..N 个）
+    fn push(&mut self, delta: &str) -> Vec<String> {
+        self.raw_buf.push_str(delta);
+        let mut blocks = Vec::new();
+
+        // 切出完整句（take_sentence 消费掉含结尾标点，空残句天然被过滤）
+        while let Some(s) = take_sentence(&mut self.raw_buf) {
+            let cleaned = clean_markdown_for_tts(&s);
+            if !cleaned.is_empty() {
+                blocks.push(cleaned);
+                self.emitted_first = true;
+            }
+        }
+
+        // 首块优化：尚无任何输出且已有文本，立即整块发出，
+        // 避免无标点长句把首个音频拖到定时周期（TTS 会话可尽快建立）
+        if !self.emitted_first {
+            if let Some(block) = self.flush_partial() {
+                blocks.push(block);
+            }
+            return blocks;
+        }
+
+        // 残句达到阈值强发，避免长句无限滞留
+        if self.raw_buf.chars().count() >= self.threshold {
+            if let Some(block) = self.flush_partial() {
+                blocks.push(block);
+            }
+        }
+        blocks
+    }
+
+    /// 残句（未闭合标点的缓冲文本）整块强发
+    fn flush_partial(&mut self) -> Option<String> {
+        let partial = std::mem::take(&mut self.raw_buf);
+        let trimmed = partial.trim().to_string();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let cleaned = clean_markdown_for_tts(&trimmed);
+        if cleaned.is_empty() {
+            return None;
+        }
+        self.emitted_first = true;
+        Some(cleaned)
+    }
+
+    /// 上游结束：发掉剩余残句
+    fn finish(&mut self) -> Option<String> {
+        self.flush_partial()
+    }
+}
+
+/// 聚合后台任务：清洗 + 按句/阈值/定时把块送入 agg_tx，并累计清洗全文（供零音频兜底重试）
+async fn tts_aggregate_task(
+    mut input: Box<dyn futures_util::Stream<Item = String> + Unpin + Send>,
+    agg_tx: mpsc::Sender<String>,
+    cleaned_full: Arc<Mutex<String>>,
+) {
+    let mut agg = TtsTextAggregator::new(TTS_AGGREGATE_THRESHOLD);
+    let mut interval = tokio::time::interval(TTS_FLUSH_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let _ = interval.tick().await; // 跳过首 tick
+
+    loop {
+        tokio::select! {
+            chunk = input.next() => {
+                match chunk {
+                    Some(delta) => {
+                        for block in agg.push(&delta) {
+                            if !emit_block(&agg_tx, &cleaned_full, block).await {
+                                return;
+                            }
+                        }
+                    }
+                    None => {
+                        if let Some(block) = agg.finish() {
+                            let _ = emit_block(&agg_tx, &cleaned_full, block).await;
+                        }
+                        return;
+                    }
+                }
+            }
+            _ = interval.tick() => {
+                if let Some(block) = agg.flush_partial() {
+                    if !emit_block(&agg_tx, &cleaned_full, block).await {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 单块发射：累计到 cleaned_full，并尝试送入 agg_tx；返回 false 表示接收端已关（任务应退出）
+async fn emit_block(
+    agg_tx: &mpsc::Sender<String>,
+    cleaned_full: &Arc<Mutex<String>>,
+    block: String,
+) -> bool {
+    if let Ok(mut f) = cleaned_full.lock() {
+        f.push_str(&block);
+        f.push('\n');
+    }
+    agg_tx.send(block).await.is_ok()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // 流式 ASR 管道状态
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1042,46 +1343,116 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             }));
 
         // ════════════════════════════════════════════════════════════════
-        // Phase 3: 流式 TTS 合成 → Opus 编码 → 逐帧发送
+        // Phase 3: 文本聚合 → 延迟建会话 → 流式 TTS 合成 → 逐帧发送
         // ════════════════════════════════════════════════════════════════
+        //
+        // 关键修复：不再立即建立 TTS 会话。模型（如 deepseek 系）会先输出思考块
+        // （thinking_delta，agent 解析时已过滤），可能持续数十秒无任何文本；若此时
+        // 已建立 doubao 会话，会话空转会被服务端闲置回收（实测 ~25.8s），文本到达
+        // 时零音频。因此这里先把文本聚合清洗，拿到第一个可播文本块后才 speak_stream。
 
-        // 从共享配置读取最新 TTS 配置，叠加 CLI 音色覆盖
-        // 如果 TTS 提供者创建或 speak_stream 启动失败，播放内置「失败，请重试」提示音
-        let mut audio_stream = match async {
+        // ── Phase 3a: 启动文本聚合任务（清洗 markdown + 按句聚合）──────
+        let (agg_tx, mut agg_rx) = mpsc::channel::<String>(TTS_AGG_CHANNEL_CAPACITY);
+        let cleaned_full: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let agg_cleaned_full = cleaned_full.clone();
+        let agg_handle = tokio::spawn(tts_aggregate_task(text_stream, agg_tx, agg_cleaned_full));
+
+        // ── Phase 3b: 拉取第一个可播文本块（此时才建立 TTS 会话）──────
+        let first = match tokio::time::timeout(TTS_FIRST_TEXT_TIMEOUT, agg_rx.recv()).await {
+            Ok(Some(first)) => first,
+            Ok(None) => {
+                // 聚合器结束且无文本：属正常空回复，排空屏幕事件后返回
+                agg_handle.abort();
+                let _ = agg_handle.await;
+                drop(text_evt_tx);
+                drain_screen_events(&mut text_evt_rx, &residual_shared, &frame_tx, session_id)
+                    .await?;
+                return Ok(());
+            }
+            Err(_) => {
+                // 首个文本超时（模型思考/调用工具过久）：播 fallback 提示音，避免设备静默
+                tracing::warn!(
+                    session_id = %session_id,
+                    timeout_s = TTS_FIRST_TEXT_TIMEOUT.as_secs(),
+                    "TTS-STREAM: 等待首个可播文本超时，播放 fallback 提示音",
+                );
+                agg_handle.abort();
+                let _ = agg_handle.await;
+                drop(text_evt_tx);
+                send_fallback_audio(&frame_tx, session_id).await?;
+                drain_screen_events(&mut text_evt_rx, &residual_shared, &frame_tx, session_id)
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        tracing::info!(
+            session_id = %session_id,
+            first_len = first.chars().count(),
+            "TTS-STREAM: 首个可播文本就绪，建立 TTS 会话",
+        );
+
+        // ── Phase 3c: 创建 TTS 提供者（失败 → fallback 提示音）─────────
+        // provider 提出来跨 .await 存活（Send + Sync），供零音频兜底重试复用。
+        let provider = match (async {
             // 在单独的块中获取并释放 TTS 配置锁，避免 RwLockReadGuard 跨越 .await
-            let provider = {
-                let cfg = self.tts_config.read().unwrap();
-                let mut work_cfg = cfg.clone();
-                if let Some(ref voice) = self.voice_override {
-                    work_cfg
-                        .providers
-                        .entry(work_cfg.active_provider.clone())
-                        .or_default()
-                        .insert("voice".to_string(), voice.clone());
-                }
-                crate::tts_factory::create_tts_provider(&work_cfg)? // cfg 在此处释放
-            };
-            let stream = provider
-                .speak_stream(Box::pin(text_stream))
-                .await
-                .map_err(|e| format!("流式 TTS 启动失败: {}", e))?;
-            Ok::<_, String>(stream)
-        }
+            let cfg = self.tts_config.read().unwrap();
+            let mut work_cfg = cfg.clone();
+            if let Some(ref voice) = self.voice_override {
+                work_cfg
+                    .providers
+                    .entry(work_cfg.active_provider.clone())
+                    .or_default()
+                    .insert("voice".to_string(), voice.clone());
+            }
+            crate::tts_factory::create_tts_provider(&work_cfg) // cfg 在此处释放
+        })
         .await
         {
-            Ok(stream) => stream,
+            Ok(p) => p,
             Err(e) => {
                 tracing::warn!(
                     session_id = %session_id,
                     error = %e,
                     "TTS 提供者创建失败，播放 fallback 提示音",
                 );
+                agg_handle.abort();
+                let _ = agg_handle.await;
+                drop(text_evt_tx);
                 send_fallback_audio(&frame_tx, session_id).await?;
+                drain_screen_events(&mut text_evt_rx, &residual_shared, &frame_tx, session_id)
+                    .await?;
                 return Ok(());
             }
         };
 
-        // ── Phase 3a: 流式 Opus 编码 + 即时下发 ────────────────────
+        // ── Phase 3d: 重建文本流：once(first).chain(rest) ─────────────
+        // first 已就绪，会话建立后 send task 立即发出第一个 TaskRequest，无闲置窗口。
+        let rest = ReceiverStream::new(agg_rx);
+        let tts_text_stream: Box<dyn futures_util::Stream<Item = String> + Unpin + Send> =
+            Box::new(stream::iter(vec![first]).chain(rest));
+
+        // ── Phase 3e: 流式 TTS 合成 ───────────────────────────────────
+        let mut audio_stream = match provider.speak_stream(Box::pin(tts_text_stream)).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "流式 TTS 启动失败，播放 fallback 提示音",
+                );
+                // speak_stream 失败时其内部已 drop 输入流，聚合器随后自然退出；
+                // await 确保 text_evt_tx2 已 drop，再排空屏幕事件
+                let _ = agg_handle.await;
+                drop(text_evt_tx);
+                send_fallback_audio(&frame_tx, session_id).await?;
+                drain_screen_events(&mut text_evt_rx, &residual_shared, &frame_tx, session_id)
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        // ── Phase 3f: 流式 Opus 编码 + 即时下发 ────────────────────
         // 使用持久化的 StreamingOpusEncoder 处理流式 PCM，
         // 每完成一帧 Opus 就立即通过 frame_tx 下发到硬件端。
         // 这样硬件端在 ~600ms（10帧预缓冲）后即可开始播放，
@@ -1139,12 +1510,69 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             }
         }
 
+        // ── 零音频兜底：流式合成有文本却一帧未出 → 用累积全文重建会话重试一次 ──
+        // speak_stream 返回了 Ok 流但无任何音频（例如会话中途被服务端回收），
+        // 用聚合任务累积的清洗全文走 synthesize（doubao 每次自建新 WS 会话）重试。
+        if frame_count == 0 {
+            let full = cleaned_full
+                .lock()
+                .ok()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            if !full.is_empty() {
+                tracing::warn!(
+                    session_id = %session_id,
+                    text_len = full.chars().count(),
+                    "TTS-STREAM: 流式合成零音频，用累积全文重试 synthesize",
+                );
+                match provider
+                    .synthesize(TtsRequest {
+                        text: full,
+                        options: None,
+                    })
+                    .await
+                {
+                    Ok(resp) if !resp.audio.is_empty() => {
+                        total_audio_bytes += resp.audio.len();
+                        raw_pcm.extend_from_slice(&resp.audio);
+                        let opus_frames = stream_enc
+                            .feed(&resp.audio)
+                            .map_err(|e| format!("Opus 编码失败: {}", e))?;
+                        for opus in opus_frames {
+                            if frame_tx
+                                .send(PlaybackEvent::Audio(AudioFrame {
+                                    timestamp,
+                                    data: opus,
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                tracing::info!(
+                                    session_id = %session_id,
+                                    "TTS-STREAM: 回放管道已关闭，停止生成",
+                                );
+                                return Ok(());
+                            }
+                            timestamp = timestamp.wrapping_add(60);
+                            frame_count += 1;
+                        }
+                    }
+                    _ => {
+                        send_fallback_audio(&frame_tx, session_id).await?;
+                    }
+                }
+            } else {
+                // 无任何文本：也给出提示，避免设备完全静默
+                send_fallback_audio(&frame_tx, session_id).await?;
+            }
+        }
+
         // 音频流已结束，释放 text_stream 与旁路发送端，使下方 text_evt_rx.recv()
         // 能收到 None 正常退出（否则发送端存活会阻塞）。
         drop(audio_stream);
         drop(text_evt_tx);
 
-        // ── Phase 3b: 编码最后残片 ─────────────────────────────────
+        // ── Phase 3g: 编码最后残片 ─────────────────────────────────
         // TTS 合成完成后，flush 缓存中的不足一帧的残片（零填充后编码）
         {
             let last_frames = stream_enc
@@ -1172,27 +1600,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
 
         // ── 排空剩余句子事件 + 补发最后残句 ──────────────────────
         // 确保所有 LLM 文本在 Ok(()) 返回前进入回放通道，先于 ws.rs 的 Tts::Stop。
-        while let Some(sentence) = text_evt_rx.recv().await {
-            if frame_tx
-                .send(PlaybackEvent::LlmSentence(sentence))
-                .await
-                .is_err()
-            {
-                tracing::info!(session_id = %session_id, "TTS-STREAM: 回放管道已关闭，停止生成");
-                return Ok(());
-            }
-        }
-        let residual = residual_shared
-            .lock()
-            .ok()
-            .map(|g| g.trim().to_string())
-            .filter(|s| !s.is_empty());
-        if let Some(s) = residual {
-            if frame_tx.send(PlaybackEvent::LlmSentence(s)).await.is_err() {
-                tracing::info!(session_id = %session_id, "TTS-STREAM: 回放管道已关闭，停止生成");
-                return Ok(());
-            }
-        }
+        drain_screen_events(&mut text_evt_rx, &residual_shared, &frame_tx, session_id).await?;
 
         // ── 保存 TTS 音频到本地 ───────────────────────────────────
         if !raw_pcm.is_empty() {
@@ -1633,6 +2041,44 @@ impl StreamingOpusEncoder {
 
         Ok(vec![self.opus_buf[..encoded_len].to_vec()])
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 屏幕事件排空
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 排空屏幕句子事件 + 补发最后残句。
+///
+/// 调用前需确保 `text_evt_tx` 及其所有 clone（聚合任务持有的 `text_evt_tx2`）
+/// 均已 drop，否则 `text_evt_rx.recv()` 会一直阻塞。
+async fn drain_screen_events(
+    text_evt_rx: &mut mpsc::UnboundedReceiver<String>,
+    residual_shared: &Arc<Mutex<String>>,
+    frame_tx: &mpsc::Sender<PlaybackEvent>,
+    session_id: &str,
+) -> Result<(), String> {
+    while let Some(sentence) = text_evt_rx.recv().await {
+        if frame_tx
+            .send(PlaybackEvent::LlmSentence(sentence))
+            .await
+            .is_err()
+        {
+            tracing::info!(session_id = %session_id, "TTS-STREAM: 回放管道已关闭，停止生成");
+            return Ok(());
+        }
+    }
+    let residual = residual_shared
+        .lock()
+        .ok()
+        .map(|g| g.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(s) = residual {
+        if frame_tx.send(PlaybackEvent::LlmSentence(s)).await.is_err() {
+            tracing::info!(session_id = %session_id, "TTS-STREAM: 回放管道已关闭，停止生成");
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2263,5 +2709,171 @@ mod tests {
         assert!(take_sentence(&mut buf).is_none(), "空缓冲返回 None");
         let mut buf2 = "   \n  ".to_string();
         assert!(take_sentence(&mut buf2).is_none(), "纯空白返回 None");
+    }
+
+    // ─── clean_markdown_for_tts ──────────────────────────────────
+
+    #[test]
+    fn test_c1_clean_bold() {
+        assert_eq!(clean_markdown_for_tts("**加粗**文本"), "加粗文本");
+        assert_eq!(clean_markdown_for_tts("***加粗斜体***"), "加粗斜体");
+        assert_eq!(clean_markdown_for_tts("~~删除~~"), "删除");
+    }
+
+    #[test]
+    fn test_c2_clean_heading() {
+        assert_eq!(clean_markdown_for_tts("## 标题"), "标题");
+        assert_eq!(clean_markdown_for_tts("###### 六级标题"), "六级标题");
+    }
+
+    #[test]
+    fn test_c3_clean_link() {
+        assert_eq!(
+            clean_markdown_for_tts("[链接](https://x.com)文字"),
+            "链接文字"
+        );
+    }
+
+    #[test]
+    fn test_c4_clean_image() {
+        assert_eq!(clean_markdown_for_tts("![图片](url)"), "图片");
+    }
+
+    #[test]
+    fn test_c5_clean_list() {
+        assert_eq!(clean_markdown_for_tts("- 列表项"), "列表项");
+        assert_eq!(clean_markdown_for_tts("+ 加号列表"), "加号列表");
+        assert_eq!(clean_markdown_for_tts("1. 有序列表"), "有序列表");
+        assert_eq!(clean_markdown_for_tts("3) 括号列表"), "括号列表");
+    }
+
+    #[test]
+    fn test_c6_clean_quote() {
+        assert_eq!(clean_markdown_for_tts("> 引用内容"), "引用内容");
+    }
+
+    #[test]
+    fn test_c7_clean_fence_and_inline_code() {
+        let raw = "```rust\nlet x = 1;\n```";
+        assert_eq!(clean_markdown_for_tts(raw), "let x = 1;");
+        assert_eq!(clean_markdown_for_tts("`内联代码`"), "内联代码");
+    }
+
+    #[test]
+    fn test_c8_clean_unclosed_and_escape() {
+        assert_eq!(clean_markdown_for_tts("**未闭合"), "未闭合");
+        assert_eq!(clean_markdown_for_tts("\\*字面\\#"), "*字面#");
+    }
+
+    #[test]
+    fn test_c9_clean_preserve_plain_text() {
+        // 普通中文、数字、缩写、行内连字符/加号均不受影响
+        assert_eq!(clean_markdown_for_tts("你好，世界。"), "你好，世界。");
+        assert_eq!(clean_markdown_for_tts("单价3.14元"), "单价3.14元");
+        assert_eq!(clean_markdown_for_tts("C++"), "C++");
+        assert_eq!(clean_markdown_for_tts("well-known"), "well-known");
+        // 整行分隔线删除
+        assert_eq!(clean_markdown_for_tts("---"), "");
+        assert_eq!(clean_markdown_for_tts("***"), "");
+    }
+
+    #[test]
+    fn test_c10_clean_markdown_heavy_block() {
+        // 模拟用户日志中的大段 markdown 回复
+        let raw = "**主要特征**\n- 周五放量反弹（沪指 +0.72%、深成指 +2.21%）\n- 结构分化明显：**大消费走强**、**科技成长承压**\n来源：\n- [A股周评（易天富）](https://m.etf88.com/jjb/2026/0801/9825902.html)";
+        let cleaned = clean_markdown_for_tts(raw);
+        assert!(!cleaned.contains('*'), "不应残留星号: {cleaned}");
+        assert!(
+            !cleaned.contains('[') && !cleaned.contains(']'),
+            "不应残留方括号"
+        );
+        assert!(
+            !cleaned.contains('(') && !cleaned.contains(')'),
+            "不应残留半角括号"
+        );
+        assert!(cleaned.contains("主要特征"));
+        assert!(cleaned.contains("周五放量反弹"));
+        assert!(cleaned.contains("大消费走强"));
+        assert!(cleaned.contains("科技成长承压"));
+        assert!(cleaned.contains("A股周评（易天富）"));
+    }
+
+    // ─── TtsTextAggregator ───────────────────────────────────────
+
+    #[test]
+    fn test_a1_first_block_emitted_immediately() {
+        // 首个非空 delta 即使无标点也立即发出，便于尽快建立 TTS 会话
+        let mut agg = TtsTextAggregator::new(100);
+        assert_eq!(agg.push("好的"), vec!["好的"]);
+    }
+
+    #[test]
+    fn test_a2_aggregate_sentence_across_chunks() {
+        let mut agg = TtsTextAggregator::new(100);
+        agg.push("今天。"); // 首块
+        // 未闭合残句跨 chunk 累积，完整句才发出
+        assert!(agg.push("我们出").is_empty());
+        assert_eq!(agg.push("去玩吧！"), vec!["我们出去玩吧！"]);
+    }
+
+    #[test]
+    fn test_a3_threshold_flush() {
+        let mut agg = TtsTextAggregator::new(10);
+        assert_eq!(agg.push("你好。"), vec!["你好。"]);
+        // 残句超过阈值强制整块发出
+        let blocks = agg.push("这是一段没有任何标点的很长的残句文本内容");
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].contains("这是一段没有任何标点"));
+    }
+
+    #[test]
+    fn test_a4_flush_partial_and_finish() {
+        let mut agg = TtsTextAggregator::new(100);
+        agg.push("已发出。");
+        assert!(agg.push("残句").is_empty());
+        let p = agg.flush_partial().expect("残句应被强发");
+        assert_eq!(p, "残句");
+        assert!(agg.flush_partial().is_none(), "缓冲已空");
+        assert!(agg.finish().is_none());
+    }
+
+    #[test]
+    fn test_a5_clean_marks_in_aggregator() {
+        let mut agg = TtsTextAggregator::new(100);
+        let blocks = agg.push("**你好**，世界。");
+        assert_eq!(blocks, vec!["你好，世界。"]);
+    }
+
+    #[tokio::test]
+    async fn test_a6_aggregate_task_end_to_end() {
+        let input = stream::iter(vec![
+            "今天".to_string(),
+            "天气很好。".to_string(),
+            "**我们去**".to_string(),
+            "公园吧！".to_string(),
+        ]);
+        let (agg_tx, mut agg_rx) = mpsc::channel::<String>(16);
+        let cleaned_full: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let handle = tokio::spawn(tts_aggregate_task(
+            Box::new(input),
+            agg_tx,
+            cleaned_full.clone(),
+        ));
+
+        let mut blocks = Vec::new();
+        while let Some(b) = agg_rx.recv().await {
+            blocks.push(b);
+        }
+        handle.await.expect("聚合任务正常结束");
+
+        // 块拼接后的文本 = 清洗后按句聚合结果
+        let joined: String = blocks.iter().flat_map(|s| s.chars()).collect();
+        assert_eq!(joined, "今天天气很好。我们去公园吧！");
+        // cleaned_full 累积了清洗后全文（块间以换行分隔）
+        let full = cleaned_full.lock().unwrap().clone();
+        assert_eq!(
+            full.lines().collect::<String>(),
+            "今天天气很好。我们去公园吧！"
+        );
     }
 }
