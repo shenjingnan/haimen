@@ -259,19 +259,15 @@ fn create_asr_provider(cfg: &AsrConfig) -> Result<Box<dyn AsrProvider>, String> 
         }
         _ => {
             // doubao（默认）
-            let app_key = cfg
-                .get_credential("app_key")
-                .ok_or_else(|| "ASR App Key 未配置（当前提供商: doubao）".to_string())?;
-            let access_key = cfg
-                .get_credential("access_key")
-                .ok_or_else(|| "ASR Access Token 未配置（当前提供商: doubao）".to_string())?;
+            let api_key = cfg
+                .get_credential("api_key")
+                .ok_or_else(|| "ASR API Key 未配置（当前提供商: doubao）".to_string())?;
             Ok(Box::new(DoubaoAsr::new(DoubaoAsrOption {
                 base: BaseProviderOption {
                     language: Some("zh-CN".into()),
                     ..Default::default()
                 },
-                app_key: Some(app_key),
-                access_key: Some(access_key),
+                api_key: Some(api_key),
                 mode: DoubaoAsrMode::Streaming,
                 ..Default::default()
             })))
@@ -335,19 +331,15 @@ fn create_streaming_asr_provider(cfg: &AsrConfig) -> Result<Box<dyn AsrProvider>
         }
         _ => {
             // doubao（默认）- 流式模式添加 VAD 端点检测参数
-            let app_key = cfg
-                .get_credential("app_key")
-                .ok_or_else(|| "ASR App Key 未配置（当前提供商: doubao）".to_string())?;
-            let access_key = cfg
-                .get_credential("access_key")
-                .ok_or_else(|| "ASR Access Token 未配置（当前提供商: doubao）".to_string())?;
+            let api_key = cfg
+                .get_credential("api_key")
+                .ok_or_else(|| "ASR API Key 未配置（当前提供商: doubao）".to_string())?;
             Ok(Box::new(DoubaoAsr::new(DoubaoAsrOption {
                 base: BaseProviderOption {
                     language: Some("zh-CN".into()),
                     ..Default::default()
                 },
-                app_key: Some(app_key),
-                access_key: Some(access_key),
+                api_key: Some(api_key),
                 mode: DoubaoAsrMode::Streaming,
                 sample_rate: 16000,
                 bits: 16,
@@ -409,10 +401,8 @@ impl AsrLlmTtsStrategy {
             let cfg = asr_config.read().unwrap();
             match cfg.active_provider.as_str() {
                 "doubao" => {
-                    cfg.resolved_app_key()
-                        .map_err(|e| format!("ASR App Key 配置无效: {}", e))?;
-                    cfg.resolved_access_token()
-                        .map_err(|e| format!("ASR Access Token 配置无效: {}", e))?;
+                    cfg.get_credential("api_key")
+                        .ok_or_else(|| "ASR API Key 未配置（当前提供商: doubao）".to_string())?;
                 }
                 "xfyun" => {
                     cfg.get_credential("app_id")
@@ -1791,8 +1781,7 @@ mod tests {
     fn test_tts_config() -> crate::config::settings::TtsConfig {
         let mut providers = std::collections::HashMap::new();
         let mut creds = std::collections::HashMap::new();
-        creds.insert("app_key".to_string(), "test-app-key".to_string());
-        creds.insert("access_token".to_string(), "test-access-token".to_string());
+        creds.insert("api_key".to_string(), "test-app-key".to_string());
         providers.insert("doubao".to_string(), creds);
         crate::config::settings::TtsConfig {
             active_provider: "doubao".to_string(),
@@ -1804,8 +1793,7 @@ mod tests {
     fn test_asr_config() -> crate::config::settings::AsrConfig {
         let mut providers = std::collections::HashMap::new();
         let mut creds = std::collections::HashMap::new();
-        creds.insert("app_key".to_string(), "test-app-key".to_string());
-        creds.insert("access_key".to_string(), "test-access-token".to_string());
+        creds.insert("api_key".to_string(), "test-app-key".to_string());
         providers.insert("doubao".to_string(), creds);
         crate::config::settings::AsrConfig {
             active_provider: "doubao".to_string(),

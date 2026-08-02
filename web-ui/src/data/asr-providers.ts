@@ -27,16 +27,10 @@ export const ASR_PROVIDERS: ProviderInfo[] = [
     name: '火山引擎',
     fields: [
       {
-        key: 'app_key',
-        label: 'App Key',
+        key: 'api_key',
+        label: 'API Key',
         type: 'password',
-        placeholder: '未设置，可用环境变量 DOUBAO_APP_KEY',
-      },
-      {
-        key: 'access_key',
-        label: 'Access Key',
-        type: 'password',
-        placeholder: '未设置，可用环境变量 DOUBAO_ACCESS_TOKEN',
+        placeholder: '未设置，可用环境变量 DOUBAO_API_KEY',
       },
     ],
   },

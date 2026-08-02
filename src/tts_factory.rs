@@ -45,12 +45,9 @@ pub fn create_tts_provider(config: &TtsConfig) -> Result<Box<dyn TtsProvider>, S
 
     match active {
         "doubao" => {
-            let app_key = config
-                .get_credential("app_key")
-                .ok_or_else(|| "缺少 Doubao App Key".to_string())?;
-            let access_token = config
-                .get_credential("access_token")
-                .ok_or_else(|| "缺少 Doubao Access Token".to_string())?;
+            let api_key = config
+                .get_credential("api_key")
+                .ok_or_else(|| "缺少 Doubao API Key".to_string())?;
             let cluster = config.get_credential("cluster");
             let resource_id =
                 config
@@ -80,8 +77,7 @@ pub fn create_tts_provider(config: &TtsConfig) -> Result<Box<dyn TtsProvider>, S
                     format: Some("pcm".into()),
                     ..Default::default()
                 },
-                app_id: Some(app_key),
-                access_token: Some(access_token),
+                api_key: Some(api_key),
                 resource_id,
                 ..Default::default()
             })))
@@ -154,8 +150,7 @@ mod tests {
     fn test_create_doubao_provider() {
         let mut providers = HashMap::new();
         let mut creds = HashMap::new();
-        creds.insert("app_key".to_string(), "test-app-key".to_string());
-        creds.insert("access_token".to_string(), "test-access-token".to_string());
+        creds.insert("api_key".to_string(), "test-app-key".to_string());
         providers.insert("doubao".to_string(), creds);
 
         let config = TtsConfig {
