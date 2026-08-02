@@ -91,8 +91,7 @@ pub async fn get_asr_settings() -> Json<serde_json::Value> {
             "active_provider": cfg.asr.active_provider,
             "providers": cfg.asr.providers,
             "resolved": {
-                "app_key": cfg.asr.resolved_app_key().ok(),
-                "access_key": cfg.asr.resolved_access_token().ok(),
+                "api_key": cfg.asr.resolved_api_key().ok(),
             }
         }
     }))
@@ -151,7 +150,7 @@ pub async fn update_asr_settings(
 /// 验证指定提供商的凭证是否有效。
 ///
 /// 请求体包含 `provider` 字段和各提供商对应的凭证字段：
-/// - doubao: `app_key` + `access_key`
+/// - doubao: `api_key`
 /// - qwen / glm / mimo: `api_key`
 /// - xfyun: `app_id` + `api_key` + `api_secret`
 pub async fn verify_asr_credentials(
@@ -277,8 +276,8 @@ async fn verify_http_key(
 async fn verify_doubao(
     body: &serde_json::Value,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let app_key = body
-        .get("app_key")
+    let api_key = body
+        .get("api_key")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
@@ -286,33 +285,13 @@ async fn verify_doubao(
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "success": false,
-                    "error": "缺少 app_key"
-                })),
-            )
-        })?;
-    let access_key = body
-        .get("access_key")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error": "缺少 access_key"
+                    "error": "缺少 api_key"
                 })),
             )
         })?;
 
     // ASR 侧仅验证 token 有效性，使用默认 TTS 资源与音色
-    match verify_doubao_token(
-        app_key,
-        access_key,
-        "seed-tts-2.0",
-        "zh_female_xiaohe_uranus_bigtts",
-    )
-    .await
-    {
+    match verify_doubao_token(api_key, "seed-tts-2.0", "zh_female_xiaohe_uranus_bigtts").await {
         Ok(()) => Ok(Json(serde_json::json!({
             "success": true,
             "data": { "valid": true, "message": "凭证验证成功" }
@@ -325,12 +304,7 @@ async fn verify_doubao(
 }
 
 /// 用提供的凭证调用 Doubao TTS 合成测试音频验证有效性
-async fn verify_doubao_token(
-    app_key: &str,
-    access_token: &str,
-    resource_id: &str,
-    voice: &str,
-) -> Result<(), String> {
+async fn verify_doubao_token(api_key: &str, resource_id: &str, voice: &str) -> Result<(), String> {
     use univoice::tts::provider::{DoubaoTts, DoubaoTtsOption};
     use univoice::tts::{BaseTtsOption, TtsProvider, TtsRequest, VoiceId};
 
@@ -340,8 +314,7 @@ async fn verify_doubao_token(
             voice: Some(VoiceId::from(voice)),
             ..Default::default()
         },
-        app_id: Some(app_key.to_string()),
-        access_token: Some(access_token.to_string()),
+        api_key: Some(api_key.to_string()),
         resource_id: Some(resource_id.to_string()),
         ..Default::default()
     });
@@ -382,8 +355,7 @@ pub async fn get_tts_settings() -> Json<serde_json::Value> {
             "fixed_text_enabled": cfg.tts.fixed_text_enabled,
             "fixed_text": cfg.tts.fixed_text,
             "resolved": {
-                "app_key": cfg.tts.resolved_app_key().ok(),
-                "access_token": cfg.tts.resolved_access_token().ok(),
+                "api_key": cfg.tts.resolved_api_key().ok(),
                 "voice": Some(cfg.tts.resolved_voice()),
             }
         }
@@ -517,7 +489,7 @@ pub async fn list_tts_voices(params: Query<HashMap<String, String>>) -> Json<ser
 /// 验证指定 TTS 提供商的凭证是否有效。
 ///
 /// 请求体包含 `provider` 字段和各提供商对应的凭证字段：
-/// - doubao: `app_key` + `access_token`
+/// - doubao: `api_key`
 /// - qwen / glm / openai / minimax / gemini: `api_key`
 /// - xfyun: `app_id` + `api_key` + `api_secret`
 pub async fn verify_tts_credentials(
@@ -602,8 +574,8 @@ pub async fn verify_tts_credentials(
 async fn verify_tts_doubao(
     body: &serde_json::Value,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let app_key = body
-        .get("app_key")
+    let api_key = body
+        .get("api_key")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
@@ -611,20 +583,7 @@ async fn verify_tts_doubao(
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "success": false,
-                    "error": "缺少 app_key"
-                })),
-            )
-        })?;
-    let access_token = body
-        .get("access_token")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error": "缺少 access_token"
+                    "error": "缺少 api_key"
                 })),
             )
         })?;
@@ -641,7 +600,7 @@ async fn verify_tts_doubao(
         .filter(|s| !s.is_empty())
         .unwrap_or("zh_female_xiaohe_uranus_bigtts");
 
-    match verify_doubao_token(app_key, access_token, resource_id, voice).await {
+    match verify_doubao_token(api_key, resource_id, voice).await {
         Ok(()) => Ok(Json(serde_json::json!({
             "success": true,
             "data": { "valid": true, "message": "凭证验证成功" }
@@ -666,8 +625,7 @@ mod tests {
         let json = serde_json::json!({
             "providers": {
                 "doubao": {
-                    "app_key": "key1",
-                    "access_key": "token1"
+                    "api_key": "key1"
                 },
                 "qwen": {
                     "api_key": "qwen-key"
@@ -677,7 +635,7 @@ mod tests {
         let providers = parse_providers(&json).unwrap();
         assert_eq!(providers.len(), 2);
         assert_eq!(
-            providers.get("doubao").unwrap().get("app_key").unwrap(),
+            providers.get("doubao").unwrap().get("api_key").unwrap(),
             "key1"
         );
         assert_eq!(
@@ -691,15 +649,15 @@ mod tests {
         let json = serde_json::json!({
             "providers": {
                 "doubao": {
-                    "app_key": "key1",
-                    "access_key": ""
+                    "api_key": "key1",
+                    "resource_id": ""
                 }
             }
         });
         let providers = parse_providers(&json).unwrap();
         let doubao = providers.get("doubao").unwrap();
-        assert_eq!(doubao.get("app_key").unwrap(), "key1");
-        assert!(doubao.get("access_key").is_none());
+        assert_eq!(doubao.get("api_key").unwrap(), "key1");
+        assert!(doubao.get("resource_id").is_none());
     }
 
     #[test]

@@ -386,7 +386,6 @@ impl Default for AsrConfig {
 struct AsrConfigLegacy {
     provider: Option<String>,
     app_key: Option<String>,
-    access_token: Option<String>,
     active_provider: Option<String>,
     providers: Option<HashMap<String, HashMap<String, String>>>,
 }
@@ -410,19 +409,15 @@ impl<'de> Deserialize<'de> for AsrConfig {
         let provider = legacy.provider.unwrap_or_else(|| "doubao".to_string());
         let mut providers = legacy.providers.unwrap_or_default();
 
-        // 如果旧格式有凭证值，迁移到 providers
-        let has_legacy_creds = legacy.app_key.is_some() || legacy.access_token.is_some();
-        if has_legacy_creds && !providers.contains_key(&provider) {
+        // 如果旧格式有凭证值，迁移到 providers（旧 app_key 迁移为新版 api_key，access_token 已废弃）
+        if let Some(key) = legacy
+            .app_key
+            .filter(|s| !s.is_empty())
+            .filter(|_| !providers.contains_key(&provider))
+        {
             let mut creds = HashMap::new();
-            if let Some(key) = legacy.app_key.filter(|s| !s.is_empty()) {
-                creds.insert("app_key".to_string(), key);
-            }
-            if let Some(token) = legacy.access_token.filter(|s| !s.is_empty()) {
-                creds.insert("access_key".to_string(), token);
-            }
-            if !creds.is_empty() {
-                providers.insert(provider.clone(), creds);
-            }
+            creds.insert("api_key".to_string(), key);
+            providers.insert(provider.clone(), creds);
         }
 
         Ok(Self {
@@ -449,8 +444,10 @@ impl AsrConfig {
 
         // 回退到环境变量（按提供商映射）
         match (self.active_provider.as_str(), key) {
-            ("doubao", "app_key") => std::env::var("DOUBAO_APP_KEY").ok(),
-            ("doubao", "access_key") => std::env::var("DOUBAO_ACCESS_TOKEN").ok(),
+            // doubao 新版控制台单一 API Key（X-Api-Key 鉴权），兼容旧 DOUBAO_APP_KEY
+            ("doubao", "api_key") => std::env::var("DOUBAO_API_KEY")
+                .ok()
+                .or_else(|| std::env::var("DOUBAO_APP_KEY").ok()),
             ("qwen", "api_key") => std::env::var("QWEN_API_KEY").ok(),
             ("glm", "api_key") => std::env::var("GLM_API_KEY").ok(),
             ("mimo", "api_key") => std::env::var("MIMO_API_KEY").ok(),
@@ -458,16 +455,10 @@ impl AsrConfig {
         }
     }
 
-    /// 获取有效的 App Key（兼容旧接口，从当前激活提供商读取）
-    pub fn resolved_app_key(&self) -> Result<String, String> {
-        self.get_credential("app_key")
-            .ok_or_else(|| "未设置 App Key（可在 settings.toml 或环境变量中设置）".to_string())
-    }
-
-    /// 获取有效的 Access Token / Key（兼容旧接口，从当前激活提供商读取）
-    pub fn resolved_access_token(&self) -> Result<String, String> {
-        self.get_credential("access_key")
-            .ok_or_else(|| "未设置 Access Token（可在 settings.toml 或环境变量中设置）".to_string())
+    /// 获取有效的 API Key（从当前激活提供商读取）
+    pub fn resolved_api_key(&self) -> Result<String, String> {
+        self.get_credential("api_key")
+            .ok_or_else(|| "未设置 API Key（可在 settings.toml 或环境变量中设置）".to_string())
     }
 
     /// 获取指定提供商的指定凭证（不依赖 active_provider）
@@ -527,7 +518,6 @@ struct TtsConfigLegacy {
     provider: Option<String>,
     voice: Option<String>,
     app_key: Option<String>,
-    access_token: Option<String>,
     cluster: Option<String>,
     resource_id: Option<String>,
     active_provider: Option<String>,
@@ -564,10 +554,8 @@ impl<'de> Deserialize<'de> for TtsConfig {
                 creds.insert("voice".to_string(), val);
             }
             if let Some(val) = legacy.app_key.filter(|s| !s.is_empty()) {
-                creds.insert("app_key".to_string(), val);
-            }
-            if let Some(val) = legacy.access_token.filter(|s| !s.is_empty()) {
-                creds.insert("access_token".to_string(), val);
+                // 旧 app_key 迁移为新版 api_key（access_token 已废弃）
+                creds.insert("api_key".to_string(), val);
             }
             if let Some(val) = legacy.cluster.filter(|s| !s.is_empty()) {
                 creds.insert("cluster".to_string(), val);
@@ -621,8 +609,10 @@ impl TtsConfig {
 
         // 回退到环境变量（按提供商映射）
         match (self.active_provider.as_str(), key) {
-            ("doubao", "app_key") => std::env::var("DOUBAO_APP_KEY").ok(),
-            ("doubao", "access_token") => std::env::var("DOUBAO_ACCESS_TOKEN").ok(),
+            // doubao 新版控制台单一 API Key（X-Api-Key 鉴权），兼容旧 DOUBAO_APP_KEY
+            ("doubao", "api_key") => std::env::var("DOUBAO_API_KEY")
+                .ok()
+                .or_else(|| std::env::var("DOUBAO_APP_KEY").ok()),
             ("doubao", "voice") => std::env::var("DOUBAO_VOICE_TYPE").ok(),
             ("doubao", "cluster") => std::env::var("DOUBAO_CLUSTER").ok(),
             ("qwen", "api_key") => std::env::var("QWEN_API_KEY").ok(),
@@ -637,16 +627,10 @@ impl TtsConfig {
         }
     }
 
-    /// 获取有效的 App Key（兼容旧接口，从当前激活提供商读取）
-    pub fn resolved_app_key(&self) -> Result<String, String> {
-        self.get_credential("app_key")
-            .ok_or_else(|| "未设置 App Key（可在 settings.toml 或环境变量中设置）".to_string())
-    }
-
-    /// 获取有效的 Access Token（兼容旧接口，从当前激活提供商读取）
-    pub fn resolved_access_token(&self) -> Result<String, String> {
-        self.get_credential("access_token")
-            .ok_or_else(|| "未设置 Access Token（可在 settings.toml 或环境变量中设置）".to_string())
+    /// 获取有效的 API Key（从当前激活提供商读取）
+    pub fn resolved_api_key(&self) -> Result<String, String> {
+        self.get_credential("api_key")
+            .ok_or_else(|| "未设置 API Key（可在 settings.toml 或环境变量中设置）".to_string())
     }
 
     /// 获取有效的音色（兼容旧接口，从当前激活提供商读取）
@@ -994,8 +978,7 @@ enabled = true
     fn test_app_config_serde_roundtrip() {
         let mut providers = HashMap::new();
         let mut doubao_creds = HashMap::new();
-        doubao_creds.insert("app_key".to_string(), "test-key".to_string());
-        doubao_creds.insert("access_key".to_string(), "test-token".to_string());
+        doubao_creds.insert("api_key".to_string(), "test-key".to_string());
         providers.insert("doubao".to_string(), doubao_creds);
 
         let config = AppConfig {
@@ -1185,70 +1168,68 @@ agent = "claude-code"
     }
 
     #[test]
-    fn test_asr_resolved_app_key_from_config() {
+    fn test_asr_resolved_api_key_from_config() {
         let mut providers = HashMap::new();
         let mut creds = HashMap::new();
-        creds.insert("app_key".to_string(), "config-key".to_string());
+        creds.insert("api_key".to_string(), "config-key".to_string());
         providers.insert("doubao".to_string(), creds);
 
         let cfg = AsrConfig {
             active_provider: "doubao".to_string(),
             providers,
         };
-        assert_eq!(cfg.resolved_app_key().unwrap(), "config-key");
+        assert_eq!(cfg.resolved_api_key().unwrap(), "config-key");
     }
 
     #[test]
-    fn test_asr_resolved_app_key_from_env() {
+    fn test_asr_resolved_api_key_from_env() {
         unsafe {
-            std::env::set_var("DOUBAO_APP_KEY", "env-key");
+            std::env::set_var("DOUBAO_API_KEY", "env-key");
         }
         let cfg = AsrConfig::default();
-        assert_eq!(cfg.resolved_app_key().unwrap(), "env-key");
+        assert_eq!(cfg.resolved_api_key().unwrap(), "env-key");
         unsafe {
-            std::env::remove_var("DOUBAO_APP_KEY");
+            std::env::remove_var("DOUBAO_API_KEY");
         }
     }
 
     #[test]
-    fn test_asr_resolved_app_key_config_overrides_env() {
+    fn test_asr_resolved_api_key_config_overrides_env() {
         unsafe {
-            std::env::set_var("DOUBAO_APP_KEY", "env-key");
+            std::env::set_var("DOUBAO_API_KEY", "env-key");
         }
         let mut providers = HashMap::new();
         let mut creds = HashMap::new();
-        creds.insert("app_key".to_string(), "config-key".to_string());
+        creds.insert("api_key".to_string(), "config-key".to_string());
         providers.insert("doubao".to_string(), creds);
 
         let cfg = AsrConfig {
             active_provider: "doubao".to_string(),
             providers,
         };
-        assert_eq!(cfg.resolved_app_key().unwrap(), "config-key");
+        assert_eq!(cfg.resolved_api_key().unwrap(), "config-key");
+        unsafe {
+            std::env::remove_var("DOUBAO_API_KEY");
+        }
+    }
+
+    #[test]
+    fn test_asr_resolved_api_key_legacy_env_fallback() {
+        unsafe {
+            std::env::set_var("DOUBAO_APP_KEY", "legacy-env-key");
+        }
+        let cfg = AsrConfig::default();
+        assert_eq!(cfg.resolved_api_key().unwrap(), "legacy-env-key");
         unsafe {
             std::env::remove_var("DOUBAO_APP_KEY");
         }
     }
 
     #[test]
-    fn test_asr_resolved_app_key_missing() {
+    fn test_asr_resolved_api_key_missing() {
         let cfg = AsrConfig::default();
-        let result = cfg.resolved_app_key();
+        let result = cfg.resolved_api_key();
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_asr_resolved_access_token_from_config() {
-        let mut providers = HashMap::new();
-        let mut creds = HashMap::new();
-        creds.insert("access_key".to_string(), "config-token".to_string());
-        providers.insert("doubao".to_string(), creds);
-
-        let cfg = AsrConfig {
-            active_provider: "doubao".to_string(),
-            providers,
-        };
-        assert_eq!(cfg.resolved_access_token().unwrap(), "config-token");
     }
 
     #[test]
@@ -1258,7 +1239,7 @@ agent = "claude-code"
         qwen_creds.insert("api_key".to_string(), "qwen-key".to_string());
         providers.insert("qwen".to_string(), qwen_creds);
         let mut doubao_creds = HashMap::new();
-        doubao_creds.insert("app_key".to_string(), "doubao-key".to_string());
+        doubao_creds.insert("api_key".to_string(), "doubao-key".to_string());
         providers.insert("doubao".to_string(), doubao_creds);
 
         let cfg = AsrConfig {
@@ -1285,8 +1266,9 @@ access_token = "old-token"
             let result = load_settings().unwrap().unwrap();
             assert_eq!(result.asr.active_provider, "doubao");
             let doubao = result.asr.providers.get("doubao").unwrap();
-            assert_eq!(doubao.get("app_key").unwrap(), "old-key");
-            assert_eq!(doubao.get("access_key").unwrap(), "old-token");
+            // 旧 app_key 迁移为新版 api_key，access_token 已废弃忽略
+            assert_eq!(doubao.get("api_key").unwrap(), "old-key");
+            assert!(doubao.get("access_key").is_none());
         });
     }
 
@@ -1399,8 +1381,7 @@ provider = "doubao"
     fn test_tts_get_credential_multi_provider() {
         let mut providers = HashMap::new();
         let mut doubao_creds = HashMap::new();
-        doubao_creds.insert("app_key".to_string(), "doubao-app-key".to_string());
-        doubao_creds.insert("access_token".to_string(), "doubao-token".to_string());
+        doubao_creds.insert("api_key".to_string(), "doubao-app-key".to_string());
         providers.insert("doubao".to_string(), doubao_creds);
         let mut qwen_creds = HashMap::new();
         qwen_creds.insert("api_key".to_string(), "qwen-key".to_string());
@@ -1412,9 +1393,7 @@ provider = "doubao"
             providers: providers.clone(),
             ..Default::default()
         };
-        assert_eq!(cfg.get_credential("app_key").unwrap(), "doubao-app-key");
-        assert_eq!(cfg.get_credential("access_token").unwrap(), "doubao-token");
-        assert!(cfg.get_credential("api_key").is_none());
+        assert_eq!(cfg.get_credential("api_key").unwrap(), "doubao-app-key");
 
         // 切换为 qwen 时
         let cfg = TtsConfig {
@@ -1442,8 +1421,9 @@ voice = "zh_female_vv_uranus_bigtts"
             let result = load_settings().unwrap().unwrap();
             assert_eq!(result.tts.active_provider, "doubao");
             let doubao = result.tts.providers.get("doubao").unwrap();
-            assert_eq!(doubao.get("app_key").unwrap(), "old-key");
-            assert_eq!(doubao.get("access_token").unwrap(), "old-token");
+            // 旧 app_key 迁移为新版 api_key，access_token 已废弃忽略
+            assert_eq!(doubao.get("api_key").unwrap(), "old-key");
+            assert!(doubao.get("access_token").is_none());
             assert_eq!(doubao.get("voice").unwrap(), "zh_female_vv_uranus_bigtts");
         });
     }
@@ -1499,7 +1479,7 @@ api_key = "qwen-api-key"
         run_with_temp_home(|_home| {
             let mut providers = HashMap::new();
             let mut creds = HashMap::new();
-            creds.insert("app_key".to_string(), "saved-key".to_string());
+            creds.insert("api_key".to_string(), "saved-key".to_string());
             providers.insert("doubao".to_string(), creds);
 
             let config = AppConfig {
@@ -1533,7 +1513,7 @@ api_key = "qwen-api-key"
                     .asr
                     .providers
                     .get("doubao")
-                    .and_then(|p| p.get("app_key")),
+                    .and_then(|p| p.get("api_key")),
                 Some(&"saved-key".to_string())
             );
             assert_eq!(

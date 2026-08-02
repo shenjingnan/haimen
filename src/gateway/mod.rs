@@ -81,7 +81,7 @@ fn build_xiaozhi_strategy(
     {
         let cfg = shared_asr_config.read().unwrap();
         let has_creds = match cfg.active_provider.as_str() {
-            "doubao" => cfg.resolved_app_key().is_ok() && cfg.resolved_access_token().is_ok(),
+            "doubao" => cfg.get_credential("api_key").is_some(),
             "xfyun" => {
                 cfg.get_credential("app_id").is_some()
                     && cfg.get_credential("api_key").is_some()

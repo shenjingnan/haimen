@@ -83,8 +83,7 @@ export interface AsrSettings {
   providers: Record<string, Record<string, string>>;
   /** 当前激活提供商的回退解析值 */
   resolved?: {
-    app_key: string | null;
-    access_key: string | null;
+    api_key: string | null;
   };
 }
 
@@ -99,8 +98,7 @@ export interface TtsSettings {
   fixed_text: string | null;
   /** 当前激活提供商的回退解析值 */
   resolved?: {
-    app_key: string | null;
-    access_token: string | null;
+    api_key: string | null;
     voice: string | null;
   };
 }
