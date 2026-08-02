@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.10.0](https://github.com/shenjingnan/haimen/compare/v0.9.1...v0.10.0) - 2026-08-02
+
+### Other
+
+- *(deps)* 升级 univoice 0.1.4 → 0.1.6 并迁移 doubao 鉴权到 api_key ([#143](https://github.com/shenjingnan/haimen/pull/143))
+
 ## [0.9.1](https://github.com/shenjingnan/haimen/compare/v0.9.0...v0.9.1) - 2026-08-01
 
 ### Fixed
