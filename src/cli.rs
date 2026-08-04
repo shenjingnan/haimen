@@ -305,7 +305,13 @@ fn cmd_agent_log(
         tracing::info!(removed = removed, "清理过期 Agent 日志");
     }
 
-    let records = crate::agent_log::load(day.as_deref(), source.as_deref(), chat.as_deref(), limit);
+    let records = crate::agent_log::load(
+        day.as_deref(),
+        source.as_deref(),
+        chat.as_deref(),
+        None,
+        limit,
+    );
 
     if records.is_empty() {
         println!("（没有匹配的 Agent 调用日志）");

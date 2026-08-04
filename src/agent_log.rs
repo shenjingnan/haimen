@@ -122,11 +122,13 @@ pub fn record(rec: &AgentLogRecord) {
 /// - `day`：只读指定日期文件（YYYY-MM-DD）
 /// - `source`：按来源过滤（gateway/xiaozhi/cli）
 /// - `chat`：按 chat_id 精确过滤
+/// - `status`：按状态过滤（success/error/timeout）
 /// - `limit`：最多返回条数
 pub fn load(
     day: Option<&str>,
     source: Option<&str>,
     chat: Option<&str>,
+    status: Option<&str>,
     limit: usize,
 ) -> Vec<AgentLogRecord> {
     let cfg = agent_log_config();
@@ -172,6 +174,7 @@ pub fn load(
             && chat
                 .map(|c| r.chat_id.as_deref() == Some(c))
                 .unwrap_or(true)
+            && status.map(|s| r.status == s).unwrap_or(true)
     });
 
     // ISO 8601 同格式字符串按字典序即时间倒序
@@ -324,28 +327,74 @@ mod tests {
             std::fs::write(&path, content).unwrap();
 
             // 全量：时间倒序（r3 最早写入但最晚时间 → 排最前）
-            let all = load(None, None, None, 10);
+            let all = load(None, None, None, None, 10);
             assert_eq!(all.len(), 3);
             assert_eq!(all[0].timestamp, "2026-08-04T12:00:00+08:00");
             assert_eq!(all[2].timestamp, "2026-08-04T10:00:00+08:00");
 
             // source 过滤
-            let gw = load(None, Some("gateway"), None, 10);
+            let gw = load(None, Some("gateway"), None, None, 10);
             assert_eq!(gw.len(), 2);
             assert!(gw.iter().all(|r| r.source == "gateway"));
 
             // chat 过滤
-            let c1 = load(None, None, Some("chat-1"), 10);
+            let c1 = load(None, None, Some("chat-1"), None, 10);
             assert_eq!(c1.len(), 1);
             assert_eq!(c1[0].chat_id.as_deref(), Some("chat-1"));
 
             // limit
-            let limited = load(None, None, None, 2);
+            let limited = load(None, None, None, None, 2);
             assert_eq!(limited.len(), 2);
 
             // day 过滤（错误日期 → 空）
-            let wrong_day = load(Some("2000-01-01"), None, None, 10);
+            let wrong_day = load(Some("2000-01-01"), None, None, None, 10);
             assert!(wrong_day.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_load_status_filter() {
+        run_with_temp_home(|home| {
+            let day = Local::now().format("%Y-%m-%d").to_string();
+            let path = log_dir(home).join(format!("{}.jsonl", day));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+            // 三条记录：两条 success、一条 error
+            let mut r1 = sample_record("gateway", "chat-1");
+            r1.status = "success".to_string();
+            let mut r2 = sample_record("gateway", "chat-2");
+            r2.status = "error".to_string();
+            r2.error = Some("boom".to_string());
+            let mut r3 = sample_record("cli", "chat-3");
+            r3.status = "success".to_string();
+
+            let mut content = String::new();
+            content.push_str(&serde_json::to_string(&r1).unwrap());
+            content.push('\n');
+            content.push_str(&serde_json::to_string(&r2).unwrap());
+            content.push('\n');
+            content.push_str(&serde_json::to_string(&r3).unwrap());
+            content.push('\n');
+            std::fs::write(&path, content).unwrap();
+
+            // status = error 只命中 error 那条
+            let err = load(None, None, None, Some("error"), 10);
+            assert_eq!(err.len(), 1);
+            assert_eq!(err[0].status, "error");
+
+            // status = success 命中两条 success
+            let ok = load(None, None, None, Some("success"), 10);
+            assert_eq!(ok.len(), 2);
+            assert!(ok.iter().all(|r| r.status == "success"));
+
+            // status = timeout 无命中
+            let timeout = load(None, None, None, Some("timeout"), 10);
+            assert!(timeout.is_empty());
+
+            // status 与其他过滤组合（source + status）
+            let gw_ok = load(None, Some("gateway"), None, Some("success"), 10);
+            assert_eq!(gw_ok.len(), 1);
+            assert_eq!(gw_ok[0].chat_id.as_deref(), Some("chat-1"));
         });
     }
 

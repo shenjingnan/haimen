@@ -1,9 +1,10 @@
 import { useState } from 'react';
+import AgentLogs from '@/pages/AgentLogs';
 import AgentSettings from '@/pages/Settings/AgentSettings';
 import ConnectorSettings from '@/pages/Settings/ConnectorSettings';
 import VoiceSettings from '@/pages/Settings/VoiceSettings';
 
-type Page = 'voice' | 'agent' | 'connectors';
+type Page = 'voice' | 'agent' | 'connectors' | 'logs';
 
 export default function App() {
   const [page, setPage] = useState<Page>('voice');
@@ -40,11 +41,21 @@ export default function App() {
           >
             消息渠道
           </button>
+          <button
+            type="button"
+            onClick={() => setPage('logs')}
+            className={`px-3 py-1 rounded text-sm cursor-pointer ${
+              page === 'logs' ? 'bg-primary text-primary-foreground' : 'hover:bg-muted'
+            }`}
+          >
+            对话记录
+          </button>
         </div>
       </nav>
       {page === 'voice' && <VoiceSettings />}
       {page === 'agent' && <AgentSettings />}
       {page === 'connectors' && <ConnectorSettings />}
+      {page === 'logs' && <AgentLogs />}
     </div>
   );
 }

@@ -156,3 +156,31 @@ export interface ConnectorSettings {
   lark: LarkSettings;
   dingtalk: DingTalkSettings;
 }
+
+// ── Agent 调用日志 ──
+
+export type AgentLogSource = 'gateway' | 'xiaozhi' | 'cli';
+export type AgentLogStatus = 'success' | 'error' | 'timeout';
+
+/** 一次 Agent 调用的日志记录（对应后端 agent_log::AgentLogRecord） */
+export interface AgentLogRecord {
+  timestamp: string;
+  source: AgentLogSource;
+  agent: string;
+  connector: string | null;
+  chat_id: string | null;
+  sender_id: string | null;
+  session_id: string | null;
+  work_dir: string;
+  input: string;
+  output: string | null;
+  status: AgentLogStatus;
+  error: string | null;
+  latency_ms: number;
+}
+
+export interface AgentLogsData {
+  /** 日志功能是否启用（后端 [agent_log] enabled） */
+  enabled: boolean;
+  records: AgentLogRecord[];
+}
