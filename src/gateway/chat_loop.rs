@@ -8,7 +8,7 @@ use tracing;
 use crate::config::settings::GatewayConfig;
 use crate::gateway::channel::MessageChannel;
 use crate::gateway::model::Message;
-use crate::gateway::provider::AgentProvider;
+use crate::gateway::provider::{AgentLogEvent, AgentProvider};
 use crate::gateway::session::{SessionKey, SessionManager};
 
 /// 内置网关命令
@@ -94,6 +94,7 @@ where
         let (need_new_session, existing_session_id) = session_mgr.get_or_create(&chat_id);
 
         // 调用 Agent 处理
+        let start = std::time::Instant::now();
         let result = if need_new_session {
             agent.process(&message.content, None, &work_dir).await
         } else {
@@ -102,8 +103,41 @@ where
                 .await
         };
 
+        // 记录一次 Agent 调用（每次 process 尝试都记一条）
+        let record_call = |status: &str,
+                           output: Option<&str>,
+                           error: Option<&str>,
+                           session_id: Option<&str>,
+                           latency: std::time::Duration,
+                           events: Vec<AgentLogEvent>| {
+            crate::agent_log::record(&crate::agent_log::AgentLogRecord {
+                timestamp: crate::datetime::iso_timestamp_now(),
+                source: "gateway".to_string(),
+                agent: agent.name().to_string(),
+                connector: Some(channel.name().to_string()),
+                chat_id: Some(chat_id.clone()),
+                sender_id: Some(message.sender_id.clone()),
+                session_id: session_id.map(String::from),
+                work_dir: work_dir.clone(),
+                input: message.content.clone(),
+                output: output.map(String::from),
+                status: status.to_string(),
+                error: error.map(String::from),
+                latency_ms: latency.as_millis() as u64,
+                events,
+            });
+        };
+
         match result {
-            Ok((response, new_session_id)) => {
+            Ok((agent_output, new_session_id)) => {
+                record_call(
+                    "success",
+                    Some(&agent_output.text),
+                    None,
+                    Some(&new_session_id),
+                    start.elapsed(),
+                    agent_output.events.clone(),
+                );
                 if need_new_session {
                     session_mgr.create_session(&chat_id, &new_session_id, &work_dir);
                 }
@@ -111,35 +145,53 @@ where
 
                 tracing::info!(
                     chat_id = %chat_id,
-                    total_chars = response.len(),
+                    total_chars = agent_output.text.len(),
                     session_id = %new_session_id,
-                    response = %response,
+                    response = %agent_output.text,
                     "Agent 处理完成"
                 );
 
                 let _ = channel
-                    .send(&chat_id, &format!("💡 处理完成:\n\n{}", response))
+                    .send(&chat_id, &format!("💡 处理完成:\n\n{}", agent_output.text))
                     .await;
             }
             Err(e) => {
                 // Resume 失败时自动降级为新会话重试
                 if !need_new_session {
+                    record_call("error", None, Some(&e), None, start.elapsed(), Vec::new());
                     tracing::warn!(chat_id = %chat_id, error = %e, "Resume 失败，降级为新会话重试");
                     session_mgr.remove_session(&chat_id);
 
+                    let retry_start = std::time::Instant::now();
                     match agent.process(&message.content, None, &work_dir).await {
-                        Ok((response, new_session_id)) => {
+                        Ok((agent_output, new_session_id)) => {
+                            record_call(
+                                "success",
+                                Some(&agent_output.text),
+                                None,
+                                Some(&new_session_id),
+                                retry_start.elapsed(),
+                                agent_output.events.clone(),
+                            );
                             session_mgr.create_session(&chat_id, &new_session_id, &work_dir);
                             tracing::info!(
                                 chat_id = %chat_id,
-                                response = %response,
+                                response = %agent_output.text,
                                 "降级重试成功"
                             );
                             let _ = channel
-                                .send(&chat_id, &format!("💡 处理完成:\n\n{}", response))
+                                .send(&chat_id, &format!("💡 处理完成:\n\n{}", agent_output.text))
                                 .await;
                         }
                         Err(e2) => {
+                            record_call(
+                                "error",
+                                None,
+                                Some(&e2),
+                                None,
+                                retry_start.elapsed(),
+                                Vec::new(),
+                            );
                             tracing::error!(chat_id = %chat_id, error = %e2, "降级重试也失败");
                             let _ = channel
                                 .send(&chat_id, &format!("❌ 处理失败: {}", e2))
@@ -147,6 +199,7 @@ where
                         }
                     }
                 } else {
+                    record_call("error", None, Some(&e), None, start.elapsed(), Vec::new());
                     tracing::error!(chat_id = %chat_id, error = %e, "Agent 处理失败");
                     let _ = channel.send(&chat_id, &format!("❌ 处理失败: {}", e)).await;
                 }
@@ -309,16 +362,50 @@ pub async fn run_unified_gateway(
         let (need_new_session, existing_session_id) = session_mgr.get_or_create(&chat_id);
 
         // 调用 Agent 处理（带超时）
+        let start = std::time::Instant::now();
         let process_fut = if need_new_session {
             agent.process(&message.content, None, &work_dir)
         } else {
             agent.process(&message.content, existing_session_id.as_deref(), &work_dir)
         };
 
+        // 记录一次 Agent 调用（每次 process 尝试都记一条）
+        let record_call = |status: &str,
+                           output: Option<&str>,
+                           error: Option<&str>,
+                           session_id: Option<&str>,
+                           latency: std::time::Duration,
+                           events: Vec<AgentLogEvent>| {
+            crate::agent_log::record(&crate::agent_log::AgentLogRecord {
+                timestamp: crate::datetime::iso_timestamp_now(),
+                source: "gateway".to_string(),
+                agent: agent.name().to_string(),
+                connector: Some(connector_name.clone()),
+                chat_id: Some(chat_id.clone()),
+                sender_id: Some(message.sender_id.clone()),
+                session_id: session_id.map(String::from),
+                work_dir: work_dir.clone(),
+                input: message.content.clone(),
+                output: output.map(String::from),
+                status: status.to_string(),
+                error: error.map(String::from),
+                latency_ms: latency.as_millis() as u64,
+                events,
+            });
+        };
+
         let result = tokio::time::timeout(timeout_duration, process_fut).await;
 
         match result {
-            Ok(Ok((response, new_session_id))) => {
+            Ok(Ok((agent_output, new_session_id))) => {
+                record_call(
+                    "success",
+                    Some(&agent_output.text),
+                    None,
+                    Some(&new_session_id),
+                    start.elapsed(),
+                    agent_output.events.clone(),
+                );
                 if need_new_session {
                     session_mgr.create_session(&chat_id, &new_session_id, &work_dir);
                 }
@@ -327,50 +414,79 @@ pub async fn run_unified_gateway(
                 tracing::info!(
                     connector = %connector_name,
                     chat_id = %chat_id,
-                    total_chars = response.len(),
+                    total_chars = agent_output.text.len(),
                     session_id = %new_session_id,
-                    response = %response,
+                    response = %agent_output.text,
                     "Agent 处理完成"
                 );
 
                 let _ = channel
                     .send(
                         &message.conversation_id,
-                        &format!("💡 处理完成:\n\n{}", response),
+                        &format!("💡 处理完成:\n\n{}", agent_output.text),
                     )
                     .await;
             }
             Ok(Err(e)) => {
                 // Resume 失败时自动降级为新会话重试（带超时保护）
                 if !need_new_session {
+                    record_call("error", None, Some(&e), None, start.elapsed(), Vec::new());
                     tracing::warn!(chat_id = %chat_id, error = %e, "Resume 失败，降级为新会话重试");
                     session_mgr.remove_session(&chat_id);
 
+                    let retry_start = std::time::Instant::now();
                     let retry_fut = agent.process(&message.content, None, &work_dir);
                     let retry_result = tokio::time::timeout(timeout_duration, retry_fut).await;
 
                     match retry_result {
-                        Ok(Ok((response, new_session_id))) => {
+                        Ok(Ok((agent_output, new_session_id))) => {
+                            record_call(
+                                "success",
+                                Some(&agent_output.text),
+                                None,
+                                Some(&new_session_id),
+                                retry_start.elapsed(),
+                                agent_output.events.clone(),
+                            );
                             session_mgr.create_session(&chat_id, &new_session_id, &work_dir);
                             tracing::info!(
                                 chat_id = %chat_id,
-                                response = %response,
+                                response = %agent_output.text,
                                 "降级重试成功"
                             );
                             let _ = channel
                                 .send(
                                     &message.conversation_id,
-                                    &format!("💡 处理完成:\n\n{}", response),
+                                    &format!("💡 处理完成:\n\n{}", agent_output.text),
                                 )
                                 .await;
                         }
                         Ok(Err(e2)) => {
+                            record_call(
+                                "error",
+                                None,
+                                Some(&e2),
+                                None,
+                                retry_start.elapsed(),
+                                Vec::new(),
+                            );
                             tracing::error!(chat_id = %chat_id, error = %e2, "降级重试也失败");
                             let _ = channel
                                 .send(&message.conversation_id, &format!("❌ 处理失败: {}", e2))
                                 .await;
                         }
                         Err(_) => {
+                            record_call(
+                                "timeout",
+                                None,
+                                Some(&format!(
+                                    "处理超时（超过 {} 秒）",
+                                    config.agent_timeout_secs
+                                )),
+                                None,
+                                retry_start.elapsed(),
+                                Vec::new(),
+                            );
                             tracing::error!(chat_id = %chat_id, timeout_secs = config.agent_timeout_secs, "降级重试超时");
                             let _ = channel
                                 .send(
@@ -384,6 +500,7 @@ pub async fn run_unified_gateway(
                         }
                     }
                 } else {
+                    record_call("error", None, Some(&e), None, start.elapsed(), Vec::new());
                     tracing::error!(chat_id = %chat_id, error = %e, "Agent 处理失败");
                     let _ = channel
                         .send(&message.conversation_id, &format!("❌ 处理失败: {}", e))
@@ -391,6 +508,17 @@ pub async fn run_unified_gateway(
                 }
             }
             Err(_elapsed) => {
+                record_call(
+                    "timeout",
+                    None,
+                    Some(&format!(
+                        "处理超时（超过 {} 秒）",
+                        config.agent_timeout_secs
+                    )),
+                    None,
+                    start.elapsed(),
+                    Vec::new(),
+                );
                 // 超时处理：通知用户并继续处理下一条消息
                 tracing::error!(
                     connector = %connector_name,
@@ -629,6 +757,7 @@ pub fn expand_tilde(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gateway::provider::AgentOutput;
     use std::collections::VecDeque;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -787,7 +916,7 @@ mod tests {
             _msg: &str,
             _session_id: Option<&str>,
             _work_dir: &str,
-        ) -> Result<(String, String), String> {
+        ) -> Result<(AgentOutput, String), String> {
             // delay simulation
             if !self.delay.is_zero() {
                 let do_sleep = loop {
@@ -827,7 +956,13 @@ mod tests {
                 .get(idx as usize % self.session_ids.len().max(1))
                 .cloned()
                 .unwrap_or_default();
-            Ok((text, sid))
+            Ok((
+                AgentOutput {
+                    text,
+                    events: Vec::new(),
+                },
+                sid,
+            ))
         }
     }
 
@@ -859,7 +994,11 @@ mod tests {
             .map(|(n, ch)| (n.to_string(), Box::new(ch) as Box<dyn MessageChannel>))
             .collect();
         let agent = Box::new(agent) as Box<dyn AgentProvider>;
-        run_unified_gateway(channels, &*agent, &config, cancel).await
+        // 隔离 HOME，避免测试写入真实 ~/.haimen/agent-logs
+        crate::test_util::run_with_temp_home_async(move |_home| async move {
+            run_unified_gateway(channels, &*agent, &config, cancel).await
+        })
+        .await
     }
 
     /// Create a token that cancels after `delay`.
@@ -1378,5 +1517,134 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "stream ends → Err");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Agent 调用日志记录
+    // ---------------------------------------------------------------------------
+
+    /// 读取临时 HOME 下当日 agent-logs 文件中的所有记录（按写入顺序）
+    fn read_agent_logs(home: &std::path::Path) -> Vec<crate::agent_log::AgentLogRecord> {
+        let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let path = home.join(format!(".haimen/agent-logs/{}.jsonl", day));
+        if !path.exists() {
+            return Vec::new();
+        }
+        let content = std::fs::read_to_string(&path).unwrap();
+        content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<crate::agent_log::AgentLogRecord>(l).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_agent_log_success_recorded() {
+        let ch = MockChannel::new("ch", vec![test_msg("c1", "hello")]);
+        let agent = MockAgent::new(vec!["response"]);
+        let cancel = CancellationToken::new();
+
+        let channels: Vec<(String, Box<dyn MessageChannel>)> =
+            vec![("ch".to_string(), Box::new(ch) as Box<dyn MessageChannel>)];
+        let agent = Box::new(agent) as Box<dyn AgentProvider>;
+
+        // 断言必须在临时 HOME 闭包内执行（TempDir 返回后即删除）
+        crate::test_util::run_with_temp_home_async(move |home| async move {
+            let result = run_unified_gateway(channels, &*agent, &default_config(), cancel).await;
+            assert!(result.is_err(), "stream end → Err");
+
+            let records = read_agent_logs(&home);
+            assert_eq!(records.len(), 1, "一次成功处理应产生一条记录");
+            assert_eq!(records[0].source, "gateway");
+            assert_eq!(records[0].status, "success");
+            assert_eq!(records[0].input, "hello");
+            assert_eq!(records[0].output.as_deref(), Some("response"));
+            assert_eq!(records[0].chat_id.as_deref(), Some("ch:c1"));
+            assert_eq!(records[0].sender_id.as_deref(), Some("test-sender"));
+            assert_eq!(records[0].connector.as_deref(), Some("ch"));
+        })
+        .await;
+    }
+
+    /// 首个调用成功（创建会话），后续 resume 调用失败、新会话重试成功。
+    /// 用于测试"resume 失败 → 降级重试"路径的记录。
+    struct ResumeFailAgent {
+        calls: AtomicU64,
+    }
+
+    #[async_trait]
+    impl AgentProvider for ResumeFailAgent {
+        fn name(&self) -> &str {
+            "resume-fail-agent"
+        }
+
+        async fn check_available(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn process(
+            &self,
+            _msg: &str,
+            session_id: Option<&str>,
+            _work_dir: &str,
+        ) -> Result<(AgentOutput, String), String> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Ok((
+                    AgentOutput {
+                        text: "first-ok".to_string(),
+                        events: Vec::new(),
+                    },
+                    "sess-1".to_string(),
+                ))
+            } else if session_id.is_some() {
+                Err("resume failed".to_string())
+            } else {
+                Ok((
+                    AgentOutput {
+                        text: "retry-ok".to_string(),
+                        events: Vec::new(),
+                    },
+                    "sess-2".to_string(),
+                ))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_agent_log_degrade_two_records() {
+        let ch = MockChannel::new(
+            "ch",
+            vec![test_msg("c1", "first"), test_msg("c1", "second")],
+        );
+        let agent = ResumeFailAgent {
+            calls: AtomicU64::new(0),
+        };
+        let cancel = CancellationToken::new();
+
+        let channels: Vec<(String, Box<dyn MessageChannel>)> =
+            vec![("ch".to_string(), Box::new(ch) as Box<dyn MessageChannel>)];
+        let agent = Box::new(agent) as Box<dyn AgentProvider>;
+
+        // 断言必须在临时 HOME 闭包内执行（TempDir 返回后即删除）
+        crate::test_util::run_with_temp_home_async(move |home| async move {
+            let result = run_unified_gateway(channels, &*agent, &default_config(), cancel).await;
+            assert!(result.is_err(), "stream end → Err");
+
+            // msg1 成功 → 1 条 success；msg2 resume 失败 + 降级重试成功 → error + success
+            let records = read_agent_logs(&home);
+            assert_eq!(
+                records.len(),
+                3,
+                "应产生三条记录（成功 + 降级 error + 重试 success）"
+            );
+            assert_eq!(records[0].status, "success");
+            assert_eq!(records[0].output.as_deref(), Some("first-ok"));
+            assert_eq!(records[1].status, "error", "第二条是 resume 失败");
+            assert_eq!(records[1].error.as_deref(), Some("resume failed"));
+            assert_eq!(records[2].status, "success", "第三条是降级重试成功");
+            assert_eq!(records[2].output.as_deref(), Some("retry-ok"));
+        })
+        .await;
     }
 }

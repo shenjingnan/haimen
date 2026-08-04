@@ -1,3 +1,4 @@
+pub mod agent_logs;
 pub mod agent_settings;
 pub mod connectors;
 pub mod system;

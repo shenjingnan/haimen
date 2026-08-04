@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::gateway::provider::AgentProvider;
+use crate::gateway::provider::{AgentOutput, AgentProvider};
 
 use super::mcp_client::McpClient;
 
@@ -30,14 +30,20 @@ impl AgentProvider for McpAgent {
         message: &str,
         _session_id: Option<&str>,
         _work_dir: &str,
-    ) -> Result<(String, String), String> {
+    ) -> Result<(AgentOutput, String), String> {
         let response = self
             .client
             .call_agent(message, "haimen gateway")
             .await
             .map_err(|e| format!("MCP Agent 调用失败: {}", e))?;
-        // MCP 协议级别无 session 概念，返回空字符串
-        Ok((response, String::new()))
+        // MCP 协议级别无 session 概念，返回空字符串；无内容轨迹
+        Ok((
+            AgentOutput {
+                text: response,
+                events: Vec::new(),
+            },
+            String::new(),
+        ))
     }
 
     async fn check_available(&self) -> Result<(), String> {

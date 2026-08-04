@@ -100,6 +100,24 @@ pub enum AgentCommands {
         #[arg(long)]
         provider: Option<String>,
     },
+    /// 查看 Agent 调用日志
+    Log {
+        /// 显示条数
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// 只显示指定日期 (YYYY-MM-DD)
+        #[arg(long)]
+        day: Option<String>,
+        /// 只显示指定来源（网关 / 语音 / CLI 调试）
+        #[arg(long)]
+        source: Option<String>,
+        /// 只显示指定会话 chat_id
+        #[arg(long)]
+        chat: Option<String>,
+        /// 以 JSON 数组输出
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// config 命令
@@ -144,11 +162,49 @@ async fn cmd_agent_run(provider: Option<String>, prompt: String) -> Result<(), S
     let work_dir = resolve_work_dir();
 
     println!("🤖 正在调用 {}...", agent.name());
-    let (response, session_id) = agent.process(&prompt, None, &work_dir).await?;
-
-    println!("{}", response);
-    tracing::info!(response_len = response.len(), session_id = %session_id, "Agent 处理完成");
-    Ok(())
+    let start = std::time::Instant::now();
+    match agent.process(&prompt, None, &work_dir).await {
+        Ok((agent_output, session_id)) => {
+            crate::agent_log::record(&crate::agent_log::AgentLogRecord {
+                timestamp: crate::datetime::iso_timestamp_now(),
+                source: "cli".to_string(),
+                agent: agent.name().to_string(),
+                connector: None,
+                chat_id: None,
+                sender_id: None,
+                session_id: Some(session_id.clone()),
+                work_dir: work_dir.clone(),
+                input: prompt.clone(),
+                output: Some(agent_output.text.clone()),
+                status: "success".to_string(),
+                error: None,
+                latency_ms: start.elapsed().as_millis() as u64,
+                events: agent_output.events.clone(),
+            });
+            println!("{}", agent_output.text);
+            tracing::info!(response_len = agent_output.text.len(), session_id = %session_id, "Agent 处理完成");
+            Ok(())
+        }
+        Err(e) => {
+            crate::agent_log::record(&crate::agent_log::AgentLogRecord {
+                timestamp: crate::datetime::iso_timestamp_now(),
+                source: "cli".to_string(),
+                agent: agent.name().to_string(),
+                connector: None,
+                chat_id: None,
+                sender_id: None,
+                session_id: None,
+                work_dir: work_dir.clone(),
+                input: prompt.clone(),
+                output: None,
+                status: "error".to_string(),
+                error: Some(e.clone()),
+                latency_ms: start.elapsed().as_millis() as u64,
+                events: Vec::new(),
+            });
+            Err(e)
+        }
+    }
 }
 
 /// agent chat 命令：交互式多轮对话
@@ -181,14 +237,142 @@ async fn cmd_agent_chat(provider: Option<String>) -> Result<(), String> {
             continue;
         }
 
-        let (response, new_session_id) = agent
+        let start = std::time::Instant::now();
+        match agent
             .process(&input, session_id.as_deref(), &work_dir)
-            .await?;
-        session_id = Some(new_session_id);
-
-        println!("{}", response);
+            .await
+        {
+            Ok((agent_output, new_session_id)) => {
+                crate::agent_log::record(&crate::agent_log::AgentLogRecord {
+                    timestamp: crate::datetime::iso_timestamp_now(),
+                    source: "cli".to_string(),
+                    agent: agent.name().to_string(),
+                    connector: None,
+                    chat_id: None,
+                    sender_id: None,
+                    session_id: Some(new_session_id.clone()),
+                    work_dir: work_dir.clone(),
+                    input: input.clone(),
+                    output: Some(agent_output.text.clone()),
+                    status: "success".to_string(),
+                    error: None,
+                    latency_ms: start.elapsed().as_millis() as u64,
+                    events: agent_output.events.clone(),
+                });
+                session_id = Some(new_session_id);
+                println!("{}", agent_output.text);
+            }
+            Err(e) => {
+                crate::agent_log::record(&crate::agent_log::AgentLogRecord {
+                    timestamp: crate::datetime::iso_timestamp_now(),
+                    source: "cli".to_string(),
+                    agent: agent.name().to_string(),
+                    connector: None,
+                    chat_id: None,
+                    sender_id: None,
+                    session_id: session_id.clone(),
+                    work_dir: work_dir.clone(),
+                    input: input.clone(),
+                    output: None,
+                    status: "error".to_string(),
+                    error: Some(e.clone()),
+                    latency_ms: start.elapsed().as_millis() as u64,
+                    events: Vec::new(),
+                });
+                return Err(e);
+            }
+        }
     }
 
+    Ok(())
+}
+
+/// agent log 命令：查看 Agent 调用日志
+///
+/// 查询前会先清理超过保留天数的过期日志。
+fn cmd_agent_log(
+    limit: usize,
+    day: Option<String>,
+    source: Option<String>,
+    chat: Option<String>,
+    json: bool,
+) -> Result<(), String> {
+    // 先清理过期日志
+    let retention = crate::config::settings::load_settings()
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+        .agent_log
+        .retention_days;
+    let removed = crate::agent_log::cleanup(retention);
+    if removed > 0 {
+        tracing::info!(removed = removed, "清理过期 Agent 日志");
+    }
+
+    let records = crate::agent_log::load(
+        day.as_deref(),
+        source.as_deref(),
+        chat.as_deref(),
+        None,
+        limit,
+    );
+
+    if records.is_empty() {
+        println!("（没有匹配的 Agent 调用日志）");
+        return Ok(());
+    }
+
+    if json {
+        let arr = serde_json::to_string_pretty(&records)
+            .map_err(|e| format!("序列化 Agent 日志失败: {}", e))?;
+        println!("{}", arr);
+        return Ok(());
+    }
+
+    for (i, rec) in records.iter().enumerate() {
+        let status_icon = match rec.status.as_str() {
+            "success" => "✅",
+            "error" => "❌",
+            "timeout" => "⏱",
+            _ => "•",
+        };
+        println!(
+            "[{}] {}  {}  {}  {} {}  {:.1}s",
+            i + 1,
+            rec.timestamp,
+            rec.source,
+            rec.agent,
+            status_icon,
+            rec.status,
+            rec.latency_ms as f64 / 1000.0,
+        );
+        let mut meta: Vec<String> = Vec::new();
+        if let Some(c) = &rec.connector {
+            meta.push(format!("connector: {}", c));
+        }
+        if let Some(cid) = &rec.chat_id {
+            meta.push(format!("chat: {}", cid));
+        }
+        if let Some(sid) = &rec.session_id {
+            meta.push(format!("session: {}", sid));
+        }
+        if let Some(s) = &rec.sender_id {
+            meta.push(format!("sender: {}", s));
+        }
+        if !meta.is_empty() {
+            println!("    {}", meta.join("  "));
+        }
+        println!("    in:  {}", rec.input);
+        match &rec.output {
+            Some(out) => println!("    out: {}", out),
+            None => {
+                if let Some(e) = &rec.error {
+                    println!("    err: {}", e);
+                }
+            }
+        }
+        println!();
+    }
     Ok(())
 }
 
@@ -223,6 +407,13 @@ pub async fn run(cli: Cli) -> Result<(), String> {
         Some(Commands::Agent(agent_cmd)) => match agent_cmd {
             AgentCommands::Run { provider, prompt } => cmd_agent_run(provider, prompt).await,
             AgentCommands::Chat { provider } => cmd_agent_chat(provider).await,
+            AgentCommands::Log {
+                limit,
+                day,
+                source,
+                chat,
+                json,
+            } => cmd_agent_log(limit, day, source, chat, json),
         },
         Some(Commands::Serve {
             host,
@@ -666,6 +857,66 @@ mod tests {
                 assert_eq!(xiaozhi_tts_voice.unwrap(), "zh_female_xiaohe");
             }
             _ => panic!("Expected Serve command"),
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // agent log 命令
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_cli_parse_agent_log() {
+        let cli = Cli::try_parse_from(["test", "agent", "log"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Agent(AgentCommands::Log {
+                limit,
+                day,
+                source,
+                chat,
+                json,
+            }) => {
+                assert_eq!(limit, 20, "默认显示 20 条");
+                assert!(day.is_none());
+                assert!(source.is_none());
+                assert!(chat.is_none());
+                assert!(!json);
+            }
+            _ => panic!("Expected agent log command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_agent_log_with_args() {
+        let cli = Cli::try_parse_from([
+            "test",
+            "agent",
+            "log",
+            "--limit",
+            "5",
+            "--day",
+            "2026-08-01",
+            "--source",
+            "gateway",
+            "--chat",
+            "lark:oc_xxx",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Agent(AgentCommands::Log {
+                limit,
+                day,
+                source,
+                chat,
+                json,
+            }) => {
+                assert_eq!(limit, 5);
+                assert_eq!(day.as_deref(), Some("2026-08-01"));
+                assert_eq!(source.as_deref(), Some("gateway"));
+                assert_eq!(chat.as_deref(), Some("lark:oc_xxx"));
+                assert!(json);
+            }
+            _ => panic!("Expected agent log command"),
         }
     }
 }

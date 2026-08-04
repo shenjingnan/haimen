@@ -156,3 +156,59 @@ export interface ConnectorSettings {
   lark: LarkSettings;
   dingtalk: DingTalkSettings;
 }
+
+// ── Agent 调用日志 ──
+
+export type AgentLogSource = 'gateway' | 'xiaozhi' | 'cli';
+export type AgentLogStatus = 'success' | 'error' | 'timeout';
+
+/** 思考事件（模型推理过程） */
+export interface AgentLogThinkingEvent {
+  type: 'thinking';
+  thinking: string;
+}
+
+/** 工具调用事件 */
+export interface AgentLogToolUseEvent {
+  type: 'tool_use';
+  id: string;
+  name: string;
+  /** 最终拼接好的入参 JSON */
+  input: unknown;
+}
+
+/** 工具执行结果事件 */
+export interface AgentLogToolResultEvent {
+  type: 'tool_result';
+  tool_use_id: string;
+  content: string;
+  is_error?: boolean;
+}
+
+/** 内容轨迹事件（thinking / tool_use / tool_result），按出现顺序 */
+export type AgentLogEvent = AgentLogThinkingEvent | AgentLogToolUseEvent | AgentLogToolResultEvent;
+
+/** 一次 Agent 调用的日志记录（对应后端 agent_log::AgentLogRecord） */
+export interface AgentLogRecord {
+  timestamp: string;
+  source: AgentLogSource;
+  agent: string;
+  connector: string | null;
+  chat_id: string | null;
+  sender_id: string | null;
+  session_id: string | null;
+  work_dir: string;
+  input: string;
+  output: string | null;
+  status: AgentLogStatus;
+  error: string | null;
+  latency_ms: number;
+  /** 完整内容轨迹；老记录可能缺省 */
+  events?: AgentLogEvent[];
+}
+
+export interface AgentLogsData {
+  /** 日志功能是否启用（后端 [agent_log] enabled） */
+  enabled: boolean;
+  records: AgentLogRecord[];
+}

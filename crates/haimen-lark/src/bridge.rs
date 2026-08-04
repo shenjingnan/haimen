@@ -75,9 +75,19 @@ impl LarkCliBridge {
         ))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // 必须保持子进程 stdin 打开：lark-cli 的 `event consume` 把 stdin EOF 当作
+        // "父进程要求停止"的信号，读到 EOF 会以 `context canceled` 退出，导致消息流中断。
+        // 这里用管道接管 stdin，并把写端句柄留在流状态里，确保其存活（不 drop）即不 EOF。
+        .stdin(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("启动 lark-cli 失败: {}", e))?;
+
+        // 持有 stdin 写端，防止 drop 后管道关闭（EOF）。无需写入，仅保证打开。
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "无法获取 lark-cli stdin".to_string())?;
 
         let stdout = child
             .stdout
@@ -87,17 +97,19 @@ impl LarkCliBridge {
         let reader = BufReader::new(stdout);
         let lines = reader.lines();
 
-        let stream =
-            futures_util::stream::unfold((lines, child), |(mut lines, _child)| async move {
+        let stream = futures_util::stream::unfold(
+            (lines, child, stdin),
+            |(mut lines, _child, _stdin)| async move {
                 match lines.next_line().await {
-                    Ok(Some(line)) => Some((Ok(line), (lines, _child))),
+                    Ok(Some(line)) => Some((Ok(line), (lines, _child, _stdin))),
                     Ok(None) => None,
                     Err(e) => Some((
                         Err(format!("读取 lark-cli 输出失败: {}", e)),
-                        (lines, _child),
+                        (lines, _child, _stdin),
                     )),
                 }
-            });
+            },
+        );
         Ok(Box::pin(stream))
     }
 
@@ -142,5 +154,35 @@ impl LarkCliBridge {
     #[allow(dead_code)]
     pub fn path(&self) -> &str {
         &self.lark_cli_path
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+    use std::time::Duration;
+
+    /// 回归测试：`stream()` 必须保持子进程 stdin 打开。
+    ///
+    /// lark-cli 的 `event consume` 在 stdin 读到 EOF 时会以 `context canceled` 退出，
+    /// 导致飞书消息流中断（见 bridge 实现说明）。此处用 `cat` 模拟
+    /// "stdin EOF 即退出"的子进程：
+    /// - 修复前：cat 继承测试进程 stdin（EOF）→ 立即退出 → 流结束
+    /// - 修复后：stdin 以管道持有 → cat 阻塞等待输入 → 流保持存活
+    #[tokio::test]
+    async fn test_stream_keeps_stdin_open() {
+        let bridge = LarkCliBridge::new("cat");
+        let mut stream = bridge.stream(&[]).await.expect("启动 cat 失败");
+
+        // 给子进程时间初始化/退出
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // 200ms 内流不应结束（cat 未因 stdin EOF 退出）；若流提前结束则测试失败
+        let next = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+        assert!(
+            next.is_err(),
+            "子进程 stdin 应保持打开，流不应因 EOF 提前结束"
+        );
     }
 }

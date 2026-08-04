@@ -87,6 +87,10 @@ pub async fn start(
         .route(
             "/api/v1/agent/providers",
             axum::routing::get(api::agent_settings::list_agent_providers),
+        )
+        .route(
+            "/api/v1/agent/logs",
+            axum::routing::get(api::agent_logs::get_agent_logs),
         );
 
     // 消息渠道（Connector）：飞书/钉钉配置读写 + 可用状态

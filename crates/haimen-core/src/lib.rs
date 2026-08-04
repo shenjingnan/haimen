@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::Stream;
 
-pub use provider::{AgentProvider, TextStream};
+pub use provider::{AgentEventReceiver, AgentLogEvent, AgentOutput, AgentProvider, TextStream};
 
 /// 统一消息模型
 #[derive(Debug, Clone)]

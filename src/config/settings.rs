@@ -222,6 +222,38 @@ impl Default for GatewayConfig {
     }
 }
 
+/// Agent 调用日志配置
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentLogConfig {
+    /// 是否记录 Agent 调用日志，默认开启
+    #[serde(default = "default_agent_log_enabled")]
+    pub enabled: bool,
+    /// 日志目录（未配置时默认 `~/.haimen/agent-logs`，支持 `~/` 展开）
+    #[serde(default)]
+    pub dir: Option<String>,
+    /// 日志保留天数，超过自动清理，默认 30
+    #[serde(default = "default_agent_log_retention")]
+    pub retention_days: u64,
+}
+
+fn default_agent_log_enabled() -> bool {
+    true
+}
+
+fn default_agent_log_retention() -> u64 {
+    30
+}
+
+impl Default for AgentLogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_agent_log_enabled(),
+            dir: None,
+            retention_days: default_agent_log_retention(),
+        }
+    }
+}
+
 /// 旧格式 Gateway 配置（用于向后兼容反序列化）
 #[derive(Debug, Clone, Deserialize)]
 struct GatewayConfigLegacy {
@@ -729,6 +761,9 @@ pub struct AppConfig {
     /// GitHub Webhook 配置（后续方案 A 移入 connectors）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github: Option<crate::connectors::github::config::GitHubConfig>,
+    /// Agent 调用日志配置
+    #[serde(default)]
+    pub agent_log: AgentLogConfig,
 }
 
 fn default_log_level() -> String {
@@ -746,6 +781,7 @@ impl Default for AppConfig {
             asr: AsrConfig::default(),
             tts: TtsConfig::default(),
             github: None,
+            agent_log: AgentLogConfig::default(),
         }
     }
 }
@@ -1020,6 +1056,7 @@ enabled = true
                 ..Default::default()
             },
             github: None,
+            agent_log: AgentLogConfig::default(),
         };
         let toml_str = toml::to_string(&config).unwrap();
         let deserialized: AppConfig = toml::from_str(&toml_str).unwrap();
@@ -1533,6 +1570,49 @@ api_key = "qwen-api-key"
             let config = AppConfig::default();
             save_settings(&config).unwrap();
             assert!(home.join(".haimen/settings.toml").exists());
+        });
+    }
+
+    // ---------------------------------------------------------------------------
+    // Agent 调用日志配置
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_agent_log_config_default() {
+        let cfg = AgentLogConfig::default();
+        assert!(cfg.enabled, "默认应开启");
+        assert!(cfg.dir.is_none(), "默认目录应为 None（用默认路径）");
+        assert_eq!(cfg.retention_days, 30, "默认保留 30 天");
+    }
+
+    #[test]
+    fn test_agent_log_config_toml_roundtrip() {
+        run_with_temp_home(|home| {
+            write_toml_settings(home, "[agent_log]\nenabled = true\nretention_days = 7\n");
+            let cfg = load_settings().unwrap().unwrap();
+            assert!(cfg.agent_log.enabled);
+            assert_eq!(cfg.agent_log.retention_days, 7);
+            assert!(cfg.agent_log.dir.is_none());
+        });
+    }
+
+    #[test]
+    fn test_agent_log_config_disabled_in_toml() {
+        run_with_temp_home(|home| {
+            write_toml_settings(home, "[agent_log]\nenabled = false\n");
+            let cfg = load_settings().unwrap().unwrap();
+            assert!(!cfg.agent_log.enabled);
+        });
+    }
+
+    #[test]
+    fn test_agent_log_config_missing_section_uses_default() {
+        run_with_temp_home(|home| {
+            // 无 [agent_log] 节 → 默认开启
+            write_toml_settings(home, "[gateway]\nactive_provider = \"claude-code\"\n");
+            let cfg = load_settings().unwrap().unwrap();
+            assert!(cfg.agent_log.enabled);
+            assert_eq!(cfg.agent_log.retention_days, 30);
         });
     }
 }
