@@ -52,7 +52,7 @@ use univoice::asr::{
 use univoice::tts::TtsRequest;
 
 use crate::config::settings::{AsrConfig, TtsConfig};
-use crate::gateway::provider::AgentProvider;
+use crate::gateway::provider::{AgentEventReceiver, AgentLogEvent, AgentProvider};
 use crate::xiaozhi_tts::pcm_to_opus_frames;
 
 /// 共享 TTS 配置类型
@@ -659,6 +659,7 @@ impl AsrLlmTtsStrategy {
     /// 记录一次 xiaozhi 路径的 Agent 调用日志
     ///
     /// `llm_session_id` 从共享态读取（记录时刻已是最新会话）。
+    #[allow(clippy::too_many_arguments)]
     fn record_agent_log(
         &self,
         user_text: &str,
@@ -667,6 +668,7 @@ impl AsrLlmTtsStrategy {
         status: &str,
         error: Option<&str>,
         latency: std::time::Duration,
+        events: Vec<AgentLogEvent>,
     ) {
         let llm_session = self.llm_session_id.lock().ok().and_then(|g| (*g).clone());
         crate::agent_log::record(&crate::agent_log::AgentLogRecord {
@@ -683,6 +685,7 @@ impl AsrLlmTtsStrategy {
             status: status.to_string(),
             error: error.map(String::from),
             latency_ms: latency.as_millis() as u64,
+            events,
         });
     }
 
@@ -1311,6 +1314,8 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         // agent 调用记录标记：固定文本模式跳过 LLM，不记录
         let mut agent_mode = false;
         let mut agent_start = std::time::Instant::now();
+        // Agent 流式调用的事件轨迹接收端（agent 模式才有，收尾记录时取回）
+        let mut agent_events_rx: Option<AgentEventReceiver> = None;
 
         let text_stream: Box<dyn futures_util::Stream<Item = String> + Unpin + Send> =
             if fixed_text_enabled {
@@ -1336,7 +1341,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
 
                 agent_mode = true;
                 agent_start = std::time::Instant::now();
-                let (text_stream_inner, new_llm_session_id) = match self
+                let (text_stream_inner, new_llm_session_id, events_rx) = match self
                     .agent
                     .process_stream(&user_text, current_llm_session.as_deref(), &self.work_dir)
                     .await
@@ -1351,10 +1356,12 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                             "error",
                             Some(&msg),
                             agent_start.elapsed(),
+                            Vec::new(),
                         );
                         return Err(msg);
                     }
                 };
+                agent_events_rx = Some(events_rx);
 
                 // 立即更新 LLM 会话 ID（用于多轮对话）
                 if let Ok(mut session) = self.llm_session_id.lock() {
@@ -1665,6 +1672,15 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
 
         // agent 模式成功完成才记录（固定文本模式无 LLM 调用）
         if agent_mode {
+            // 文本流已排空 → 后台读流任务已完成并投递事件轨迹；加超时防御
+            let events = match agent_events_rx.take() {
+                Some(mut rx) => tokio::time::timeout(std::time::Duration::from_secs(5), &mut rx)
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
             self.record_agent_log(
                 &user_text,
                 session_id,
@@ -1672,6 +1688,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 "success",
                 None,
                 agent_start.elapsed(),
+                events,
             );
         }
 
@@ -1760,8 +1777,8 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             )
             .await;
 
-            let (llm_text, new_llm_session_id) = match llm_response {
-                Ok(Ok((text, sid))) => (text, sid),
+            let (llm_text, new_llm_session_id, llm_events) = match llm_response {
+                Ok(Ok((output, sid))) => (output.text, sid, output.events),
                 Ok(Err(e)) => {
                     let msg = format!("AI Agent 处理失败: {}", e);
                     self.record_agent_log(
@@ -1771,6 +1788,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                         "error",
                         Some(&msg),
                         start.elapsed(),
+                        Vec::new(),
                     );
                     return Err(msg);
                 }
@@ -1783,6 +1801,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                         "timeout",
                         Some(&msg),
                         start.elapsed(),
+                        Vec::new(),
                     );
                     return Err(msg);
                 }
@@ -1796,6 +1815,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                     "error",
                     Some("AI Agent 返回空回复"),
                     start.elapsed(),
+                    Vec::new(),
                 );
                 return Err("AI Agent 返回空回复".to_string());
             }
@@ -1812,6 +1832,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 "success",
                 None,
                 start.elapsed(),
+                llm_events,
             );
 
             tracing::info!(
@@ -2249,6 +2270,7 @@ fn make_fallback_audio_frames() -> Result<Vec<AudioFrame>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gateway::provider::AgentOutput;
     use crate::xiaozhi_tts::pcm_to_opus_frames;
 
     // ─── 模拟 Agent —— 用于测试 ──────────────────────────────
@@ -2267,14 +2289,20 @@ mod tests {
             message: &str,
             session_id: Option<&str>,
             _work_dir: &str,
-        ) -> Result<(String, String), String> {
+        ) -> Result<(AgentOutput, String), String> {
             // 如果提供了 session_id，追加 "(continued)" 表示恢复了上下文
             let response = if session_id.is_some() {
                 format!("{} (continued)", message)
             } else {
                 message.to_string()
             };
-            Ok((response, "mock-session-id".to_string()))
+            Ok((
+                AgentOutput {
+                    text: response,
+                    events: Vec::new(),
+                },
+                "mock-session-id".to_string(),
+            ))
         }
 
         async fn check_available(&self) -> Result<(), String> {
@@ -2296,7 +2324,7 @@ mod tests {
             _message: &str,
             _session_id: Option<&str>,
             _work_dir: &str,
-        ) -> Result<(String, String), String> {
+        ) -> Result<(AgentOutput, String), String> {
             Err("模拟 Agent 失败".to_string())
         }
 
@@ -2319,8 +2347,14 @@ mod tests {
             _message: &str,
             _session_id: Option<&str>,
             _work_dir: &str,
-        ) -> Result<(String, String), String> {
-            Ok((String::new(), "empty-session".to_string()))
+        ) -> Result<(AgentOutput, String), String> {
+            Ok((
+                AgentOutput {
+                    text: String::new(),
+                    events: Vec::new(),
+                },
+                "empty-session".to_string(),
+            ))
         }
 
         async fn check_available(&self) -> Result<(), String> {
@@ -2559,22 +2593,22 @@ mod tests {
     #[tokio::test]
     async fn test_t22_mock_agent_no_session() {
         let agent = MockAgent;
-        let (response, session_id) = agent
+        let (output, session_id) = agent
             .process("你好", None, "/tmp")
             .await
             .expect("MockAgent 应成功");
-        assert_eq!(response, "你好");
+        assert_eq!(output.text, "你好");
         assert_eq!(session_id, "mock-session-id");
     }
 
     #[tokio::test]
     async fn test_t23_mock_agent_with_session() {
         let agent = MockAgent;
-        let (response, session_id) = agent
+        let (output, session_id) = agent
             .process("你好", Some("prev-session"), "/tmp")
             .await
             .expect("MockAgent 应成功");
-        assert_eq!(response, "你好 (continued)");
+        assert_eq!(output.text, "你好 (continued)");
         assert_eq!(session_id, "mock-session-id");
     }
 
@@ -2670,7 +2704,7 @@ mod tests {
     #[tokio::test]
     async fn test_t33_mock_agent_process_stream() {
         let agent = MockAgent;
-        let (mut stream, sid) = agent
+        let (mut stream, sid, events_rx) = agent
             .process_stream("你好", None, "/tmp")
             .await
             .expect("MockAgent process_stream 应成功");
@@ -2680,6 +2714,9 @@ mod tests {
         }
         assert_eq!(result, "你好", "process_stream 应返回 process 的结果");
         assert_eq!(sid, "mock-session-id");
+        // 默认实现应立即投递空事件轨迹
+        let events = events_rx.await.unwrap_or_default();
+        assert!(events.is_empty());
     }
 
     // ─── ASR 提供者工厂测试 ──────────────────────────

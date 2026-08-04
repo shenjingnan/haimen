@@ -164,7 +164,7 @@ async fn cmd_agent_run(provider: Option<String>, prompt: String) -> Result<(), S
     println!("🤖 正在调用 {}...", agent.name());
     let start = std::time::Instant::now();
     match agent.process(&prompt, None, &work_dir).await {
-        Ok((response, session_id)) => {
+        Ok((agent_output, session_id)) => {
             crate::agent_log::record(&crate::agent_log::AgentLogRecord {
                 timestamp: crate::datetime::iso_timestamp_now(),
                 source: "cli".to_string(),
@@ -175,13 +175,14 @@ async fn cmd_agent_run(provider: Option<String>, prompt: String) -> Result<(), S
                 session_id: Some(session_id.clone()),
                 work_dir: work_dir.clone(),
                 input: prompt.clone(),
-                output: Some(response.clone()),
+                output: Some(agent_output.text.clone()),
                 status: "success".to_string(),
                 error: None,
                 latency_ms: start.elapsed().as_millis() as u64,
+                events: agent_output.events.clone(),
             });
-            println!("{}", response);
-            tracing::info!(response_len = response.len(), session_id = %session_id, "Agent 处理完成");
+            println!("{}", agent_output.text);
+            tracing::info!(response_len = agent_output.text.len(), session_id = %session_id, "Agent 处理完成");
             Ok(())
         }
         Err(e) => {
@@ -199,6 +200,7 @@ async fn cmd_agent_run(provider: Option<String>, prompt: String) -> Result<(), S
                 status: "error".to_string(),
                 error: Some(e.clone()),
                 latency_ms: start.elapsed().as_millis() as u64,
+                events: Vec::new(),
             });
             Err(e)
         }
@@ -240,7 +242,7 @@ async fn cmd_agent_chat(provider: Option<String>) -> Result<(), String> {
             .process(&input, session_id.as_deref(), &work_dir)
             .await
         {
-            Ok((response, new_session_id)) => {
+            Ok((agent_output, new_session_id)) => {
                 crate::agent_log::record(&crate::agent_log::AgentLogRecord {
                     timestamp: crate::datetime::iso_timestamp_now(),
                     source: "cli".to_string(),
@@ -251,13 +253,14 @@ async fn cmd_agent_chat(provider: Option<String>) -> Result<(), String> {
                     session_id: Some(new_session_id.clone()),
                     work_dir: work_dir.clone(),
                     input: input.clone(),
-                    output: Some(response.clone()),
+                    output: Some(agent_output.text.clone()),
                     status: "success".to_string(),
                     error: None,
                     latency_ms: start.elapsed().as_millis() as u64,
+                    events: agent_output.events.clone(),
                 });
                 session_id = Some(new_session_id);
-                println!("{}", response);
+                println!("{}", agent_output.text);
             }
             Err(e) => {
                 crate::agent_log::record(&crate::agent_log::AgentLogRecord {
@@ -274,6 +277,7 @@ async fn cmd_agent_chat(provider: Option<String>) -> Result<(), String> {
                     status: "error".to_string(),
                     error: Some(e.clone()),
                     latency_ms: start.elapsed().as_millis() as u64,
+                    events: Vec::new(),
                 });
                 return Err(e);
             }

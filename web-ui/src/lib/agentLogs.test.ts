@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AgentLogRecord } from '@/types';
-import { formatTime, groupByChat, todayStr, UNGROUPED } from './agentLogs';
+import { formatTime, groupByChat, prettyJson, todayStr, UNGROUPED } from './agentLogs';
 
 function makeRecord(overrides: Partial<AgentLogRecord> & { timestamp: string }): AgentLogRecord {
   return {
@@ -16,6 +16,7 @@ function makeRecord(overrides: Partial<AgentLogRecord> & { timestamp: string }):
     status: 'success',
     error: null,
     latency_ms: 100,
+    events: [],
     ...overrides,
   };
 }
@@ -86,5 +87,23 @@ describe('todayStr', () => {
     const d = new Date();
     const pad = (n: number) => String(n).padStart(2, '0');
     expect(todayStr()).toBe(`${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`);
+  });
+});
+
+describe('prettyJson', () => {
+  it('对象格式化为缩进 JSON', () => {
+    expect(prettyJson({ file_path: '/tmp/a.txt' })).toBe('{\n  "file_path": "/tmp/a.txt"\n}');
+  });
+
+  it('嵌套对象保留层级', () => {
+    expect(prettyJson({ a: { b: [1, 2] } })).toBe(
+      '{\n  "a": {\n    "b": [\n      1,\n      2\n    ]\n  }\n}',
+    );
+  });
+
+  it('字符串与 null 回退为 String()', () => {
+    expect(prettyJson('hello')).toBe('"hello"');
+    expect(prettyJson(null)).toBe('null');
+    expect(prettyJson(undefined)).toBe('undefined');
   });
 });

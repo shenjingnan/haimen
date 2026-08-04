@@ -149,10 +149,10 @@ impl WebhookHandler for GitHubConnector {
                 )
                 .await
             {
-                Ok((response, _session_id)) => {
+                Ok((agent_output, _session_id)) => {
                     // 7. 通过 GitHub API 回复评论
                     if let Err(e) =
-                        handler::post_comment(&token, &issue.comments_url, &response).await
+                        handler::post_comment(&token, &issue.comments_url, &agent_output.text).await
                     {
                         tracing::error!(error = %e, "GitHub 回复评论失败");
                     }

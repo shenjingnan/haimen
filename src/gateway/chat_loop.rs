@@ -8,7 +8,7 @@ use tracing;
 use crate::config::settings::GatewayConfig;
 use crate::gateway::channel::MessageChannel;
 use crate::gateway::model::Message;
-use crate::gateway::provider::AgentProvider;
+use crate::gateway::provider::{AgentLogEvent, AgentProvider};
 use crate::gateway::session::{SessionKey, SessionManager};
 
 /// 内置网关命令
@@ -108,7 +108,8 @@ where
                            output: Option<&str>,
                            error: Option<&str>,
                            session_id: Option<&str>,
-                           latency: std::time::Duration| {
+                           latency: std::time::Duration,
+                           events: Vec<AgentLogEvent>| {
             crate::agent_log::record(&crate::agent_log::AgentLogRecord {
                 timestamp: crate::datetime::iso_timestamp_now(),
                 source: "gateway".to_string(),
@@ -123,17 +124,19 @@ where
                 status: status.to_string(),
                 error: error.map(String::from),
                 latency_ms: latency.as_millis() as u64,
+                events,
             });
         };
 
         match result {
-            Ok((response, new_session_id)) => {
+            Ok((agent_output, new_session_id)) => {
                 record_call(
                     "success",
-                    Some(&response),
+                    Some(&agent_output.text),
                     None,
                     Some(&new_session_id),
                     start.elapsed(),
+                    agent_output.events.clone(),
                 );
                 if need_new_session {
                     session_mgr.create_session(&chat_id, &new_session_id, &work_dir);
@@ -142,45 +145,53 @@ where
 
                 tracing::info!(
                     chat_id = %chat_id,
-                    total_chars = response.len(),
+                    total_chars = agent_output.text.len(),
                     session_id = %new_session_id,
-                    response = %response,
+                    response = %agent_output.text,
                     "Agent 处理完成"
                 );
 
                 let _ = channel
-                    .send(&chat_id, &format!("💡 处理完成:\n\n{}", response))
+                    .send(&chat_id, &format!("💡 处理完成:\n\n{}", agent_output.text))
                     .await;
             }
             Err(e) => {
                 // Resume 失败时自动降级为新会话重试
                 if !need_new_session {
-                    record_call("error", None, Some(&e), None, start.elapsed());
+                    record_call("error", None, Some(&e), None, start.elapsed(), Vec::new());
                     tracing::warn!(chat_id = %chat_id, error = %e, "Resume 失败，降级为新会话重试");
                     session_mgr.remove_session(&chat_id);
 
                     let retry_start = std::time::Instant::now();
                     match agent.process(&message.content, None, &work_dir).await {
-                        Ok((response, new_session_id)) => {
+                        Ok((agent_output, new_session_id)) => {
                             record_call(
                                 "success",
-                                Some(&response),
+                                Some(&agent_output.text),
                                 None,
                                 Some(&new_session_id),
                                 retry_start.elapsed(),
+                                agent_output.events.clone(),
                             );
                             session_mgr.create_session(&chat_id, &new_session_id, &work_dir);
                             tracing::info!(
                                 chat_id = %chat_id,
-                                response = %response,
+                                response = %agent_output.text,
                                 "降级重试成功"
                             );
                             let _ = channel
-                                .send(&chat_id, &format!("💡 处理完成:\n\n{}", response))
+                                .send(&chat_id, &format!("💡 处理完成:\n\n{}", agent_output.text))
                                 .await;
                         }
                         Err(e2) => {
-                            record_call("error", None, Some(&e2), None, retry_start.elapsed());
+                            record_call(
+                                "error",
+                                None,
+                                Some(&e2),
+                                None,
+                                retry_start.elapsed(),
+                                Vec::new(),
+                            );
                             tracing::error!(chat_id = %chat_id, error = %e2, "降级重试也失败");
                             let _ = channel
                                 .send(&chat_id, &format!("❌ 处理失败: {}", e2))
@@ -188,7 +199,7 @@ where
                         }
                     }
                 } else {
-                    record_call("error", None, Some(&e), None, start.elapsed());
+                    record_call("error", None, Some(&e), None, start.elapsed(), Vec::new());
                     tracing::error!(chat_id = %chat_id, error = %e, "Agent 处理失败");
                     let _ = channel.send(&chat_id, &format!("❌ 处理失败: {}", e)).await;
                 }
@@ -363,7 +374,8 @@ pub async fn run_unified_gateway(
                            output: Option<&str>,
                            error: Option<&str>,
                            session_id: Option<&str>,
-                           latency: std::time::Duration| {
+                           latency: std::time::Duration,
+                           events: Vec<AgentLogEvent>| {
             crate::agent_log::record(&crate::agent_log::AgentLogRecord {
                 timestamp: crate::datetime::iso_timestamp_now(),
                 source: "gateway".to_string(),
@@ -378,19 +390,21 @@ pub async fn run_unified_gateway(
                 status: status.to_string(),
                 error: error.map(String::from),
                 latency_ms: latency.as_millis() as u64,
+                events,
             });
         };
 
         let result = tokio::time::timeout(timeout_duration, process_fut).await;
 
         match result {
-            Ok(Ok((response, new_session_id))) => {
+            Ok(Ok((agent_output, new_session_id))) => {
                 record_call(
                     "success",
-                    Some(&response),
+                    Some(&agent_output.text),
                     None,
                     Some(&new_session_id),
                     start.elapsed(),
+                    agent_output.events.clone(),
                 );
                 if need_new_session {
                     session_mgr.create_session(&chat_id, &new_session_id, &work_dir);
@@ -400,23 +414,23 @@ pub async fn run_unified_gateway(
                 tracing::info!(
                     connector = %connector_name,
                     chat_id = %chat_id,
-                    total_chars = response.len(),
+                    total_chars = agent_output.text.len(),
                     session_id = %new_session_id,
-                    response = %response,
+                    response = %agent_output.text,
                     "Agent 处理完成"
                 );
 
                 let _ = channel
                     .send(
                         &message.conversation_id,
-                        &format!("💡 处理完成:\n\n{}", response),
+                        &format!("💡 处理完成:\n\n{}", agent_output.text),
                     )
                     .await;
             }
             Ok(Err(e)) => {
                 // Resume 失败时自动降级为新会话重试（带超时保护）
                 if !need_new_session {
-                    record_call("error", None, Some(&e), None, start.elapsed());
+                    record_call("error", None, Some(&e), None, start.elapsed(), Vec::new());
                     tracing::warn!(chat_id = %chat_id, error = %e, "Resume 失败，降级为新会话重试");
                     session_mgr.remove_session(&chat_id);
 
@@ -425,29 +439,37 @@ pub async fn run_unified_gateway(
                     let retry_result = tokio::time::timeout(timeout_duration, retry_fut).await;
 
                     match retry_result {
-                        Ok(Ok((response, new_session_id))) => {
+                        Ok(Ok((agent_output, new_session_id))) => {
                             record_call(
                                 "success",
-                                Some(&response),
+                                Some(&agent_output.text),
                                 None,
                                 Some(&new_session_id),
                                 retry_start.elapsed(),
+                                agent_output.events.clone(),
                             );
                             session_mgr.create_session(&chat_id, &new_session_id, &work_dir);
                             tracing::info!(
                                 chat_id = %chat_id,
-                                response = %response,
+                                response = %agent_output.text,
                                 "降级重试成功"
                             );
                             let _ = channel
                                 .send(
                                     &message.conversation_id,
-                                    &format!("💡 处理完成:\n\n{}", response),
+                                    &format!("💡 处理完成:\n\n{}", agent_output.text),
                                 )
                                 .await;
                         }
                         Ok(Err(e2)) => {
-                            record_call("error", None, Some(&e2), None, retry_start.elapsed());
+                            record_call(
+                                "error",
+                                None,
+                                Some(&e2),
+                                None,
+                                retry_start.elapsed(),
+                                Vec::new(),
+                            );
                             tracing::error!(chat_id = %chat_id, error = %e2, "降级重试也失败");
                             let _ = channel
                                 .send(&message.conversation_id, &format!("❌ 处理失败: {}", e2))
@@ -463,6 +485,7 @@ pub async fn run_unified_gateway(
                                 )),
                                 None,
                                 retry_start.elapsed(),
+                                Vec::new(),
                             );
                             tracing::error!(chat_id = %chat_id, timeout_secs = config.agent_timeout_secs, "降级重试超时");
                             let _ = channel
@@ -477,7 +500,7 @@ pub async fn run_unified_gateway(
                         }
                     }
                 } else {
-                    record_call("error", None, Some(&e), None, start.elapsed());
+                    record_call("error", None, Some(&e), None, start.elapsed(), Vec::new());
                     tracing::error!(chat_id = %chat_id, error = %e, "Agent 处理失败");
                     let _ = channel
                         .send(&message.conversation_id, &format!("❌ 处理失败: {}", e))
@@ -494,6 +517,7 @@ pub async fn run_unified_gateway(
                     )),
                     None,
                     start.elapsed(),
+                    Vec::new(),
                 );
                 // 超时处理：通知用户并继续处理下一条消息
                 tracing::error!(
@@ -733,6 +757,7 @@ pub fn expand_tilde(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gateway::provider::AgentOutput;
     use std::collections::VecDeque;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -891,7 +916,7 @@ mod tests {
             _msg: &str,
             _session_id: Option<&str>,
             _work_dir: &str,
-        ) -> Result<(String, String), String> {
+        ) -> Result<(AgentOutput, String), String> {
             // delay simulation
             if !self.delay.is_zero() {
                 let do_sleep = loop {
@@ -931,7 +956,13 @@ mod tests {
                 .get(idx as usize % self.session_ids.len().max(1))
                 .cloned()
                 .unwrap_or_default();
-            Ok((text, sid))
+            Ok((
+                AgentOutput {
+                    text,
+                    events: Vec::new(),
+                },
+                sid,
+            ))
         }
     }
 
@@ -1556,14 +1587,26 @@ mod tests {
             _msg: &str,
             session_id: Option<&str>,
             _work_dir: &str,
-        ) -> Result<(String, String), String> {
+        ) -> Result<(AgentOutput, String), String> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
-                Ok(("first-ok".to_string(), "sess-1".to_string()))
+                Ok((
+                    AgentOutput {
+                        text: "first-ok".to_string(),
+                        events: Vec::new(),
+                    },
+                    "sess-1".to_string(),
+                ))
             } else if session_id.is_some() {
                 Err("resume failed".to_string())
             } else {
-                Ok(("retry-ok".to_string(), "sess-2".to_string()))
+                Ok((
+                    AgentOutput {
+                        text: "retry-ok".to_string(),
+                        events: Vec::new(),
+                    },
+                    "sess-2".to_string(),
+                ))
             }
         }
     }

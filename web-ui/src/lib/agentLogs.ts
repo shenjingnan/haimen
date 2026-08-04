@@ -80,3 +80,15 @@ export function todayStr(): string {
   const pad = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
+
+/** 将任意值格式化为缩进 JSON 字符串；非对象值回退为 String() */
+export function prettyJson(value: unknown): string {
+  if (value == null) return String(value);
+  try {
+    const s = JSON.stringify(value, null, 2);
+    if (s != null) return s;
+  } catch {
+    // 循环引用等序列化失败 → 回退 String
+  }
+  return String(value);
+}

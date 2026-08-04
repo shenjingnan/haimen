@@ -11,6 +11,9 @@ repository = "https://github.com/shenjingnan/haimen"
 async-trait = { workspace = true }
 chrono = { workspace = true }
 futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 
 # 仅 Windows：解析 npm 安装的 CLI shim（.cmd/.bat）
 [target.'cfg(windows)'.dependencies]

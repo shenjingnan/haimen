@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing;
 
-use crate::gateway::provider::{AgentProvider, TextStream};
+use crate::gateway::provider::{AgentEventReceiver, AgentOutput, AgentProvider, TextStream};
 
 /// Codex CLI Agent
 ///
@@ -28,13 +28,15 @@ impl AgentProvider for CodexAgent {
     }
 
     /// 批处理：等待 codex 全部输出完成后返回完整文本
+    /// （codex 的 reasoning/tool 轨迹捕获留作后续，events 为空）
     async fn process(
         &self,
         message: &str,
         session_id: Option<&str>,
         work_dir: &str,
-    ) -> Result<(String, String), String> {
-        let (mut stream, sid) = self.process_stream(message, session_id, work_dir).await?;
+    ) -> Result<(AgentOutput, String), String> {
+        let (mut stream, sid, _events_rx) =
+            self.process_stream(message, session_id, work_dir).await?;
         let mut full_text = String::new();
         while let Some(chunk) = stream.next().await {
             full_text.push_str(&chunk);
@@ -43,7 +45,13 @@ impl AgentProvider for CodexAgent {
         if final_text.is_empty() {
             return Err("Codex 返回为空".to_string());
         }
-        Ok((final_text, sid))
+        Ok((
+            AgentOutput {
+                text: final_text,
+                events: Vec::new(),
+            },
+            sid,
+        ))
     }
 
     /// 流式处理：逐块返回 codex 的文本输出
@@ -52,8 +60,12 @@ impl AgentProvider for CodexAgent {
         message: &str,
         session_id: Option<&str>,
         work_dir: &str,
-    ) -> Result<(TextStream, String), String> {
-        process_with_codex_stream(message, session_id, work_dir).await
+    ) -> Result<(TextStream, String, AgentEventReceiver), String> {
+        let (stream, sid) = process_with_codex_stream(message, session_id, work_dir).await?;
+        // 事件轨迹为空，直接投递空列表
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = tx.send(Vec::new());
+        Ok((stream, sid, rx))
     }
 
     async fn check_available(&self) -> Result<(), String> {

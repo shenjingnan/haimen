@@ -1,3 +1,4 @@
+import { ChevronRight } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { getAgentLogs } from '@/api/agentLogs';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
@@ -9,12 +10,13 @@ import { Skeleton } from '@/components/ui/skeleton';
 import {
   formatTime,
   groupByChat,
+  prettyJson,
   STATUS_META,
   sourceLabel,
   todayStr,
   UNGROUPED,
 } from '@/lib/agentLogs';
-import type { AgentLogRecord, AgentLogSource, AgentLogStatus } from '@/types';
+import type { AgentLogEvent, AgentLogRecord, AgentLogSource, AgentLogStatus } from '@/types';
 
 const MAX_LIMIT = 5000;
 const INITIAL_LIMIT = 200;
@@ -58,7 +60,72 @@ function FilterChip({
   );
 }
 
-/** 单条调用记录的气泡（用户输入 + Agent 输出/错误） */
+/** 事件在记录内是静态不可变列表，key 只需在本条记录内稳定即可 */
+function eventKey(ev: AgentLogEvent, i: number): string {
+  if (ev.type === 'tool_use') return `tool_use:${ev.id}`;
+  if (ev.type === 'tool_result') return `tool_result:${ev.tool_use_id}`;
+  return `thinking:${i}`;
+}
+
+/** 内容轨迹事件展示：思考 / 工具调用 / 工具结果（可折叠） */
+function TraceEvent({ ev }: { ev: AgentLogEvent }) {
+  if (ev.type === 'thinking') {
+    return (
+      <details className="group rounded-md border border-input bg-muted/50 px-2 py-1.5 text-xs text-muted-foreground">
+        <summary className="flex cursor-pointer select-none list-none items-center gap-1.5 [&::-webkit-details-marker]:hidden">
+          <ChevronRight className="h-3 w-3 transition-transform group-open:rotate-90" />💭 思考
+        </summary>
+        <pre className="mt-1.5 whitespace-pre-wrap break-words text-foreground">{ev.thinking}</pre>
+      </details>
+    );
+  }
+
+  if (ev.type === 'tool_use') {
+    return (
+      <div className="rounded-md border border-input bg-muted/50 px-2 py-1.5 text-xs">
+        <div className="flex items-center gap-1.5 font-medium text-foreground">
+          🔧 工具调用
+          <span className="text-muted-foreground">{ev.name}</span>
+        </div>
+        <details className="group mt-1 text-muted-foreground">
+          <summary className="flex cursor-pointer select-none list-none items-center gap-1.5 [&::-webkit-details-marker]:hidden">
+            <ChevronRight className="h-3 w-3 transition-transform group-open:rotate-90" />
+            入参
+          </summary>
+          <pre className="mt-1.5 whitespace-pre-wrap break-words text-foreground">
+            {prettyJson(ev.input)}
+          </pre>
+        </details>
+      </div>
+    );
+  }
+
+  // tool_result
+  return (
+    <div className="rounded-md border border-input bg-muted/50 px-2 py-1.5 text-xs">
+      <div className="flex items-center gap-1.5 font-medium text-foreground">
+        ⚙️ 工具结果
+        {ev.is_error && (
+          <Badge
+            variant="outline"
+            className="bg-destructive/10 text-destructive border-transparent"
+          >
+            出错
+          </Badge>
+        )}
+      </div>
+      <details className="group mt-1 text-muted-foreground">
+        <summary className="flex cursor-pointer select-none list-none items-center gap-1.5 [&::-webkit-details-marker]:hidden">
+          <ChevronRight className="h-3 w-3 transition-transform group-open:rotate-90" />
+          结果
+        </summary>
+        <pre className="mt-1.5 whitespace-pre-wrap break-words text-foreground">{ev.content}</pre>
+      </details>
+    </div>
+  );
+}
+
+/** 单条调用记录的气泡（用户输入 + 内容轨迹 + Agent 输出/错误） */
 function MessageBubble({ rec }: { rec: AgentLogRecord }) {
   const meta = STATUS_META[rec.status];
   return (
@@ -79,6 +146,14 @@ function MessageBubble({ rec }: { rec: AgentLogRecord }) {
           {rec.input}
         </div>
       </div>
+      {/* 内容轨迹（思考 / 工具调用 / 工具结果），介于输入与最终输出之间 */}
+      {rec.events && rec.events.length > 0 && (
+        <div className="flex flex-col gap-1.5">
+          {rec.events.map((ev, i) => (
+            <TraceEvent key={eventKey(ev, i)} ev={ev} />
+          ))}
+        </div>
+      )}
       {/* Agent 输出（右）；失败/超时展示错误信息 */}
       <div className="flex justify-end">
         {rec.output != null ? (

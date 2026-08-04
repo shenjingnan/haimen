@@ -15,6 +15,7 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 
 use crate::config::settings::{AgentLogConfig, load_settings};
+use haimen_core::provider::AgentLogEvent;
 
 /// 一次 Agent 调用的日志记录
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -45,6 +46,11 @@ pub struct AgentLogRecord {
     pub error: Option<String>,
     /// Agent 调用耗时（毫秒）
     pub latency_ms: u64,
+    /// 完整内容轨迹（thinking / tool_use / tool_result）
+    ///
+    /// 老记录（无此字段）反序列化为 `[]`；为空时序列化省略该字段。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<AgentLogEvent>,
 }
 
 /// 全局写锁，串行化并发追加，防止多连接器/xiaozhi 并发写时交错
@@ -243,6 +249,7 @@ mod tests {
             status: "success".to_string(),
             error: None,
             latency_ms: 123,
+            events: Vec::new(),
         }
     }
 
@@ -441,5 +448,43 @@ mod tests {
                 assert!(parsed.chat_id.is_some());
             }
         });
+    }
+
+    #[test]
+    fn test_load_old_record_without_events() {
+        // 老版本 JSONL 无 events 字段：应正常反序列化为空轨迹，不整行跳过
+        let old_json = r#"{"timestamp":"2026-08-01T10:00:00+08:00","source":"gateway","agent":"claude-code","connector":"lark","chat_id":"c1","sender_id":"u1","session_id":"s1","work_dir":"/tmp","input":"hi","output":"hello","status":"success","error":null,"latency_ms":50}"#;
+        let rec: AgentLogRecord = serde_json::from_str(old_json).unwrap();
+        assert!(rec.events.is_empty());
+    }
+
+    #[test]
+    fn test_events_roundtrip_and_skip_when_empty() {
+        // 带事件轨迹：序列化/反序列化往返一致
+        let mut rec = sample_record("gateway", "chat-e");
+        rec.events = vec![
+            AgentLogEvent::Thinking {
+                thinking: "先看看".to_string(),
+            },
+            AgentLogEvent::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "Read".to_string(),
+                input: serde_json::json!({ "file_path": "/tmp/a.txt" }),
+            },
+            AgentLogEvent::ToolResult {
+                tool_use_id: "toolu_1".to_string(),
+                content: "file content".to_string(),
+                is_error: false,
+            },
+        ];
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"events\""), "events 非空时应序列化");
+        let parsed: AgentLogRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, rec);
+
+        // 空轨迹：序列化时省略 events 字段（与老记录形状一致）
+        let empty = sample_record("cli", "chat-empty");
+        let json = serde_json::to_string(&empty).unwrap();
+        assert!(!json.contains("\"events\""), "events 为空时应省略该字段");
     }
 }
