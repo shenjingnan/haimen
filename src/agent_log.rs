@@ -297,9 +297,11 @@ mod tests {
             let custom = home.join("my-logs");
             let settings_dir = home.join(".haimen");
             std::fs::create_dir_all(&settings_dir).unwrap();
+            // 用 TOML 字面字符串（单引号）写路径：Windows 路径含反斜杠，
+            // 基本字符串（双引号）会把反斜杠当转义符导致解析失败。
             std::fs::write(
                 settings_dir.join("settings.toml"),
-                format!("[agent_log]\ndir = \"{}\"\n", custom.display()),
+                format!("[agent_log]\ndir = '{}'\n", custom.display()),
             )
             .unwrap();
 
