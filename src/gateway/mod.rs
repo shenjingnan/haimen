@@ -139,6 +139,12 @@ fn resolve_work_dir_from_config(config: &crate::config::settings::AppConfig) -> 
 pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
     let config = load_settings().ok().flatten().unwrap_or_default();
 
+    // 清理过期 Agent 调用日志
+    let removed = crate::agent_log::cleanup(config.agent_log.retention_days);
+    if removed > 0 {
+        tracing::info!(removed = removed, "启动时清理过期 Agent 调用日志");
+    }
+
     let all_connectors = build_connectors(&config)?;
     let has_connectors = !all_connectors.is_empty();
 

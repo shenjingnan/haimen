@@ -1,4 +1,5 @@
 /// 通用工具模块
+pub mod agent_log;
 pub mod agents;
 pub mod cli;
 pub mod commands;
@@ -47,5 +48,31 @@ pub(crate) mod test_util {
                 std::env::remove_var("HOME");
             },
         }
+    }
+
+    /// 在临时 HOME 目录下执行异步测试函数
+    /// 使用全局锁确保 HOME 环境变量不会被并行测试竞态覆盖
+    pub async fn run_with_temp_home_async<F, Fut, T>(f: F) -> T
+    where
+        F: FnOnce(std::path::PathBuf) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let _guard = acquire_home_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let orig_home = std::env::var("HOME").ok();
+        // SAFETY: HOME_LOCK 确保无竞态
+        unsafe {
+            std::env::set_var("HOME", dir.path());
+        }
+        let out = f(dir.path().to_path_buf()).await;
+        match orig_home {
+            Some(h) => unsafe {
+                std::env::set_var("HOME", h);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+        out
     }
 }

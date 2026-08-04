@@ -656,6 +656,36 @@ fn create_streaming_asr_provider(cfg: &AsrConfig) -> Result<Box<dyn AsrProvider>
 }
 
 impl AsrLlmTtsStrategy {
+    /// 记录一次 xiaozhi 路径的 Agent 调用日志
+    ///
+    /// `llm_session_id` 从共享态读取（记录时刻已是最新会话）。
+    fn record_agent_log(
+        &self,
+        user_text: &str,
+        session_id: &str,
+        output: Option<&str>,
+        status: &str,
+        error: Option<&str>,
+        latency: std::time::Duration,
+    ) {
+        let llm_session = self.llm_session_id.lock().ok().and_then(|g| (*g).clone());
+        crate::agent_log::record(&crate::agent_log::AgentLogRecord {
+            timestamp: crate::datetime::iso_timestamp_now(),
+            source: "xiaozhi".to_string(),
+            agent: self.agent.name().to_string(),
+            connector: None,
+            chat_id: Some(session_id.to_string()),
+            sender_id: None,
+            session_id: llm_session,
+            work_dir: self.work_dir.clone(),
+            input: user_text.to_string(),
+            output: output.map(String::from),
+            status: status.to_string(),
+            error: error.map(String::from),
+            latency_ms: latency.as_millis() as u64,
+        });
+    }
+
     /// 创建 ASR → LLM → TTS 策略
     ///
     /// # 参数
@@ -1278,6 +1308,10 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             (cfg.fixed_text_enabled, cfg.fixed_text.clone())
         };
 
+        // agent 调用记录标记：固定文本模式跳过 LLM，不记录
+        let mut agent_mode = false;
+        let mut agent_start = std::time::Instant::now();
+
         let text_stream: Box<dyn futures_util::Stream<Item = String> + Unpin + Send> =
             if fixed_text_enabled {
                 // 固定文本模式：跳过 LLM，使用预设文本
@@ -1300,11 +1334,27 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                     .map_err(|e| format!("LLM session_id 锁获取失败: {}", e))?
                     .clone();
 
-                let (text_stream_inner, new_llm_session_id) = self
+                agent_mode = true;
+                agent_start = std::time::Instant::now();
+                let (text_stream_inner, new_llm_session_id) = match self
                     .agent
                     .process_stream(&user_text, current_llm_session.as_deref(), &self.work_dir)
                     .await
-                    .map_err(|e| format!("AI Agent 流式处理失败: {}", e))?;
+                {
+                    Ok(ok) => ok,
+                    Err(e) => {
+                        let msg = format!("AI Agent 流式处理失败: {}", e);
+                        self.record_agent_log(
+                            &user_text,
+                            session_id,
+                            None,
+                            "error",
+                            Some(&msg),
+                            agent_start.elapsed(),
+                        );
+                        return Err(msg);
+                    }
+                };
 
                 // 立即更新 LLM 会话 ID（用于多轮对话）
                 if let Ok(mut session) = self.llm_session_id.lock() {
@@ -1613,6 +1663,18 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             .map(|g| g.clone())
             .unwrap_or_default();
 
+        // agent 模式成功完成才记录（固定文本模式无 LLM 调用）
+        if agent_mode {
+            self.record_agent_log(
+                &user_text,
+                session_id,
+                Some(&full_response),
+                "success",
+                None,
+                agent_start.elapsed(),
+            );
+        }
+
         tracing::info!(
             session_id = %session_id,
             total_audio_bytes = total_audio_bytes,
@@ -1690,18 +1752,51 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 .map_err(|e| format!("LLM session_id 锁获取失败: {}", e))?
                 .clone();
 
+            let start = std::time::Instant::now();
             let llm_response = tokio::time::timeout(
                 std::time::Duration::from_secs(60),
                 self.agent
                     .process(&user_text, current_llm_session.as_deref(), &self.work_dir),
             )
-            .await
-            .map_err(|_| "AI Agent 响应超时 (60s)".to_string())?
-            .map_err(|e| format!("AI Agent 处理失败: {}", e))?;
+            .await;
 
-            let (llm_text, new_llm_session_id) = llm_response;
+            let (llm_text, new_llm_session_id) = match llm_response {
+                Ok(Ok((text, sid))) => (text, sid),
+                Ok(Err(e)) => {
+                    let msg = format!("AI Agent 处理失败: {}", e);
+                    self.record_agent_log(
+                        &user_text,
+                        session_id,
+                        None,
+                        "error",
+                        Some(&msg),
+                        start.elapsed(),
+                    );
+                    return Err(msg);
+                }
+                Err(_) => {
+                    let msg = "AI Agent 响应超时 (60s)".to_string();
+                    self.record_agent_log(
+                        &user_text,
+                        session_id,
+                        None,
+                        "timeout",
+                        Some(&msg),
+                        start.elapsed(),
+                    );
+                    return Err(msg);
+                }
+            };
 
             if llm_text.is_empty() {
+                self.record_agent_log(
+                    &user_text,
+                    session_id,
+                    None,
+                    "error",
+                    Some("AI Agent 返回空回复"),
+                    start.elapsed(),
+                );
                 return Err("AI Agent 返回空回复".to_string());
             }
 
@@ -1709,6 +1804,15 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             if let Ok(mut session) = self.llm_session_id.lock() {
                 *session = Some(new_llm_session_id);
             }
+
+            self.record_agent_log(
+                &user_text,
+                session_id,
+                Some(&llm_text),
+                "success",
+                None,
+                start.elapsed(),
+            );
 
             tracing::info!(
                 session_id = %session_id,
