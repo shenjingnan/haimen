@@ -52,7 +52,7 @@ use univoice::asr::{
 use univoice::tts::TtsRequest;
 
 use crate::config::settings::{AsrConfig, TtsConfig};
-use crate::gateway::provider::{AgentEventReceiver, AgentLogEvent, AgentProvider};
+use crate::gateway::provider::{AgentEventStream, AgentLogEvent, AgentProvider};
 use crate::xiaozhi_tts::pcm_to_opus_frames;
 
 /// 共享 TTS 配置类型
@@ -109,11 +109,17 @@ const TTS_AGGREGATE_THRESHOLD: usize = 180;
 const TTS_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// 首个可播文本块的等待上限（与批处理路径 LLM 超时口径一致）。
-/// 超过该时长（模型思考/调用工具过久）则播放 fallback 提示音，避免设备静默。
+/// 超过该时长（模型思考/调用工具过久）则播放超时兜底提示，避免设备静默。
 const TTS_FIRST_TEXT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 聚合文本通道容量（有界，提供背压）
 const TTS_AGG_CHANNEL_CAPACITY: usize = 16;
+
+/// 默认处理进度提示文案（Agent 思考/调用工具期间周期播报）
+const DEFAULT_THINKING_FEEDBACK_TEXT: &str = "好的，我正在处理，请稍候";
+
+/// 默认超时兜底文案（等待首个文本超时后播报，随后结束会话）
+const DEFAULT_THINKING_TIMEOUT_TEXT: &str = "这次任务处理时间较长，本次没有完成，请稍后再试";
 
 /// 从 markdown 中提取一段可作为 TTS 输入纯文本。
 ///
@@ -398,6 +404,64 @@ async fn emit_block(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// 首个可播文本等待 + 处理进度播报
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 等待首个可播文本块的三种结果
+enum FirstTextOutcome {
+    /// 首个可播文本就绪
+    Text(String),
+    /// 文本流结束（空回复），或回放管道关闭（on_tick 返回 false）
+    StreamEnded,
+    /// 超过总等待时长仍无文本
+    Timeout,
+}
+
+/// 等待首个可播文本，期间按 `interval` 周期调用 `on_tick` 播报处理进度提示。
+///
+/// # 语义
+/// - 首个文本就绪 → `FirstTextOutcome::Text`
+/// - 文本流结束（空回复）或 `on_tick` 返回 false（回放管道已关闭）→ `StreamEnded`
+/// - 超过 `total_timeout` 仍无文本 → `Timeout`
+///
+/// 使用 `interval_at(now + interval, interval)` 保证首个 tick 在等待 `interval` 后才触发，
+/// 避免开始等待立即播报；`MissedTickBehavior::Skip` 避免慢合成导致提示音连发。
+/// 前提：`interval > 0`（调用方保证）。
+async fn wait_first_text_with_feedback<F, Fut>(
+    agg_rx: &mut mpsc::Receiver<String>,
+    total_timeout: std::time::Duration,
+    interval: std::time::Duration,
+    mut on_tick: F,
+) -> FirstTextOutcome
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    debug_assert!(interval > std::time::Duration::ZERO, "interval 必须 > 0");
+    let deadline = tokio::time::Instant::now() + total_timeout;
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => return FirstTextOutcome::Timeout,
+            maybe_text = agg_rx.recv() => {
+                return match maybe_text {
+                    Some(text) => FirstTextOutcome::Text(text),
+                    None => FirstTextOutcome::StreamEnded,
+                };
+            }
+            _ = ticker.tick() => {
+                if !on_tick().await {
+                    // 回放管道已关闭，停止等待；以 StreamEnded 返回让调用方走正常收尾
+                    return FirstTextOutcome::StreamEnded;
+                }
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // 流式 ASR 管道状态
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -470,11 +534,12 @@ pub struct AsrLlmTtsStrategy {
 /// PCM16 mono 静音 RMS 阈值（低于此值视为静音）
 ///
 /// 经验值：PCM16 满幅 32768，正常语音 RMS ≈ 3000~15000，
-/// 环境底噪 RMS ≈ 100~800，阈值 2000 可区分底噪和有效语音。
-const SILENCE_RMS_THRESHOLD: f64 = 2000.0;
+/// 环境底噪 RMS ≈ 100~800，阈值 1500 可区分底噪和轻声说话。
+const SILENCE_RMS_THRESHOLD: f64 = 1500.0;
 
-/// 连续静音帧数阈值（60ms/帧），约 1.2s 静音后触发本地 VAD
-const MAX_SILENCE_FRAMES: u64 = 20;
+/// 连续静音帧数阈值（60ms/帧），约 2.4s 静音后触发本地 VAD。
+/// 中文口语中思考停顿/语气词后的迟疑常超 1.2s，故取较宽容的 2.4s。
+const MAX_SILENCE_FRAMES: u64 = 40;
 
 /// 无语音超时帧数阈值：按 60ms/帧向上取整，保证实际时长 ≥ 配置值
 fn no_speech_threshold_frames(timeout_ms: u64) -> u64 {
@@ -655,8 +720,9 @@ fn create_streaming_asr_provider(cfg: &AsrConfig) -> Result<Box<dyn AsrProvider>
                 sample_rate: 16000,
                 bits: 16,
                 channel: 1,
-                // VAD 端点检测：800ms 静音强制判停
-                end_window_size: Some(800),
+                // VAD 端点检测：1500ms 静音强制判停（与本地能量 VAD 的 2.4s 配合，
+                // 给中文口语停顿留出余地，避免说话中途被截断）
+                end_window_size: Some(1500),
                 // 至少 1s 音频后才允许判停（避免极短音频误判）
                 force_to_speech_time: Some(1000),
                 ..Default::default()
@@ -699,19 +765,18 @@ impl AsrLlmTtsStrategy {
         });
     }
 
-    /// 取回 Agent 流式调用的事件轨迹（oneshot，5s 超时防御）
+    /// 取回 Agent 流式调用的事件轨迹（事件消费任务累积到共享 Vec）
     ///
-    /// 提前退出分支中，若 agent 后台读流任务尚未感知文本通道关闭（如模型仍在
-    /// thinking、未输出任何 text_delta），事件可能取不回，此时返回空。
-    async fn take_agent_events(rx: &mut Option<AgentEventReceiver>) -> Vec<AgentLogEvent> {
-        match rx.take() {
-            Some(mut rx) => tokio::time::timeout(std::time::Duration::from_secs(5), &mut rx)
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .unwrap_or_default(),
-            None => Vec::new(),
+    /// 尽力等事件消费任务结束（事件流耗尽）最多 5s，超时则取当前累积；
+    /// 提前退出分支中事件可能未完全到达，此时返回已累积部分。
+    async fn take_agent_events(agent_events: &mut Option<AgentEventsHandle>) -> Vec<AgentLogEvent> {
+        if let Some(handle) = agent_events.take() {
+            let AgentEventsHandle { task, log } = handle;
+            // 尽力等事件消费任务结束（事件流耗尽）最多 5s；超时则取当前累积
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+            return log.lock().ok().map(|g| g.clone()).unwrap_or_default();
         }
+        Vec::new()
     }
 
     /// agent 模式收尾：统一取回事件轨迹并记录 agent 日志
@@ -721,7 +786,7 @@ impl AsrLlmTtsStrategy {
     #[allow(clippy::too_many_arguments)]
     async fn finish_agent_log(
         &self,
-        agent_events_rx: &mut Option<AgentEventReceiver>,
+        agent_events: &mut Option<AgentEventsHandle>,
         user_text: &str,
         session_id: &str,
         output: Option<&str>,
@@ -729,7 +794,7 @@ impl AsrLlmTtsStrategy {
         error: Option<&str>,
         started: std::time::Instant,
     ) {
-        let events = Self::take_agent_events(agent_events_rx).await;
+        let events = Self::take_agent_events(agent_events).await;
         self.record_agent_log(
             user_text,
             session_id,
@@ -746,7 +811,7 @@ impl AsrLlmTtsStrategy {
     /// `output` 为已累积的部分文本（设备可能在 agent 输出完成前断开）。
     async fn record_pipeline_closed_log(
         &self,
-        agent_events_rx: &mut Option<AgentEventReceiver>,
+        agent_events: &mut Option<AgentEventsHandle>,
         user_text: &str,
         session_id: &str,
         llm_response_full: &Arc<Mutex<String>>,
@@ -758,7 +823,7 @@ impl AsrLlmTtsStrategy {
             .map(|g| g.clone())
             .unwrap_or_default();
         self.finish_agent_log(
-            agent_events_rx,
+            agent_events,
             user_text,
             session_id,
             Some(&full),
@@ -1189,83 +1254,135 @@ impl AsrLlmTtsStrategy {
         session_id: &str,
         purpose: &str,
     ) -> Option<Vec<AudioFrame>> {
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            // 在单独的块中获取并释放 TTS 配置锁，避免 RwLockReadGuard 跨越 .await
-            let provider = {
-                let cfg = self.tts_config.read().unwrap();
-                let mut work_cfg = cfg.clone();
-                if let Some(ref voice) = self.voice_override {
-                    work_cfg
-                        .providers
-                        .entry(work_cfg.active_provider.clone())
-                        .or_default()
-                        .insert("voice".to_string(), voice.clone());
-                }
-                crate::tts_factory::create_tts_provider(&work_cfg)?
-            };
-            let response = provider
-                .synthesize(TtsRequest {
-                    text: text.to_string(),
-                    options: None,
-                })
-                .await
-                .map_err(|e| format!("TTS 合成失败: {}", e))?;
-
-            if response.audio.is_empty() {
-                return Err::<Vec<AudioFrame>, String>("TTS 返回空音频".to_string());
-            }
-
-            // PCM → Opus 编码 (24kHz, 60ms)，与 generate_response 批处理路径一致
-            let opus_frames = pcm_to_opus_frames(&response.audio, 24000, 60)
-                .map_err(|e| format!("Opus 编码失败: {}", e))?;
-
-            let mut frames = Vec::with_capacity(opus_frames.len());
-            let mut timestamp: u32 = 0;
-            for opus in opus_frames {
-                frames.push(AudioFrame {
-                    timestamp,
-                    data: opus,
-                });
-                timestamp = timestamp.wrapping_add(60);
-            }
-
-            Ok::<Vec<AudioFrame>, String>(frames)
-        })
-        .await;
-
-        match result {
-            Ok(Ok(frames)) => {
-                tracing::info!(
-                    session_id = %session_id,
-                    text = %text,
-                    frame_count = frames.len(),
-                    "{}: TTS 合成完成", purpose,
-                );
-                Some(frames)
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    session_id = %session_id,
-                    text = %text,
-                    error = %e,
-                    "{}: TTS 合成失败，静默跳过", purpose,
-                );
-                None
-            }
-            Err(_) => {
-                tracing::warn!(
-                    session_id = %session_id,
-                    text = %text,
-                    "{}: TTS 合成超时（>5s），静默跳过", purpose,
-                );
-                None
-            }
-        }
+        synthesize_status_audio(
+            &self.tts_config,
+            &self.voice_override,
+            text,
+            session_id,
+            purpose,
+        )
+        .await
     }
 
     /// 唤醒问候合成（薄封装，日志标签固定为「唤醒问候」）
     async fn synthesize_greeting(&self, text: &str, session_id: &str) -> Option<Vec<AudioFrame>> {
         self.synthesize_audio(text, session_id, "唤醒问候").await
+    }
+
+    /// 播报超时兜底文案；合成失败（synthesize_audio 静默返回 None）才回退内置 fallback 提示音
+    async fn play_timeout_feedback(
+        &self,
+        timeout_text: &str,
+        frame_tx: &tokio::sync::mpsc::Sender<PlaybackEvent>,
+        session_id: &str,
+    ) -> Result<(), String> {
+        if let Some(frames) = self
+            .synthesize_audio(timeout_text, session_id, "处理超时提示")
+            .await
+        {
+            for frame in frames {
+                if frame_tx.send(PlaybackEvent::Audio(frame)).await.is_err() {
+                    tracing::info!(session_id = %session_id, "超时提示播放管道已关闭");
+                    return Ok(());
+                }
+            }
+            tracing::info!(
+                session_id = %session_id,
+                text = %timeout_text,
+                "超时兜底文案播放完成",
+            );
+            Ok(())
+        } else {
+            tracing::warn!(session_id = %session_id, "超时文案合成失败，回退 fallback 提示音");
+            send_fallback_audio(frame_tx, session_id).await
+        }
+    }
+
+    /// 等待首个可播文本。统一处理「功能关闭 / 仅超时兜底 / 周期提示+超时兜底」三种配置。
+    ///
+    /// Timeout 时已在本方法内播放兜底音频（兜底文案或 fallback 提示音），调用方只做收尾。
+    async fn wait_first_text(
+        &self,
+        agg_rx: &mut mpsc::Receiver<String>,
+        frame_tx: &tokio::sync::mpsc::Sender<PlaybackEvent>,
+        session_id: &str,
+    ) -> Result<FirstTextOutcome, String> {
+        let (enabled, interval_ms) = {
+            let cfg = self.tts_config.read().unwrap();
+            (
+                cfg.thinking_feedback_enabled,
+                cfg.thinking_feedback_interval_ms,
+            )
+        };
+
+        if enabled {
+            let (fb_text, timeout_text) = {
+                let cfg = self.tts_config.read().unwrap();
+                (thinking_feedback_text(&cfg), thinking_timeout_text(&cfg))
+            };
+            if let (Some(fb), Some(to)) = (fb_text, timeout_text) {
+                if interval_ms > 0 {
+                    // 周期进度提示 + 超时兜底文案
+                    let interval = std::time::Duration::from_millis(interval_ms);
+                    let fb_for_tick = fb.clone();
+                    let on_tick = || async {
+                        if let Some(frames) = self
+                            .synthesize_audio(&fb_for_tick, session_id, "处理进度提示")
+                            .await
+                        {
+                            for frame in frames {
+                                if frame_tx.send(PlaybackEvent::Audio(frame)).await.is_err() {
+                                    return false;
+                                }
+                            }
+                        }
+                        true
+                    };
+                    return Ok(
+                        match wait_first_text_with_feedback(
+                            agg_rx,
+                            TTS_FIRST_TEXT_TIMEOUT,
+                            interval,
+                            on_tick,
+                        )
+                        .await
+                        {
+                            FirstTextOutcome::Text(t) => FirstTextOutcome::Text(t),
+                            FirstTextOutcome::StreamEnded => FirstTextOutcome::StreamEnded,
+                            FirstTextOutcome::Timeout => {
+                                self.play_timeout_feedback(&to, frame_tx, session_id)
+                                    .await?;
+                                FirstTextOutcome::Timeout
+                            }
+                        },
+                    );
+                }
+                // interval == 0：仅保留超时兜底文案，不做周期提示
+                return Ok(
+                    match tokio::time::timeout(TTS_FIRST_TEXT_TIMEOUT, agg_rx.recv()).await {
+                        Ok(Some(t)) => FirstTextOutcome::Text(t),
+                        Ok(None) => FirstTextOutcome::StreamEnded,
+                        Err(_) => {
+                            self.play_timeout_feedback(&to, frame_tx, session_id)
+                                .await?;
+                            FirstTextOutcome::Timeout
+                        }
+                    },
+                );
+            }
+        }
+
+        // 功能关闭：完全保留原逻辑（超时播 fallback 提示音）
+        Ok(
+            match tokio::time::timeout(TTS_FIRST_TEXT_TIMEOUT, agg_rx.recv()).await {
+                Ok(Some(t)) => FirstTextOutcome::Text(t),
+                Ok(None) => FirstTextOutcome::StreamEnded,
+                Err(_) => {
+                    send_fallback_audio(frame_tx, session_id).await?;
+                    FirstTextOutcome::Timeout
+                }
+            },
+        )
     }
 }
 
@@ -1540,8 +1657,8 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         // agent 调用记录标记：固定文本模式跳过 LLM，不记录
         let mut agent_mode = false;
         let mut agent_start = std::time::Instant::now();
-        // Agent 流式调用的事件轨迹接收端（agent 模式才有，收尾记录时取回）
-        let mut agent_events_rx: Option<AgentEventReceiver> = None;
+        // Agent 事件消费任务句柄（agent 模式才有，收尾记录时取回累积事件）
+        let mut agent_events: Option<AgentEventsHandle> = None;
 
         let text_stream: Box<dyn futures_util::Stream<Item = String> + Unpin + Send> =
             if fixed_text_enabled {
@@ -1587,7 +1704,21 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                         return Err(msg);
                     }
                 };
-                agent_events_rx = Some(events_rx);
+                // 启动事件消费任务：实时感知工具调用并播报进度提示，
+                // 同时累积事件轨迹到共享 Vec 供收尾日志取回。
+                let events_log: Arc<Mutex<Vec<AgentLogEvent>>> = Arc::new(Mutex::new(Vec::new()));
+                let events_task = spawn_agent_event_consumer(
+                    events_rx,
+                    events_log.clone(),
+                    self.tts_config.clone(),
+                    self.voice_override.clone(),
+                    frame_tx.clone(),
+                    session_id.to_string(),
+                );
+                agent_events = Some(AgentEventsHandle {
+                    task: events_task,
+                    log: events_log,
+                });
 
                 // 立即更新 LLM 会话 ID（用于多轮对话）
                 if let Ok(mut session) = self.llm_session_id.lock() {
@@ -1641,9 +1772,14 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         let agg_handle = tokio::spawn(tts_aggregate_task(text_stream, agg_tx, agg_cleaned_full));
 
         // ── Phase 3b: 拉取第一个可播文本块（此时才建立 TTS 会话）──────
-        let first = match tokio::time::timeout(TTS_FIRST_TEXT_TIMEOUT, agg_rx.recv()).await {
-            Ok(Some(first)) => first,
-            Ok(None) => {
+        // 等待期间若 Agent 长时间无文本输出（思考/调用工具），按配置周期播报处理进度提示；
+        // 超时（TTS_FIRST_TEXT_TIMEOUT）时兜底音频已由 wait_first_text 播放（文案或 fallback）。
+        let first = match self
+            .wait_first_text(&mut agg_rx, &frame_tx, session_id)
+            .await?
+        {
+            FirstTextOutcome::Text(first) => first,
+            FirstTextOutcome::StreamEnded => {
                 // 聚合器结束且无文本：属正常空回复，排空屏幕事件后返回
                 agg_handle.abort();
                 let _ = agg_handle.await;
@@ -1651,7 +1787,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 // agent 模式空回复也计入日志（agent 已自然结束，事件轨迹可完整取回）
                 if agent_mode {
                     self.finish_agent_log(
-                        &mut agent_events_rx,
+                        &mut agent_events,
                         &user_text,
                         session_id,
                         None,
@@ -1665,12 +1801,13 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                     .await?;
                 return Ok(());
             }
-            Err(_) => {
-                // 首个文本超时（模型思考/调用工具过久）：播 fallback 提示音，避免设备静默
+            FirstTextOutcome::Timeout => {
+                // 首个文本超时（模型思考/调用工具过久）：兜底音频已在 wait_first_text 内
+                // 播放（兜底文案或 fallback 提示音），此处仅做收尾。
                 tracing::warn!(
                     session_id = %session_id,
                     timeout_s = TTS_FIRST_TEXT_TIMEOUT.as_secs(),
-                    "TTS-STREAM: 等待首个可播文本超时，播放 fallback 提示音",
+                    "TTS-STREAM: 等待首个可播文本超时，已播放超时兜底提示",
                 );
                 agg_handle.abort();
                 let _ = agg_handle.await;
@@ -1683,7 +1820,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                         TTS_FIRST_TEXT_TIMEOUT.as_secs()
                     );
                     self.finish_agent_log(
-                        &mut agent_events_rx,
+                        &mut agent_events,
                         &user_text,
                         session_id,
                         None,
@@ -1693,7 +1830,6 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                     )
                     .await;
                 }
-                send_fallback_audio(&frame_tx, session_id).await?;
                 drain_screen_events(&mut text_evt_rx, &residual_shared, &frame_tx, session_id)
                     .await?;
                 return Ok(());
@@ -1741,7 +1877,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                         .map(|g| g.clone())
                         .unwrap_or_default();
                     self.finish_agent_log(
-                        &mut agent_events_rx,
+                        &mut agent_events,
                         &user_text,
                         session_id,
                         Some(&full),
@@ -1785,7 +1921,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                         .map(|g| g.clone())
                         .unwrap_or_default();
                     self.finish_agent_log(
-                        &mut agent_events_rx,
+                        &mut agent_events,
                         &user_text,
                         session_id,
                         Some(&full),
@@ -1813,7 +1949,28 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         let mut stream_enc = StreamingOpusEncoder::new(24000, 60)?;
         let mut timestamp: u32 = 0;
 
-        while let Some(result) = audio_stream.next().await {
+        // ── 断档处理：模型思考/调用工具时长时间无主音频帧。之前用预生成静音帧
+        //    填充保持设备播放，但孤立 Opus 帧在设备端解码会产生沙沙声，故移除；
+        //    改为断档超时后按 thinking_feedback_interval_ms 周期播报进度提示
+        //    （正常 TTS 语音），让用户知道仍在处理。
+        let (feedback_enabled, feedback_interval_ms) = {
+            let cfg = self.tts_config.read().unwrap();
+            (
+                cfg.thinking_feedback_enabled,
+                cfg.thinking_feedback_interval_ms,
+            )
+        };
+        let feedback_text = if feedback_enabled {
+            thinking_feedback_text(&self.tts_config.read().unwrap())
+        } else {
+            None
+        };
+        // 断档检测阈值：主音频无帧超过该时长视为断档（正常流式合成间隔远小于此）
+        const GAP_KEEPALIVE_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(2000);
+        // 距上次播报进度提示的时间点
+        let mut last_feedback_at = tokio::time::Instant::now();
+
+        loop {
             // 排空句切分器产生的句子事件（先于本块音频进入通道，保持文本先于语音）
             while let Ok(sentence) = text_evt_rx.try_recv() {
                 if frame_tx
@@ -1825,7 +1982,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                     // 设备已断开：尽力记录已启动的 agent 调用
                     if agent_mode {
                         self.record_pipeline_closed_log(
-                            &mut agent_events_rx,
+                            &mut agent_events,
                             &user_text,
                             session_id,
                             &llm_response_full,
@@ -1837,8 +1994,50 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 }
             }
 
+            let result = match tokio::time::timeout(GAP_KEEPALIVE_THRESHOLD, audio_stream.next())
+                .await
+            {
+                Ok(Some(result)) => Some(result),
+                Ok(None) => None, // TTS 流正常结束
+                Err(_) => {
+                    // ── 断档：按配置周期播报进度提示（正常 TTS 语音） ──
+                    if let Some(text) = &feedback_text {
+                        if feedback_interval_ms > 0
+                            && last_feedback_at.elapsed()
+                                >= std::time::Duration::from_millis(feedback_interval_ms)
+                        {
+                            last_feedback_at = tokio::time::Instant::now();
+                            if let Some(frames) =
+                                self.synthesize_audio(text, session_id, "断档提示").await
+                            {
+                                for frame in frames {
+                                    if frame_tx.send(PlaybackEvent::Audio(frame)).await.is_err() {
+                                        tracing::info!(
+                                            session_id = %session_id,
+                                            "TTS-STREAM: 回放管道已关闭，停止生成",
+                                        );
+                                        if agent_mode {
+                                            self.record_pipeline_closed_log(
+                                                &mut agent_events,
+                                                &user_text,
+                                                session_id,
+                                                &llm_response_full,
+                                                agent_start,
+                                            )
+                                            .await;
+                                        }
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
+
             match result {
-                Ok(chunk) => {
+                Some(Ok(chunk)) => {
                     total_audio_bytes += chunk.audio_chunk.len();
                     raw_pcm.extend_from_slice(&chunk.audio_chunk);
 
@@ -1861,7 +2060,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                             );
                             if agent_mode {
                                 self.record_pipeline_closed_log(
-                                    &mut agent_events_rx,
+                                    &mut agent_events,
                                     &user_text,
                                     session_id,
                                     &llm_response_full,
@@ -1875,9 +2074,10 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                         frame_count += 1;
                     }
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     tracing::warn!("流式 TTS 音频块错误: {}", e);
                 }
+                None => break,
             }
         }
 
@@ -1924,7 +2124,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                                 );
                                 if agent_mode {
                                     self.record_pipeline_closed_log(
-                                        &mut agent_events_rx,
+                                        &mut agent_events,
                                         &user_text,
                                         session_id,
                                         &llm_response_full,
@@ -1974,7 +2174,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                     );
                     if agent_mode {
                         self.record_pipeline_closed_log(
-                            &mut agent_events_rx,
+                            &mut agent_events,
                             &user_text,
                             session_id,
                             &llm_response_full,
@@ -2008,7 +2208,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         if agent_mode {
             // 文本流已排空 → 后台读流任务已完成并投递事件轨迹；加超时防御
             self.finish_agent_log(
-                &mut agent_events_rx,
+                &mut agent_events,
                 &user_text,
                 session_id,
                 Some(&full_response),
@@ -2271,6 +2471,206 @@ fn wake_greeting_text(cfg: &TtsConfig) -> Option<String> {
         .clone()
         .filter(|t| !t.trim().is_empty())
         .or_else(|| Some("你好".to_string()))
+}
+
+/// 解析处理进度提示配置 → 待播报文案
+///
+/// - 配置关闭（`thinking_feedback_enabled=false`）→ `None`（不播报）
+/// - `thinking_feedback_text` 为 None / 空串 / 纯空白 → 回退默认文案
+/// - 其余返回原文案
+fn thinking_feedback_text(cfg: &TtsConfig) -> Option<String> {
+    if !cfg.thinking_feedback_enabled {
+        return None;
+    }
+    cfg.thinking_feedback_text
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| Some(DEFAULT_THINKING_FEEDBACK_TEXT.to_string()))
+}
+
+/// 解析超时兜底提示配置 → 待播报文案
+///
+/// - 配置关闭（`thinking_feedback_enabled=false`）→ `None`（不播报，走 fallback 提示音）
+/// - `thinking_feedback_timeout_text` 为 None / 空串 / 纯空白 → 回退默认文案
+/// - 其余返回原文案
+fn thinking_timeout_text(cfg: &TtsConfig) -> Option<String> {
+    if !cfg.thinking_feedback_enabled {
+        return None;
+    }
+    cfg.thinking_feedback_timeout_text
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| Some(DEFAULT_THINKING_TIMEOUT_TEXT.to_string()))
+}
+
+/// 合成一段状态提示音频（模块级，供策略方法与独立事件播报任务共用）。
+///
+/// 任意文本 → TTS 合成 → 编码为 Opus 帧。5s 超时兜底，任何失败静默返回 None。
+async fn synthesize_status_audio(
+    tts_config: &SharedTtsConfig,
+    voice_override: &Option<String>,
+    text: &str,
+    session_id: &str,
+    purpose: &str,
+) -> Option<Vec<AudioFrame>> {
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        // 在单独的块中获取并释放 TTS 配置锁，避免 RwLockReadGuard 跨越 .await
+        let provider = {
+            let cfg = tts_config.read().unwrap();
+            let mut work_cfg = cfg.clone();
+            if let Some(voice) = voice_override {
+                work_cfg
+                    .providers
+                    .entry(work_cfg.active_provider.clone())
+                    .or_default()
+                    .insert("voice".to_string(), voice.clone());
+            }
+            crate::tts_factory::create_tts_provider(&work_cfg)?
+        };
+        let response = provider
+            .synthesize(TtsRequest {
+                text: text.to_string(),
+                options: None,
+            })
+            .await
+            .map_err(|e| format!("TTS 合成失败: {}", e))?;
+
+        if response.audio.is_empty() {
+            return Err::<Vec<AudioFrame>, String>("TTS 返回空音频".to_string());
+        }
+
+        // PCM → Opus 编码 (24kHz, 60ms)，与 generate_response 批处理路径一致
+        let opus_frames = pcm_to_opus_frames(&response.audio, 24000, 60)
+            .map_err(|e| format!("Opus 编码失败: {}", e))?;
+
+        let mut frames = Vec::with_capacity(opus_frames.len());
+        let mut timestamp: u32 = 0;
+        for opus in opus_frames {
+            frames.push(AudioFrame {
+                timestamp,
+                data: opus,
+            });
+            timestamp = timestamp.wrapping_add(60);
+        }
+
+        Ok::<Vec<AudioFrame>, String>(frames)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(frames)) => {
+            tracing::info!(
+                session_id = %session_id,
+                text = %text,
+                frame_count = frames.len(),
+                "{}: TTS 合成完成", purpose,
+            );
+            Some(frames)
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                session_id = %session_id,
+                text = %text,
+                error = %e,
+                "{}: TTS 合成失败，静默跳过", purpose,
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                session_id = %session_id,
+                text = %text,
+                "{}: TTS 合成超时（>5s），静默跳过", purpose,
+            );
+            None
+        }
+    }
+}
+
+/// 工具名 → TTS 播报文案映射（仅对可能耗时较长的工具播报，未知工具返回 None 不打扰）
+fn tool_feedback_text(name: &str) -> Option<String> {
+    let text = match name {
+        "WebSearch" => "我正在搜索网络，请稍候",
+        "WebFetch" => "我正在读取网页，请稍候",
+        "Bash" => "我正在执行命令，请稍候",
+        "Read" => "我正在读取文件，请稍候",
+        "Write" => "我正在写文件，请稍候",
+        "Edit" => "我正在修改代码，请稍候",
+        "MultiEdit" => "我正在修改代码，请稍候",
+        "NotebookEdit" => "我正在修改内容，请稍候",
+        "Task" => "我让另一个助手并行处理，请稍候",
+        _ => return None,
+    };
+    Some(text.to_string())
+}
+
+/// Agent 事件消费任务句柄：实时事件消费任务 + 共享事件累积
+struct AgentEventsHandle {
+    task: tokio::task::JoinHandle<()>,
+    log: Arc<Mutex<Vec<AgentLogEvent>>>,
+}
+
+/// 启动 Agent 实时事件消费任务
+///
+/// - 每收到一个 [`AgentLogEvent::ToolUse`] 就按工具名合成并播报进度提示
+///   （相同工具 8s 内去重，避免并行/连续调用重复打扰）
+/// - 全部事件累积到共享 Vec，供收尾日志（`finish_agent_log` 等）取回
+/// - 事件流结束（agent 后台任务 drop sender）时任务退出
+fn spawn_agent_event_consumer(
+    events_rx: AgentEventStream,
+    events_log: Arc<Mutex<Vec<AgentLogEvent>>>,
+    tts_config: SharedTtsConfig,
+    voice_override: Option<String>,
+    frame_tx: tokio::sync::mpsc::Sender<PlaybackEvent>,
+    session_id: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut last_tool: Option<(String, std::time::Instant)> = None;
+        let mut events_rx = events_rx;
+        while let Some(event) = events_rx.recv().await {
+            if let Ok(mut log) = events_log.lock() {
+                log.push(event.clone());
+            }
+            let AgentLogEvent::ToolUse { name, .. } = &event else {
+                continue;
+            };
+            let now = std::time::Instant::now();
+            let is_duplicate = last_tool
+                .as_ref()
+                .map(|(n, t)| {
+                    n.as_str() == name.as_str()
+                        && now.duration_since(*t) < std::time::Duration::from_secs(8)
+                })
+                .unwrap_or(false);
+            if is_duplicate {
+                continue;
+            }
+            last_tool = Some((name.clone(), now));
+            let Some(text) = tool_feedback_text(name.as_str()) else {
+                continue;
+            };
+            tracing::info!(
+                session_id = %session_id,
+                tool = %name,
+                "Agent 工具调用：播报进度提示",
+            );
+            if let Some(frames) = synthesize_status_audio(
+                &tts_config,
+                &voice_override,
+                &text,
+                &session_id,
+                "工具提示",
+            )
+            .await
+            {
+                for frame in frames {
+                    if frame_tx.send(PlaybackEvent::Audio(frame)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -3073,9 +3473,9 @@ mod tests {
         }
         assert_eq!(result, "你好", "process_stream 应返回 process 的结果");
         assert_eq!(sid, "mock-session-id");
-        // 默认实现应立即投递空事件轨迹
-        let events = events_rx.await.unwrap_or_default();
-        assert!(events.is_empty());
+        // 默认实现应立即投递空事件流（recv 返回 None）
+        let mut events_rx = events_rx;
+        assert!(events_rx.recv().await.is_none(), "默认实现事件流应为空");
     }
 
     // ─── ASR 提供者工厂测试 ──────────────────────────
@@ -3417,6 +3817,216 @@ mod tests {
         );
     }
 
+    // ─── 处理进度提示文案回退测试 ─────────────────────────
+
+    #[test]
+    fn test_ft1_feedback_disabled_returns_none() {
+        let mut cfg = test_tts_config();
+        cfg.thinking_feedback_enabled = false;
+        cfg.thinking_feedback_text = Some("好的".to_string());
+        assert!(thinking_feedback_text(&cfg).is_none());
+        assert!(thinking_timeout_text(&cfg).is_none());
+    }
+
+    #[test]
+    fn test_ft2_feedback_default_text() {
+        let cfg = test_tts_config(); // 默认 enabled=true, text=None
+        assert_eq!(
+            thinking_feedback_text(&cfg).as_deref(),
+            Some(DEFAULT_THINKING_FEEDBACK_TEXT)
+        );
+    }
+
+    #[test]
+    fn test_ft3_feedback_empty_whitespace_falls_back() {
+        let mut cfg = test_tts_config();
+        cfg.thinking_feedback_text = Some("   ".to_string());
+        assert_eq!(
+            thinking_feedback_text(&cfg).as_deref(),
+            Some(DEFAULT_THINKING_FEEDBACK_TEXT)
+        );
+    }
+
+    #[test]
+    fn test_ft4_feedback_custom_preserved() {
+        let mut cfg = test_tts_config();
+        cfg.thinking_feedback_text = Some("正在处理，请稍等".to_string());
+        assert_eq!(
+            thinking_feedback_text(&cfg).as_deref(),
+            Some("正在处理，请稍等")
+        );
+    }
+
+    #[test]
+    fn test_ft5_timeout_default_text() {
+        let cfg = test_tts_config();
+        assert_eq!(
+            thinking_timeout_text(&cfg).as_deref(),
+            Some(DEFAULT_THINKING_TIMEOUT_TEXT)
+        );
+    }
+
+    #[test]
+    fn test_ft6_timeout_empty_falls_back() {
+        let mut cfg = test_tts_config();
+        cfg.thinking_feedback_timeout_text = Some(String::new());
+        assert_eq!(
+            thinking_timeout_text(&cfg).as_deref(),
+            Some(DEFAULT_THINKING_TIMEOUT_TEXT)
+        );
+    }
+
+    #[test]
+    fn test_ft7_timeout_custom_preserved() {
+        let mut cfg = test_tts_config();
+        cfg.thinking_feedback_timeout_text = Some("超时了，请稍后再试".to_string());
+        assert_eq!(
+            thinking_timeout_text(&cfg).as_deref(),
+            Some("超时了，请稍后再试")
+        );
+    }
+
+    // ─── 工具名 → 播报文案映射测试 ───────────────────────
+
+    #[test]
+    fn test_tool1_web_search_mapped() {
+        assert_eq!(
+            tool_feedback_text("WebSearch").as_deref(),
+            Some("我正在搜索网络，请稍候")
+        );
+    }
+
+    #[test]
+    fn test_tool2_bash_mapped() {
+        assert_eq!(
+            tool_feedback_text("Bash").as_deref(),
+            Some("我正在执行命令，请稍候")
+        );
+    }
+
+    #[test]
+    fn test_tool3_unknown_returns_none() {
+        assert!(tool_feedback_text("UnknownTool").is_none());
+        assert!(tool_feedback_text("").is_none());
+    }
+
+    #[test]
+    fn test_tool4_read_and_edit_mapped() {
+        assert_eq!(
+            tool_feedback_text("Read").as_deref(),
+            Some("我正在读取文件，请稍候")
+        );
+        assert_eq!(
+            tool_feedback_text("Edit").as_deref(),
+            Some("我正在修改代码，请稍候")
+        );
+    }
+
+    // ─── 首个可播文本等待 + 进度播报测试 ───────────────────
+
+    /// 构造一个计数 on_tick 闭包（每 tick 自增，返回是否继续）
+    fn counting_on_tick(
+        ticks: Arc<std::sync::atomic::AtomicUsize>,
+        keep_going: bool,
+    ) -> impl FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>>
+    {
+        move || {
+            let ticks = ticks.clone();
+            Box::pin(async move {
+                ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                keep_going
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_wt1_periodic_feedback_until_text() {
+        let (agg_tx, mut agg_rx) = mpsc::channel::<String>(4);
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ticks_for_task = ticks.clone();
+        let handle = tokio::spawn(async move {
+            wait_first_text_with_feedback(
+                &mut agg_rx,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_millis(40),
+                counting_on_tick(ticks_for_task, true),
+            )
+            .await
+        });
+        // 等待首个 tick 触发后，再发送首个文本，验证周期播报期间文本到达能立即返回
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        agg_tx.send("你好".to_string()).await.unwrap();
+        let result = handle.await.unwrap();
+        assert!(matches!(result, FirstTextOutcome::Text(t) if t == "你好"));
+        assert!(
+            ticks.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "等待期间应至少播报一次进度提示"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wt2_text_immediate_no_tick() {
+        let (agg_tx, mut agg_rx) = mpsc::channel::<String>(4);
+        agg_tx.send("你好".to_string()).await.unwrap();
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = wait_first_text_with_feedback(
+            &mut agg_rx,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(40),
+            counting_on_tick(ticks.clone(), true),
+        )
+        .await;
+        assert!(matches!(result, FirstTextOutcome::Text(t) if t == "你好"));
+        assert_eq!(ticks.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_wt3_stream_ended_empty_reply() {
+        let (agg_tx, mut agg_rx) = mpsc::channel::<String>(4);
+        drop(agg_tx); // 显式关闭所有 sender，recv 返回 None
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = wait_first_text_with_feedback(
+            &mut agg_rx,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(40),
+            counting_on_tick(ticks.clone(), true),
+        )
+        .await;
+        assert!(matches!(result, FirstTextOutcome::StreamEnded));
+    }
+
+    #[tokio::test]
+    async fn test_wt4_timeout() {
+        // interval(1s) 大于 total_timeout(100ms)：期间不应触发 tick，应直接超时
+        let (_agg_tx, mut agg_rx) = mpsc::channel::<String>(4);
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = wait_first_text_with_feedback(
+            &mut agg_rx,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(1),
+            counting_on_tick(ticks.clone(), true),
+        )
+        .await;
+        assert!(matches!(result, FirstTextOutcome::Timeout));
+        assert_eq!(ticks.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_wt5_on_tick_false_stops() {
+        // on_tick 返回 false（回放管道关闭）→ 以 StreamEnded 返回，且只播报一次
+        let (_agg_tx, mut agg_rx) = mpsc::channel::<String>(4);
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = wait_first_text_with_feedback(
+            &mut agg_rx,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(40),
+            counting_on_tick(ticks.clone(), false),
+        )
+        .await;
+        assert!(matches!(result, FirstTextOutcome::StreamEnded));
+        assert_eq!(ticks.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     // ─── 无语音超时检测测试 ─────────────────────────────
 
     /// 构造已预置流式管道状态的策略（跳过联网的 init_asr_pipeline）
@@ -3576,13 +4186,19 @@ mod tests {
 
     // ─── agent 日志收尾（提前退出路径记录） ──────────────
 
+    /// 构造一个已完成的事件消费句柄：task 立即结束，log 预填指定事件
+    fn make_agent_events_handle(events: Vec<AgentLogEvent>) -> AgentEventsHandle {
+        AgentEventsHandle {
+            task: tokio::spawn(async {}),
+            log: Arc::new(Mutex::new(events)),
+        }
+    }
+
     #[tokio::test]
     async fn test_le1_take_agent_events_delivered() {
-        let (tx, rx) = tokio::sync::oneshot::channel::<Vec<AgentLogEvent>>();
-        let _ = tx.send(vec![AgentLogEvent::Thinking {
+        let mut opt = Some(make_agent_events_handle(vec![AgentLogEvent::Thinking {
             thinking: "思考中".to_string(),
-        }]);
-        let mut opt = Some(rx);
+        }]));
         let events = AsrLlmTtsStrategy::take_agent_events(&mut opt).await;
         assert_eq!(events.len(), 1);
         assert!(matches!(
@@ -3593,7 +4209,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_le2_take_agent_events_already_taken() {
-        let mut opt: Option<AgentEventReceiver> = None;
+        let mut opt: Option<AgentEventsHandle> = None;
         let events = AsrLlmTtsStrategy::take_agent_events(&mut opt).await;
         assert!(events.is_empty(), "None 时应返回空事件");
     }
@@ -3602,13 +4218,11 @@ mod tests {
     async fn test_le3_finish_agent_log_timeout_writes_record() {
         crate::test_util::run_with_temp_home_async(move |home| async move {
             let strategy = make_strategy(Arc::new(MockAgent));
-            let (tx, rx) = tokio::sync::oneshot::channel::<Vec<AgentLogEvent>>();
-            let _ = tx.send(vec![AgentLogEvent::ToolUse {
+            let mut opt = Some(make_agent_events_handle(vec![AgentLogEvent::ToolUse {
                 id: "toolu_1".to_string(),
                 name: "Bash".to_string(),
                 input: serde_json::json!({ "command": "ls" }),
-            }]);
-            let mut opt = Some(rx);
+            }]));
             strategy
                 .finish_agent_log(
                     &mut opt,
@@ -3644,9 +4258,8 @@ mod tests {
     async fn test_le4_finish_agent_log_success_with_partial_output() {
         crate::test_util::run_with_temp_home_async(move |home| async move {
             let strategy = make_strategy(Arc::new(MockAgent));
-            // 无事件投递的 receiver：验证空事件也能正常记录
-            let (_, rx) = tokio::sync::oneshot::channel::<Vec<AgentLogEvent>>();
-            let mut opt = Some(rx);
+            // 无事件：验证空事件也能正常记录
+            let mut opt = Some(make_agent_events_handle(Vec::new()));
             strategy
                 .finish_agent_log(
                     &mut opt,

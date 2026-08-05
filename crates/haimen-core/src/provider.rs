@@ -40,11 +40,13 @@ pub struct AgentOutput {
     pub events: Vec<AgentLogEvent>,
 }
 
-/// 流结束后投递完整事件轨迹的接收端
+/// Agent 实时事件流：thinking / tool_use / tool_result 按发生顺序实时到达。
 ///
-/// 实现 `process_stream` 时，后台读流任务在读到 EOF 后经 oneshot 发送
-/// 完整 `events`；调用方可在排空文本流后 `.await` 取回。
-pub type AgentEventReceiver = tokio::sync::oneshot::Receiver<Vec<AgentLogEvent>>;
+/// 实现 `process_stream` 时，后台读流任务在解析到每个事件（如
+/// `content_block_stop`）时立即发送；流结束（所有 sender drop）后
+/// `recv()` 返回 `None`。调用方可边消费边感知 Agent 中间状态（如工具
+/// 调用开始），并自行累积完整轨迹用于日志记录。
+pub type AgentEventStream = tokio::sync::mpsc::Receiver<AgentLogEvent>;
 
 /// AI Agent 抽象
 ///
@@ -72,19 +74,24 @@ pub trait AgentProvider: Send + Sync {
     /// 流式处理消息
     ///
     /// 逐块返回 Agent 输出文本，适用于驱动流式 TTS。
-    /// 默认实现将 process() 的完整结果作为一个块返回，事件经 oneshot 立即投递。
+    /// 默认实现将 process() 的完整结果作为一个块返回，事件经 mpsc 逐条实时投递。
     ///
-    /// 返回: (文本流, 新的 session_id, 事件轨迹接收端)
+    /// 返回: (文本流, 新的 session_id, 实时事件流)
     async fn process_stream(
         &self,
         message: &str,
         session_id: Option<&str>,
         work_dir: &str,
-    ) -> Result<(TextStream, String, AgentEventReceiver), String> {
+    ) -> Result<(TextStream, String, AgentEventStream), String> {
         let (output, sid) = self.process(message, session_id, work_dir).await?;
-        let stream: TextStream = Box::pin(futures_util::stream::once(async move { output.text }));
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = tx.send(output.events);
+        let AgentOutput { text, events } = output;
+        let stream: TextStream = Box::pin(futures_util::stream::once(async move { text }));
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        for event in events {
+            if tx.send(event).await.is_err() {
+                break;
+            }
+        }
         Ok((stream, sid, rx))
     }
 

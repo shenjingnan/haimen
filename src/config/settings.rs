@@ -554,6 +554,18 @@ pub struct TtsConfig {
     /// 录音开始后累计无有效语音达到该毫秒数时，播报告别并关闭连接（0 表示禁用）
     #[serde(default = "default_no_speech_timeout_ms")]
     pub no_speech_timeout_ms: u64,
+    /// 是否在等待 Agent 首个可播文本期间播报处理进度提示（默认开启，控制周期提示+超时兜底）
+    #[serde(default)]
+    pub thinking_feedback_enabled: bool,
+    /// 进度提示播报间隔毫秒（0=禁用周期提示，仅保留超时兜底文案）
+    #[serde(default = "default_thinking_feedback_interval_ms")]
+    pub thinking_feedback_interval_ms: u64,
+    /// 周期进度提示文案（None 或空串回退默认）
+    #[serde(default)]
+    pub thinking_feedback_text: Option<String>,
+    /// 超时兜底文案（None 或空串回退默认）
+    #[serde(default)]
+    pub thinking_feedback_timeout_text: Option<String>,
 }
 
 /// 旧格式 TTS 配置（用于向后兼容反序列化）
@@ -572,6 +584,10 @@ struct TtsConfigLegacy {
     wake_greeting: Option<String>,
     no_speech_goodbye: Option<String>,
     no_speech_timeout_ms: Option<u64>,
+    thinking_feedback_enabled: Option<bool>,
+    thinking_feedback_interval_ms: Option<u64>,
+    thinking_feedback_text: Option<String>,
+    thinking_feedback_timeout_text: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for TtsConfig {
@@ -594,6 +610,12 @@ impl<'de> Deserialize<'de> for TtsConfig {
                 no_speech_timeout_ms: legacy
                     .no_speech_timeout_ms
                     .unwrap_or_else(default_no_speech_timeout_ms),
+                thinking_feedback_enabled: legacy.thinking_feedback_enabled.unwrap_or(true),
+                thinking_feedback_interval_ms: legacy
+                    .thinking_feedback_interval_ms
+                    .unwrap_or_else(default_thinking_feedback_interval_ms),
+                thinking_feedback_text: legacy.thinking_feedback_text,
+                thinking_feedback_timeout_text: legacy.thinking_feedback_timeout_text,
             });
         }
 
@@ -633,6 +655,12 @@ impl<'de> Deserialize<'de> for TtsConfig {
             no_speech_timeout_ms: legacy
                 .no_speech_timeout_ms
                 .unwrap_or_else(default_no_speech_timeout_ms),
+            thinking_feedback_enabled: legacy.thinking_feedback_enabled.unwrap_or(true),
+            thinking_feedback_interval_ms: legacy
+                .thinking_feedback_interval_ms
+                .unwrap_or_else(default_thinking_feedback_interval_ms),
+            thinking_feedback_text: legacy.thinking_feedback_text,
+            thinking_feedback_timeout_text: legacy.thinking_feedback_timeout_text,
         })
     }
 }
@@ -643,6 +671,10 @@ fn default_tts_provider() -> String {
 
 fn default_no_speech_timeout_ms() -> u64 {
     10000
+}
+
+fn default_thinking_feedback_interval_ms() -> u64 {
+    15000
 }
 
 impl Default for TtsConfig {
@@ -656,6 +688,10 @@ impl Default for TtsConfig {
             wake_greeting: None,
             no_speech_goodbye: None,
             no_speech_timeout_ms: default_no_speech_timeout_ms(),
+            thinking_feedback_enabled: true,
+            thinking_feedback_interval_ms: default_thinking_feedback_interval_ms(),
+            thinking_feedback_text: None,
+            thinking_feedback_timeout_text: None,
         }
     }
 }
@@ -1369,6 +1405,10 @@ provider = "doubao"
         let cfg = TtsConfig::default();
         assert_eq!(cfg.active_provider, "doubao");
         assert!(cfg.providers.is_empty());
+        assert!(cfg.thinking_feedback_enabled);
+        assert_eq!(cfg.thinking_feedback_interval_ms, 15000);
+        assert_eq!(cfg.thinking_feedback_text, None);
+        assert_eq!(cfg.thinking_feedback_timeout_text, None);
     }
 
     #[test]

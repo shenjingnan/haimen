@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use haimen_core::provider::{
-    AgentEventReceiver, AgentLogEvent, AgentOutput, AgentProvider, TextStream,
+    AgentEventStream, AgentLogEvent, AgentOutput, AgentProvider, TextStream,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -38,13 +38,15 @@ impl AgentProvider for ClaudeAgent {
         if final_text.is_empty() {
             return Err("Claude 返回为空".to_string());
         }
-        // 文本流已排空 → 后台任务在 text_tx 关闭前已投递 events，此处可安全取回。
+        // 排空实时事件流：后台任务读完所有输出后 drop sender，recv 返回 None。
         // 加超时防御边缘场景（如消费者提前停止导致读流任务阻塞在发送上）。
-        let events = tokio::time::timeout(std::time::Duration::from_secs(5), events_rx)
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or_default();
+        let mut events_rx = events_rx;
+        let mut events = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), events_rx.recv()).await
+        {
+            events.push(event);
+        }
         Ok((
             AgentOutput {
                 text: final_text,
@@ -60,7 +62,7 @@ impl AgentProvider for ClaudeAgent {
         message: &str,
         session_id: Option<&str>,
         work_dir: &str,
-    ) -> Result<(TextStream, String, AgentEventReceiver), String> {
+    ) -> Result<(TextStream, String, AgentEventStream), String> {
         process_with_claude_stream(message, session_id, work_dir).await
     }
 
@@ -93,12 +95,12 @@ enum BlockAcc {
     },
 }
 
-/// 启动 claude --print 子进程，返回文本流、session_id 与事件轨迹接收端
+/// 启动 claude --print 子进程，返回文本流、session_id 与实时事件流
 async fn process_with_claude_stream(
     prompt: &str,
     resume_session_id: Option<&str>,
     work_dir: &str,
-) -> Result<(TextStream, String, AgentEventReceiver), String> {
+) -> Result<(TextStream, String, AgentEventStream), String> {
     let mut args: Vec<String> = vec![
         "--print".to_string(),
         "--output-format".to_string(),
@@ -127,18 +129,20 @@ async fn process_with_claude_stream(
         .take()
         .ok_or_else(|| "无法获取 claude stdout".to_string())?;
 
-    // 三个通道：session_id（oneshot）+ 文本流（mpsc）+ 事件轨迹（oneshot）
+    // 三个通道：session_id（oneshot）+ 文本流（mpsc）+ 实时事件流（mpsc）
     let (sid_tx, sid_rx) = oneshot::channel::<String>();
-    let (events_tx, events_rx) = oneshot::channel::<Vec<AgentLogEvent>>();
+    let (events_tx, events_rx) = mpsc::channel::<AgentLogEvent>(64);
     let (text_tx, text_rx) = mpsc::channel::<String>(64);
 
-    // 后台读取任务：解析 JSON 行，提取文本块发送到文本通道，同时累积内容轨迹
+    // 后台读取任务：解析 JSON 行，提取文本块发送到文本通道，
+    // 同时把 thinking / tool_use / tool_result 事件实时转发到事件流
     tokio::spawn(async move {
         let reader = BufReader::new(stdout);
         let mut lines = reader.lines();
         let mut system_init_parsed = false;
         let mut sid_tx = Some(sid_tx);
         let mut events: Vec<AgentLogEvent> = Vec::new();
+        let events_tx = Some(events_tx);
         let mut current: Option<BlockAcc> = None;
 
         while let Ok(Some(line)) = lines.next_line().await {
@@ -166,7 +170,8 @@ async fn process_with_claude_stream(
                 Some("stream_event") => {
                     // 返回 false 表示文本通道已关闭（消费者停止）→ 退出读取循环
                     let keep_going =
-                        handle_stream_event(&json, &text_tx, &mut current, &mut events).await;
+                        handle_stream_event(&json, &text_tx, &mut current, &mut events, &events_tx)
+                            .await;
                     if !keep_going {
                         break;
                     }
@@ -187,8 +192,8 @@ async fn process_with_claude_stream(
             }
         }
 
-        // 先投递事件轨迹再关闭文本通道：消费者排空文本流后即可立即取到 events
-        let _ = events_tx.send(events);
+        // 事件流 sender 在此 drop → 消费者 recv() 返回 None（事件流结束）
+        drop(events_tx);
         // 确保子进程退出
         let _ = child.wait().await;
     });
@@ -205,15 +210,28 @@ async fn process_with_claude_stream(
     Ok((stream, sid, events_rx))
 }
 
+/// 记录一个 [`AgentLogEvent`]：累积到 `events` 备用，若 `events_tx` 为 Some 则实时转发
+async fn record_event(
+    events: &mut Vec<AgentLogEvent>,
+    events_tx: &Option<mpsc::Sender<AgentLogEvent>>,
+    event: AgentLogEvent,
+) {
+    if let Some(tx) = events_tx {
+        let _ = tx.send(event.clone()).await;
+    }
+    events.push(event);
+}
+
 /// 处理一行 `stream_event`，返回 false 表示文本通道已关闭（调用方应退出读取循环）
 ///
 /// 除 text_delta 外，`thinking_delta` / `input_json_delta` / `content_block_start|stop`
-/// 均被累积为 [`AgentLogEvent`] 内容轨迹。
+/// 均被累积为 [`AgentLogEvent`] 内容轨迹，并（若提供 `events_tx`）实时转发到事件流。
 async fn handle_stream_event(
     json: &serde_json::Value,
     text_tx: &mpsc::Sender<String>,
     current: &mut Option<BlockAcc>,
     events: &mut Vec<AgentLogEvent>,
+    events_tx: &Option<mpsc::Sender<AgentLogEvent>>,
 ) -> bool {
     // 嵌套格式: {"event": {"type": "content_block_delta", "delta": ...}}
     let Some(event) = json.get("event") else {
@@ -312,7 +330,13 @@ async fn handle_stream_event(
                 match acc {
                     BlockAcc::Text => {}
                     BlockAcc::Thinking { thinking } => {
-                        events.push(AgentLogEvent::Thinking { thinking });
+                        tracing::info!(
+                            agent = "claude-code",
+                            event = "thinking",
+                            thinking = %thinking,
+                            "Claude 思考",
+                        );
+                        record_event(events, events_tx, AgentLogEvent::Thinking { thinking }).await;
                     }
                     BlockAcc::ToolUse {
                         id,
@@ -321,18 +345,44 @@ async fn handle_stream_event(
                     } => {
                         let input =
                             serde_json::from_str(&partial_json).unwrap_or(serde_json::Value::Null);
-                        events.push(AgentLogEvent::ToolUse { id, name, input });
+                        tracing::info!(
+                            agent = "claude-code",
+                            event = "tool_use",
+                            id = %id,
+                            name = %name,
+                            input = %input,
+                            "Claude 调用工具",
+                        );
+                        record_event(
+                            events,
+                            events_tx,
+                            AgentLogEvent::ToolUse { id, name, input },
+                        )
+                        .await;
                     }
                     BlockAcc::ToolResult {
                         tool_use_id,
                         content,
                         is_error,
                     } => {
-                        events.push(AgentLogEvent::ToolResult {
-                            tool_use_id,
-                            content,
+                        tracing::info!(
+                            agent = "claude-code",
+                            event = "tool_result",
+                            tool_use_id = %tool_use_id,
                             is_error,
-                        });
+                            content = %content,
+                            "Claude 工具结果",
+                        );
+                        record_event(
+                            events,
+                            events_tx,
+                            AgentLogEvent::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                            },
+                        )
+                        .await;
                     }
                 }
             }
@@ -394,7 +444,7 @@ mod tests {
         let mut current = None;
         let mut events = Vec::new();
         for line in lines {
-            let ok = handle_stream_event(line, &text_tx, &mut current, &mut events).await;
+            let ok = handle_stream_event(line, &text_tx, &mut current, &mut events, &None).await;
             assert!(ok, "文本通道不应提前关闭");
         }
         let mut texts = Vec::new();
