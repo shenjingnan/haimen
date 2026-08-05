@@ -6,7 +6,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing;
 
-use crate::gateway::provider::{AgentEventReceiver, AgentOutput, AgentProvider, TextStream};
+use crate::gateway::provider::{
+    AgentEventStream, AgentLogEvent, AgentOutput, AgentProvider, TextStream,
+};
 
 /// Codex CLI Agent
 ///
@@ -60,11 +62,10 @@ impl AgentProvider for CodexAgent {
         message: &str,
         session_id: Option<&str>,
         work_dir: &str,
-    ) -> Result<(TextStream, String, AgentEventReceiver), String> {
+    ) -> Result<(TextStream, String, AgentEventStream), String> {
         let (stream, sid) = process_with_codex_stream(message, session_id, work_dir).await?;
-        // 事件轨迹为空，直接投递空列表
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = tx.send(Vec::new());
+        // codex 的 reasoning/tool 轨迹捕获留作后续，事件流为空（sender 立即 drop）
+        let (_tx, rx) = tokio::sync::mpsc::channel::<AgentLogEvent>(64);
         Ok((stream, sid, rx))
     }
 

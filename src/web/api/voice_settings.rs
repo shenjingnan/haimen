@@ -358,6 +358,10 @@ pub async fn get_tts_settings() -> Json<serde_json::Value> {
             "wake_greeting": cfg.tts.wake_greeting,
             "no_speech_goodbye": cfg.tts.no_speech_goodbye,
             "no_speech_timeout_ms": cfg.tts.no_speech_timeout_ms,
+            "thinking_feedback_enabled": cfg.tts.thinking_feedback_enabled,
+            "thinking_feedback_interval_ms": cfg.tts.thinking_feedback_interval_ms,
+            "thinking_feedback_text": cfg.tts.thinking_feedback_text,
+            "thinking_feedback_timeout_text": cfg.tts.thinking_feedback_timeout_text,
             "resolved": {
                 "api_key": cfg.tts.resolved_api_key().ok(),
                 "voice": Some(cfg.tts.resolved_voice()),
@@ -377,6 +381,10 @@ pub async fn get_tts_settings() -> Json<serde_json::Value> {
 /// - `wake_greeting` — 唤醒问候文案（空串视为未设置，回退「你好」）
 /// - `no_speech_goodbye` — 无语音超时后的告别文案（空串视为未设置，回退「拜拜」）
 /// - `no_speech_timeout_ms` — 录音开始后累计无有效语音达到该毫秒数时播报告别并关闭连接（0 禁用）
+/// - `thinking_feedback_enabled` — 是否在等待 Agent 首个可播文本期间播报处理进度提示
+/// - `thinking_feedback_interval_ms` — 进度提示播报间隔毫秒（0 表示仅保留超时兜底、不做周期提示）
+/// - `thinking_feedback_text` — 周期进度提示文案（空串视为未设置，回退默认）
+/// - `thinking_feedback_timeout_text` — 等待超时的兜底文案（空串视为未设置，回退默认）
 pub async fn update_tts_settings(
     State(tts_config): State<Arc<RwLock<TtsConfig>>>,
     Json(body): Json<serde_json::Value>,
@@ -447,6 +455,48 @@ pub async fn update_tts_settings(
     // 更新无语音超时时长（如果提供；0 表示禁用）
     if let Some(ms) = body.get("no_speech_timeout_ms").and_then(|v| v.as_u64()) {
         cfg.tts.no_speech_timeout_ms = ms;
+    }
+
+    // 更新处理进度提示开关（如果提供）
+    if let Some(enabled) = body
+        .get("thinking_feedback_enabled")
+        .and_then(|v| v.as_bool())
+    {
+        cfg.tts.thinking_feedback_enabled = enabled;
+    }
+
+    // 更新进度提示播报间隔（如果提供；0 表示仅保留超时兜底）
+    if let Some(ms) = body
+        .get("thinking_feedback_interval_ms")
+        .and_then(|v| v.as_u64())
+    {
+        cfg.tts.thinking_feedback_interval_ms = ms;
+    }
+
+    // 更新周期进度提示文案（如果提供；空串视为未设置，回退默认）
+    if body.get("thinking_feedback_text").is_some() {
+        let text = body
+            .get("thinking_feedback_text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        cfg.tts.thinking_feedback_text = if text.is_empty() {
+            None
+        } else {
+            Some(text.to_string())
+        };
+    }
+
+    // 更新超时兜底文案（如果提供；空串视为未设置，回退默认）
+    if body.get("thinking_feedback_timeout_text").is_some() {
+        let text = body
+            .get("thinking_feedback_timeout_text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        cfg.tts.thinking_feedback_timeout_text = if text.is_empty() {
+            None
+        } else {
+            Some(text.to_string())
+        };
     }
 
     if let Err(e) = crate::config::settings::save_settings(&cfg) {
