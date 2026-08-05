@@ -8,7 +8,7 @@ members = [
 
 [package]
 name = "haimen"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 rust-version = "1.85"
 description = "AI 网关基建 CLI"
@@ -118,9 +118,9 @@ tokio-util = { workspace = true }
 tokio-stream = { workspace = true }
 
 # Workspace crate 依赖
-haimen-core = { path = "crates/haimen-core", version = "0.1.1" }
-haimen-lark = { path = "crates/haimen-lark", version = "0.2.1" }
-haimen-xiaozhi = { path = "crates/haimen-xiaozhi", version = "0.1.3" }
+haimen-core = { path = "crates/haimen-core", version = "0.1.2" }
+haimen-lark = { path = "crates/haimen-lark", version = "0.2.2" }
+haimen-xiaozhi = { path = "crates/haimen-xiaozhi", version = "0.1.4" }
 univoice = { version = "0.1.6", features = ["opus-encoder"] }
 opus2 = { workspace = true }
 webbrowser = { workspace = true }
