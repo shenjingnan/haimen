@@ -354,6 +354,8 @@ pub async fn get_tts_settings() -> Json<serde_json::Value> {
             "providers": cfg.tts.providers,
             "fixed_text_enabled": cfg.tts.fixed_text_enabled,
             "fixed_text": cfg.tts.fixed_text,
+            "wake_greeting_enabled": cfg.tts.wake_greeting_enabled,
+            "wake_greeting": cfg.tts.wake_greeting,
             "resolved": {
                 "api_key": cfg.tts.resolved_api_key().ok(),
                 "voice": Some(cfg.tts.resolved_voice()),
@@ -369,6 +371,8 @@ pub async fn get_tts_settings() -> Json<serde_json::Value> {
 /// - `providers` — 所有提供商的完整凭证映射
 /// - `fixed_text_enabled` — 是否启用固定文本模式
 /// - `fixed_text` — 固定文本内容
+/// - `wake_greeting_enabled` — 是否在设备唤醒时主动播报问候
+/// - `wake_greeting` — 唤醒问候文案（空串视为未设置，回退「你好」）
 pub async fn update_tts_settings(
     State(tts_config): State<Arc<RwLock<TtsConfig>>>,
     Json(body): Json<serde_json::Value>,
@@ -399,6 +403,24 @@ pub async fn update_tts_settings(
             .and_then(|v| v.as_str())
             .unwrap_or("");
         cfg.tts.fixed_text = if text.is_empty() {
+            None
+        } else {
+            Some(text.to_string())
+        };
+    }
+
+    // 更新唤醒问候开关（如果提供）
+    if let Some(enabled) = body.get("wake_greeting_enabled").and_then(|v| v.as_bool()) {
+        cfg.tts.wake_greeting_enabled = enabled;
+    }
+
+    // 更新唤醒问候文案（如果提供）
+    if body.get("wake_greeting").is_some() {
+        let text = body
+            .get("wake_greeting")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        cfg.tts.wake_greeting = if text.is_empty() {
             None
         } else {
             Some(text.to_string())

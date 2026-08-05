@@ -272,6 +272,16 @@ async fn handle_listen(
             );
             session.audio_buffer.clear();
             session.state = SessionState::Ready;
+
+            // 主动播报唤醒问候：策略决定是否合成（默认 no-op 返回 None）。
+            // 使用 play_greeting_frames（不监听中断）：设备唤醒后紧接着的
+            // listen/start（录音轮）不会打断问候，会完整播完；设备消息
+            // 留在 socket 缓冲中，播放结束后按序处理，用户语音不丢失。
+            if let Some(frames) = session.strategy.wake_greeting(&session.session_id).await {
+                if !frames.is_empty() {
+                    play_greeting_frames(socket, session, frames).await;
+                }
+            }
         }
         ListenState::Start => {
             tracing::debug!(
@@ -502,6 +512,81 @@ async fn playback_frames(socket: &mut WebSocket, session: &mut Session, frames: 
         frame_count = total,
         strategy = session.strategy.name(),
         "Playback completed",
+    );
+}
+
+/// 主动问候回放：将音频帧发送到设备（不监听设备中断）
+///
+/// 与 [`playback_frames`] 不同，此路径**不读取 socket**：
+/// - 不用 `wait_frame_interrupt` 监听 `listen/start`/`abort`，避免唤醒问候
+///   被设备紧接着开始的录音轮（`listen/start`）打断。
+/// - 设备在播放期间发来的消息（`listen/start`、音频帧）留在 socket 接收缓冲中，
+///   播放结束后由主循环按序处理（进入录音、缓冲音频），用户语音不丢失，
+///   只是延后 ~1 帧 × 帧数 的处理时间。
+/// - 帧按 60ms 节奏下发（与设备播放速率同步）；最后一帧后再等一帧时长才发
+///   `TTS::Stop`，避免尾帧被立即停播截断。
+///
+/// 适用于「服务端主动播报」场景（如唤醒问候）。若需支持设备打断播放，
+/// 应使用 [`playback_frames`]。
+async fn play_greeting_frames(
+    socket: &mut WebSocket,
+    session: &mut Session,
+    frames: Vec<AudioFrame>,
+) {
+    session.state = SessionState::Playing;
+
+    if frames.is_empty() {
+        session.state = SessionState::Ready;
+        return;
+    }
+
+    // 发送 TTS::Start
+    if send_json(
+        socket,
+        &ServerMessage::Tts {
+            session_id: session.session_id.clone(),
+            state: TtsState::Start,
+            text: None,
+        },
+    )
+    .await
+    .is_err()
+    {
+        session.state = SessionState::Ready;
+        return;
+    }
+
+    let total = frames.len();
+    for frame in frames.iter() {
+        let encoded = encode_protocol2(&frame.data, frame.timestamp);
+        if socket.send(Message::Binary(encoded.into())).await.is_err() {
+            session.state = SessionState::Ready;
+            return;
+        }
+
+        // 帧间隔 60ms（与设备播放节奏同步）；最后一帧后也等一帧时长，
+        // 让设备播完尾帧再收到 TTS::Stop，避免截断最后一个字。
+        // 期间不读取 socket：设备消息排队，播放结束后由主循环按序处理。
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+
+    // 所有帧播放完毕，发送 TTS::Stop
+    let _ = send_json(
+        socket,
+        &ServerMessage::Tts {
+            session_id: session.session_id.clone(),
+            state: TtsState::Stop,
+            text: None,
+        },
+    )
+    .await;
+
+    session.state = SessionState::Ready;
+    tracing::debug!(
+        device_id = %session.device_id,
+        frame_count = total,
+        strategy = session.strategy.name(),
+        "Greeting playback completed",
     );
 }
 
