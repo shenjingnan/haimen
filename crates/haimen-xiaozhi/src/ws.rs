@@ -150,6 +150,19 @@ async fn handle_ws_connection(
             };
             tokio::pin!(vad_fut);
 
+            // 获取无语音超时信号（策略可选）
+            let no_speech_completion = session.strategy.no_speech_completion();
+            let has_no_speech = no_speech_completion.is_some();
+
+            let no_speech_fut = async move {
+                if let Some(notify) = no_speech_completion {
+                    notify.notified().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::pin!(no_speech_fut);
+
             tokio::select! {
                 msg = socket.recv() => msg,
                 _ = tokio::time::sleep_until(tokio_deadline) => {
@@ -171,6 +184,24 @@ async fn handle_ws_connection(
                     session.recording_deadline = None;
                     strategy_playback(&mut socket, &mut session).await;
                     continue;
+                }
+                _ = &mut no_speech_fut, if has_no_speech => {
+                    tracing::info!(
+                        device_id = %session.device_id,
+                        strategy = session.strategy.name(),
+                        "No-speech timeout, playing goodbye and closing connection",
+                    );
+                    session.recording_deadline = None;
+                    // 合成并播放「拜拜」（最长 5s）；失败/空帧则跳过播放，
+                    // 但无论如何都要关闭连接结束这段无语音对话
+                    if let Some(frames) = session.strategy.goodbye_frames(&session.session_id).await {
+                        if !frames.is_empty() {
+                            play_greeting_frames(&mut socket, &mut session, frames).await;
+                        }
+                    }
+                    // axum 0.8 WebSocket 无 close()：发规范 Close 帧后 return（drop socket 完成关闭）
+                    let _ = socket.send(Message::Close(None)).await;
+                    return;
                 }
             }
         } else {
@@ -1185,6 +1216,11 @@ impl Drop for CancelGuard {
 mod tests {
     use super::*;
     use crate::strategy::EchoStrategy;
+    use async_trait::async_trait;
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::sync::Notify;
+    use tokio_tungstenite::tungstenite::Message as TMessage;
 
     fn make_session() -> Session {
         Session {
@@ -1216,5 +1252,136 @@ mod tests {
             session.recording_deadline.is_none(),
             "应清除旧的录音截止时刻"
         );
+    }
+
+    // ─── 无语音超时端到端测试 ────────────────────────────
+
+    /// 测试用策略：镜像真实 AsrLlmTtsStrategy 的无语音超时检测入口
+    /// （on_audio_frame 计数到阈值 → 触发 no_speech_completion 的 Notify）
+    struct TestNoSpeechStrategy {
+        notify: Arc<Notify>,
+        frame_threshold: u64,
+        frame_count: Arc<AtomicU64>,
+    }
+
+    #[async_trait]
+    impl ResponseStrategy for TestNoSpeechStrategy {
+        fn name(&self) -> &'static str {
+            "test-no-speech"
+        }
+
+        async fn generate_response(
+            &self,
+            _audio_buffer: Vec<AudioFrame>,
+            _session_id: &str,
+        ) -> Result<Vec<AudioFrame>, String> {
+            Ok(Vec::new())
+        }
+
+        fn supports_streaming_asr(&self) -> bool {
+            true
+        }
+
+        async fn on_audio_frame(&self, _frame: &AudioFrame) -> Result<(), String> {
+            let count = self.frame_count.fetch_add(1, Ordering::SeqCst) + 1;
+            if count >= self.frame_threshold {
+                self.notify.notify_one();
+            }
+            Ok(())
+        }
+
+        fn no_speech_completion(&self) -> Option<Arc<Notify>> {
+            Some(self.notify.clone())
+        }
+
+        async fn goodbye_frames(&self, _session_id: &str) -> Option<Vec<AudioFrame>> {
+            Some(vec![AudioFrame {
+                timestamp: 0,
+                data: vec![0xAB, 0xCD],
+            }])
+        }
+    }
+
+    /// 端到端：设备推流静音帧达到阈值 → 服务端播「拜拜」→ 主动发 Close 帧
+    #[tokio::test]
+    async fn test_no_speech_end_to_end_plays_goodbye_and_closes() {
+        use crate::add_routes;
+
+        let strategy = Arc::new(TestNoSpeechStrategy {
+            notify: Arc::new(Notify::new()),
+            frame_threshold: 3,
+            frame_count: Arc::new(AtomicU64::new(0)),
+        });
+        let app = add_routes(axum::Router::new(), strategy);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定测试端口失败");
+        let addr = listener.local_addr().expect("获取测试端口失败");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("测试服务器启动失败");
+        });
+
+        let url = format!("ws://{}/xiaozhi/ws", addr);
+        let (mut ws, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("连接测试服务器失败");
+
+        // HELLO 握手
+        let hello = r#"{"type":"hello","version":3,"transport":"websocket","audio_params":{"format":"opus","sample_rate":16000,"channels":1,"frame_duration":60},"features":{}}"#;
+        ws.send(TMessage::Text(hello.into()))
+            .await
+            .expect("发送 HELLO 失败");
+        let resp = ws.next().await.expect("读取 HELLO 响应失败").unwrap();
+        assert!(matches!(resp, TMessage::Text(_)), "应收到 HELLO 响应");
+
+        // 开始录音
+        let listen = r#"{"type":"listen","state":"start","mode":"auto"}"#;
+        ws.send(TMessage::Text(listen.into()))
+            .await
+            .expect("发送 listen start 失败");
+
+        // 推 3 帧静音（Protocol2），触发无语音超时
+        for i in 0..3u32 {
+            let frame = crate::protocol::encode_protocol2(&[0u8; 4], i * 60);
+            ws.send(TMessage::Binary(frame.into()))
+                .await
+                .expect("发送音频帧失败");
+        }
+
+        // 断言收到的消息序列：TTS::Start → 拜拜帧 → TTS::Stop → Close
+        let mut saw_tts_start = false;
+        let mut saw_binary = false;
+        let mut saw_tts_stop = false;
+        let mut saw_close = false;
+        for _ in 0..10 {
+            let msg = ws.next().await.expect("连接提前关闭").expect("读消息失败");
+            match msg {
+                TMessage::Text(t) => {
+                    let s = t.to_string();
+                    if s.contains("\"type\":\"tts\"") && s.contains("\"state\":\"start\"") {
+                        saw_tts_start = true;
+                    }
+                    if s.contains("\"type\":\"tts\"") && s.contains("\"state\":\"stop\"") {
+                        saw_tts_stop = true;
+                    }
+                }
+                TMessage::Binary(_) => saw_binary = true,
+                TMessage::Close(_) => {
+                    saw_close = true;
+                    break;
+                }
+                _ => {}
+            }
+            if saw_close {
+                break;
+            }
+        }
+
+        assert!(saw_tts_start, "应收到 TTS::Start（开始播告别）");
+        assert!(saw_binary, "应收到拜拜音频帧");
+        assert!(saw_tts_stop, "应收到 TTS::Stop（播报结束）");
+        assert!(saw_close, "服务端应主动发送 Close 帧结束对话");
     }
 }

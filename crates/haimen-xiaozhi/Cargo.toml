@@ -17,3 +17,6 @@ futures-util = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio-tungstenite = "0.29"

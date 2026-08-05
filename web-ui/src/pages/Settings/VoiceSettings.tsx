@@ -304,6 +304,10 @@ function TtsSettingsPanel() {
   const [editState, setEditState] = useState<Record<string, Record<string, string>>>({});
   const [fixedTextEnabled, setFixedTextEnabled] = useState(false);
   const [fixedText, setFixedText] = useState('');
+  const [wakeGreetingEnabled, setWakeGreetingEnabled] = useState(true);
+  const [wakeGreeting, setWakeGreeting] = useState('');
+  const [noSpeechGoodbye, setNoSpeechGoodbye] = useState('');
+  const [noSpeechTimeoutSecs, setNoSpeechTimeoutSecs] = useState(10);
   const [activeProvider, setActiveProvider] = useState('doubao');
   const [selectedTab, setSelectedTab] = useState('doubao');
   const [voices, setVoices] = useState<TtsVoice[]>([]);
@@ -322,6 +326,10 @@ function TtsSettingsPanel() {
       setEditState(data.providers ?? {});
       setFixedTextEnabled(data.fixed_text_enabled ?? false);
       setFixedText(data.fixed_text ?? '');
+      setWakeGreetingEnabled(data.wake_greeting_enabled ?? true);
+      setWakeGreeting(data.wake_greeting ?? '');
+      setNoSpeechGoodbye(data.no_speech_goodbye ?? '');
+      setNoSpeechTimeoutSecs((data.no_speech_timeout_ms ?? 10000) / 1000);
       setActiveProvider(data.active_provider ?? 'doubao');
       setSelectedTab(data.active_provider ?? 'doubao');
       // 音色列表由下方 effect（依赖 selectedTab / currentModel）加载
@@ -381,6 +389,10 @@ function TtsSettingsPanel() {
         providers: editState,
         fixed_text_enabled: fixedTextEnabled,
         fixed_text: fixedText || null,
+        wake_greeting_enabled: wakeGreetingEnabled,
+        wake_greeting: wakeGreeting || null,
+        no_speech_goodbye: noSpeechGoodbye || null,
+        no_speech_timeout_ms: noSpeechTimeoutSecs * 1000,
       });
       setSaveResult('保存成功');
       setVerifyResult(null);
@@ -401,6 +413,10 @@ function TtsSettingsPanel() {
         providers: editState,
         fixed_text_enabled: fixedTextEnabled,
         fixed_text: fixedText || null,
+        wake_greeting_enabled: wakeGreetingEnabled,
+        wake_greeting: wakeGreeting || null,
+        no_speech_goodbye: noSpeechGoodbye || null,
+        no_speech_timeout_ms: noSpeechTimeoutSecs * 1000,
       });
       setActiveProvider(selectedTab);
       setSaveResult('已切换激活服务商');
@@ -614,6 +630,53 @@ function TtsSettingsPanel() {
               onChange={(e) => setFixedText(e.target.value)}
             />
           )}
+        </div>
+
+        {/* ── 交互语设置 ── */}
+        <div className="mt-6 rounded-lg border p-4 space-y-4">
+          <div className="space-y-0.5">
+            <span className="text-sm font-medium">交互语</span>
+            <p className="text-xs text-muted-foreground">
+              自定义设备唤醒问候与无语音超时的告别语（留空回退默认文案）
+            </p>
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-medium">唤醒问候</span>
+              <Switch checked={wakeGreetingEnabled} onCheckedChange={setWakeGreetingEnabled} />
+            </div>
+            {wakeGreetingEnabled && (
+              <Input
+                placeholder="唤醒时播报的问候语，留空为「你好」"
+                value={wakeGreeting}
+                onChange={(e) => setWakeGreeting(e.target.value)}
+              />
+            )}
+          </div>
+
+          <div className="space-y-2">
+            <span className="text-sm font-medium">无语音告别</span>
+            <p className="text-xs text-muted-foreground">
+              设备唤醒后若持续不说话，超时后播报该告别语并结束对话
+            </p>
+            <Input
+              placeholder="超时告别语，留空为「拜拜」"
+              value={noSpeechGoodbye}
+              onChange={(e) => setNoSpeechGoodbye(e.target.value)}
+            />
+            <div className="flex items-center gap-2">
+              <Input
+                type="number"
+                min={0}
+                placeholder="超时秒数"
+                value={noSpeechTimeoutSecs}
+                onChange={(e) => setNoSpeechTimeoutSecs(Number(e.target.value) || 0)}
+                className="w-28"
+              />
+              <span className="text-sm text-muted-foreground">秒无语音后触发（0 禁用）</span>
+            </div>
+          </div>
         </div>
       </CardContent>
     </Card>

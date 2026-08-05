@@ -548,6 +548,12 @@ pub struct TtsConfig {
     /// 唤醒问候文案（None 或空串时回退为「你好」）
     #[serde(default)]
     pub wake_greeting: Option<String>,
+    /// 无语音告别文案（None 或纯空白时回退为「拜拜」）
+    #[serde(default)]
+    pub no_speech_goodbye: Option<String>,
+    /// 录音开始后累计无有效语音达到该毫秒数时，播报告别并关闭连接（0 表示禁用）
+    #[serde(default = "default_no_speech_timeout_ms")]
+    pub no_speech_timeout_ms: u64,
 }
 
 /// 旧格式 TTS 配置（用于向后兼容反序列化）
@@ -564,6 +570,8 @@ struct TtsConfigLegacy {
     fixed_text: Option<String>,
     wake_greeting_enabled: Option<bool>,
     wake_greeting: Option<String>,
+    no_speech_goodbye: Option<String>,
+    no_speech_timeout_ms: Option<u64>,
 }
 
 impl<'de> Deserialize<'de> for TtsConfig {
@@ -582,6 +590,10 @@ impl<'de> Deserialize<'de> for TtsConfig {
                 fixed_text: legacy.fixed_text,
                 wake_greeting_enabled: legacy.wake_greeting_enabled.unwrap_or(true),
                 wake_greeting: legacy.wake_greeting,
+                no_speech_goodbye: legacy.no_speech_goodbye,
+                no_speech_timeout_ms: legacy
+                    .no_speech_timeout_ms
+                    .unwrap_or_else(default_no_speech_timeout_ms),
             });
         }
 
@@ -617,12 +629,20 @@ impl<'de> Deserialize<'de> for TtsConfig {
             fixed_text: legacy.fixed_text,
             wake_greeting_enabled: legacy.wake_greeting_enabled.unwrap_or(true),
             wake_greeting: legacy.wake_greeting,
+            no_speech_goodbye: legacy.no_speech_goodbye,
+            no_speech_timeout_ms: legacy
+                .no_speech_timeout_ms
+                .unwrap_or_else(default_no_speech_timeout_ms),
         })
     }
 }
 
 fn default_tts_provider() -> String {
     "doubao".to_string()
+}
+
+fn default_no_speech_timeout_ms() -> u64 {
+    10000
 }
 
 impl Default for TtsConfig {
@@ -634,6 +654,8 @@ impl Default for TtsConfig {
             fixed_text: None,
             wake_greeting_enabled: true,
             wake_greeting: None,
+            no_speech_goodbye: None,
+            no_speech_timeout_ms: default_no_speech_timeout_ms(),
         }
     }
 }

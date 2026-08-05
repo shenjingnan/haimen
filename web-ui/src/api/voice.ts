@@ -51,6 +51,10 @@ export async function updateTtsSettings(settings: {
   providers?: Record<string, Record<string, string>>;
   fixed_text_enabled?: boolean;
   fixed_text?: string | null;
+  wake_greeting_enabled?: boolean;
+  wake_greeting?: string | null;
+  no_speech_goodbye?: string | null;
+  no_speech_timeout_ms?: number;
 }): Promise<TtsSettings> {
   const res = await apiFetch<ApiResponse<TtsSettings>>('/api/v1/settings/tts', {
     method: 'PUT',

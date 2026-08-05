@@ -96,6 +96,14 @@ export interface TtsSettings {
   fixed_text_enabled: boolean;
   /** 固定文本内容 */
   fixed_text: string | null;
+  /** 是否在设备唤醒时主动播报问候 */
+  wake_greeting_enabled: boolean;
+  /** 唤醒问候文案（空串回退「你好」） */
+  wake_greeting: string | null;
+  /** 无语音超时后的告别文案（空串回退「拜拜」） */
+  no_speech_goodbye: string | null;
+  /** 录音开始后累计无有效语音达到该毫秒数时播报告别并关闭连接（0 禁用） */
+  no_speech_timeout_ms: number;
   /** 当前激活提供商的回退解析值 */
   resolved?: {
     api_key: string | null;
