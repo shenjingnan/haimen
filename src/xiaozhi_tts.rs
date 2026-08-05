@@ -198,8 +198,8 @@ pub(crate) fn pcm_to_opus_frames(
     let _ = encoder.set_complexity(10);
     // 启用 VBR（可变比特率，节省带宽）
     let _ = encoder.set_vbr(true);
-    // 启用 DTX（静音检测）
-    let _ = encoder.set_dtx(true);
+    // 不启用 DTX（静音检测）：DTX 静音帧对部分 ESP32 固件播放器
+    // 的时长处理不友好，可能压缩句间停顿、造成"半个字/跳字"听感。
 
     let mut frames: Vec<Vec<u8>> = Vec::new();
     let mut opus_buf = vec![0u8; 4000]; // Opus 最大包大小
