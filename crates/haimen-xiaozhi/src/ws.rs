@@ -661,10 +661,19 @@ async fn playback_frames_stream(
 
     session.state = SessionState::Playing;
 
+    // ── 诊断：帧到达间隔追踪 ──
+    // 记录相邻 Audio 帧到达 frame_rx 的时间间隔，间隔超过阈值即视为 TTS 合成
+    // 断档（固件播放缓冲会 underrun → 跳帧，听感"半个字/几个字压缩在一起"）。
+    // 真机跑一轮后据日志判断断档频率与大小，再针对性优化合成节奏。
+    let mut last_frame_arrival: Option<Instant> = None;
+    let mut gap_warn_count: usize = 0;
+
     // ── Phase 1: 预缓冲 ─────────────────────────────────────────
-    // 在开始播放前先收集若干帧，给 TTS 生成足够的 head start
-    // 10 帧 × 60ms = 600ms 预缓冲，在设备播放完这 600ms 内容之前
-    // TTS 有充足时间生成后续音频。
+    // 在开始播放前先收集若干帧，给 TTS 生成足够的 head start。
+    // 10 帧 × 60ms = 600ms 预缓冲：实测 TTS 合成速率 ~7-8x 实时，
+    // 600ms 已足以覆盖网络抖动。预缓冲不宜过大——Tts::Start 后预缓冲帧
+    // 是一次性连发的，若超出固件 jitter buffer 容量会溢出丢帧
+    // （同样表现为"半个字/语速压缩"）。
     //
     // 文本事件不参与预缓冲计数：
     // - Stt 立即转发（固件对 stt 的处理不依赖状态机，任何状态都会写屏）
@@ -692,6 +701,12 @@ async fn playback_frames_stream(
                                 pending_sentences.push(text.clone());
                             }
                             PlaybackEvent::Audio(frame) => {
+                                record_frame_arrival_gap(
+                                    session,
+                                    &mut last_frame_arrival,
+                                    &mut gap_warn_count,
+                                    "prebuffer",
+                                );
                                 prebuffer.push(frame.clone());
                             }
                         }
@@ -784,6 +799,13 @@ async fn playback_frames_stream(
         frame_count += 1;
     }
 
+    // 发送时钟：预缓冲连发结束后，稳态帧从 T0+60ms 起，此后每 60ms 一帧。
+    // 用绝对时刻网格对齐（而非每次重新 sleep 60ms），且每帧发送完成后
+    // next_send_at 累加 60ms（而非取当前时刻）——否则帧间隔会变成
+    // 60ms+发送耗时，逐帧累积变慢，固件缓冲被逐渐耗尽后触发追赶跳帧
+    // （听感"开头正常、后面内容挤在一起"）。
+    let mut next_send_at = std::time::Instant::now() + std::time::Duration::from_millis(60);
+
     tracing::debug!(
         device_id = %session.device_id,
         prebuffer = prebuffer.len(),
@@ -791,9 +813,11 @@ async fn playback_frames_stream(
     );
 
     // ── Phase 3: 稳态播放 ──────────────────────────────────────
-    // 预缓冲帧已发出，设备有 600ms 的音频可播放。
-    // 后续帧按 60ms 间隔逐个发送，保持与设备播放节奏同步。
-    // 因为有预缓冲做 head start，即使个别帧迟到几毫秒也不会卡顿。
+    // 预缓冲帧已发出，设备有约 600ms 的音频可播放。
+    // 后续帧按固定 60ms 间隔发送（由 next_send_at 发送时钟对齐），
+    // 保持与设备播放节奏同步；合成慢导致帧断供时由预缓冲兜底。
+    // 发送时钟避免 socket 有消息返回时 wait_frame_interrupt 提前结束、
+    // 压缩帧间隔导致的突发快发（会冲击设备 jitter buffer 引发丢帧）。
 
     loop {
         tokio::select! {
@@ -811,18 +835,31 @@ async fn playback_frames_stream(
                             PlaybackEvent::Audio(frame) => {
                                 frame_count += 1;
 
+                                // 诊断：帧到达间隔（合成节奏）
+                                record_frame_arrival_gap(
+                                    session,
+                                    &mut last_frame_arrival,
+                                    &mut gap_warn_count,
+                                    "steady",
+                                );
+
+                                // 等待至发送时钟对齐（距上次发送 60ms），期间监听中断
+                                if let Some(interrupt) =
+                                    wait_until_send_slot(socket, &mut next_send_at).await
+                                {
+                                    handle_playback_interrupt(socket, session, interrupt).await;
+                                    return;
+                                }
+
                                 let encoded = encode_protocol2(&frame.data, frame.timestamp);
                                 if socket.send(Message::Binary(encoded.into())).await.is_err() {
                                     tracing::warn!("Streaming playback: connection lost");
                                     session.state = SessionState::Ready;
                                     return;
                                 }
-
-                                // 60ms 帧间隔 + 中断监听（与批处理模式一致）
-                                if let Some(interrupt) = wait_frame_interrupt(socket).await {
-                                    handle_playback_interrupt(socket, session, interrupt).await;
-                                    return;
-                                }
+                                // 发送时钟累加 60ms（而非取当前时刻），发送耗时由
+                                // 下一帧等待时追回，保证平均节奏严格 60ms、不累积变慢。
+                                next_send_at += std::time::Duration::from_millis(60);
                             }
                         }
                     }
@@ -857,16 +894,26 @@ async fn playback_frames_stream(
                     }
                     PlaybackEvent::Audio(frame) => {
                         frame_count += 1;
+                        // 诊断：帧到达间隔（合成节奏）
+                        record_frame_arrival_gap(
+                            session,
+                            &mut last_frame_arrival,
+                            &mut gap_warn_count,
+                            "drain",
+                        );
+                        // drain 阶段同样受发送时钟约束，避免突发快发
+                        if let Some(interrupt) =
+                            wait_until_send_slot(socket, &mut next_send_at).await
+                        {
+                            handle_playback_interrupt(socket, session, interrupt).await;
+                            return;
+                        }
                         let encoded = encode_protocol2(&frame.data, frame.timestamp);
                         if socket.send(Message::Binary(encoded.into())).await.is_err() {
                             break;
                         }
-                        // 中断时 handle_playback_interrupt 已发送 TTS::Stop 并复位状态，
-                        // 直接返回避免重复下发 TTS::Stop。
-                        if let Some(interrupt) = wait_frame_interrupt(socket).await {
-                            handle_playback_interrupt(socket, session, interrupt).await;
-                            return;
-                        }
+                        // 发送时钟累加 60ms，与稳态分支一致，drain 阶段不累积变慢
+                        next_send_at += std::time::Duration::from_millis(60);
                     }
                 }
             }
@@ -892,6 +939,16 @@ async fn playback_frames_stream(
         strategy = session.strategy.name(),
         "Streaming playback completed",
     );
+
+    if gap_warn_count > 0 {
+        tracing::warn!(
+            device_id = %session.device_id,
+            frame_count = frame_count,
+            gap_warn_count = gap_warn_count,
+            "流式回放诊断汇总: 播放期间发生 {} 次合成断档（帧到达间隔 > 300ms）",
+            gap_warn_count,
+        );
+    }
 }
 
 // ─── 工具函数 ──────────────────────────────────────────────
@@ -977,6 +1034,83 @@ async fn wait_frame_interrupt(socket: &mut WebSocket) -> Option<PlaybackInterrup
             _ => None,
         },
     }
+}
+
+/// 等待至「发送时钟」的下一帧时刻（距上次发送 60ms），期间监听中断
+///
+/// 与 [`wait_frame_interrupt`] 的区别：后者每次调用都重新起一个 60ms 计时，
+/// socket 有消息返回时会提前结束、压缩帧间隔导致突发快发；本函数以
+/// `next_send_at` 这个绝对时刻对齐，socket 有消息时忽略并继续等待，
+/// 保证帧发送间隔稳定在 60ms，避免设备 jitter buffer 因快慢不均而丢帧。
+///
+/// 返回 `Some` 表示收到中断信号；`None` 表示已到发送时刻，可发送下一帧。
+async fn wait_until_send_slot(
+    socket: &mut WebSocket,
+    next_send_at: &mut Instant,
+) -> Option<PlaybackInterrupt> {
+    loop {
+        let wait = next_send_at.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            return None;
+        }
+        let sleep = tokio::time::sleep(wait);
+        tokio::pin!(sleep);
+        tokio::select! {
+            _ = &mut sleep => return None,
+            msg = socket.recv() => match msg {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(cmd) = serde_json::from_str::<ClientMessage>(&text) {
+                        match cmd {
+                            ClientMessage::Abort => return Some(PlaybackInterrupt::Abort),
+                            ClientMessage::Listen { state: ListenState::Start, .. } => {
+                                return Some(PlaybackInterrupt::ListenStart);
+                            }
+                            // 其他消息忽略，继续等待至发送时刻
+                            _ => continue,
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+                    tracing::debug!("Connection closed during playback");
+                    return Some(PlaybackInterrupt::Closed);
+                }
+                _ => continue,
+            },
+        }
+    }
+}
+
+/// 帧到达间隔诊断阈值（ms）：超过即视为一次合成断档（固件 underrun 会跳帧）
+const FRAME_GAP_WARN_MS: u128 = 300;
+
+/// 诊断辅助：记录相邻 Audio 帧到达 frame_rx 的时间间隔。
+///
+/// 间隔超过 [`FRAME_GAP_WARN_MS`]（300ms）即打 WARN 日志——说明该窗口内 TTS
+/// 合成断供，固件播放缓冲会 underrun（表现为"半个字"或"几个字压缩在一起"）。
+/// 真机跑一轮后据日志判断断档频率与大小，再针对性优化合成节奏。
+fn record_frame_arrival_gap(
+    session: &Session,
+    last_frame_arrival: &mut Option<Instant>,
+    gap_warn_count: &mut usize,
+    phase: &str,
+) {
+    let now = Instant::now();
+    if let Some(last) = last_frame_arrival {
+        let gap_ms = now.duration_since(*last).as_millis();
+        if gap_ms > FRAME_GAP_WARN_MS {
+            *gap_warn_count += 1;
+            tracing::warn!(
+                device_id = %session.device_id,
+                phase = %phase,
+                gap_ms = gap_ms,
+                warn_count = *gap_warn_count,
+                "流式回放诊断: 帧到达间隔过大（合成断档）",
+            );
+        }
+    }
+    *last_frame_arrival = Some(now);
 }
 
 /// 处理播放期间的中断信号，统一完成状态迁移并停止播放

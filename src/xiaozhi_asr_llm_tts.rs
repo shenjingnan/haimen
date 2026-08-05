@@ -2216,7 +2216,8 @@ impl StreamingOpusEncoder {
             .map_err(|e| format!("创建 Opus 编码器失败: {}", e))?;
         let _ = encoder.set_complexity(10);
         let _ = encoder.set_vbr(true);
-        let _ = encoder.set_dtx(true);
+        // 不启用 DTX（静音检测）：DTX 静音帧对部分 ESP32 固件播放器
+        // 的时长处理不友好，可能压缩句间停顿、造成"半个字/跳字"听感。
 
         Ok(Self {
             encoder,
