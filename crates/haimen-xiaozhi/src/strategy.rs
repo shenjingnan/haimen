@@ -167,6 +167,28 @@ pub trait ResponseStrategy: Send + Sync {
     async fn wake_greeting(&self, _session_id: &str) -> Option<Vec<AudioFrame>> {
         None
     }
+
+    // ────────── 无语音超时（可选覆盖） ──────────
+
+    /// 无语音超时通知器：录音开始后持续无有效语音达到策略阈值时触发。
+    ///
+    /// ws.rs 收到此信号后可主动播报告别（[`goodbye_frames`]）并关闭连接。
+    /// 返回 `None` 表示不支持该信号（依赖正常录音结束流程）。默认返回 `None`。
+    fn no_speech_completion(&self) -> Option<Arc<Notify>> {
+        None
+    }
+
+    /// 无语音超时后的告别音频帧（如「拜拜」）。
+    ///
+    /// 返回要播放的 [`AudioFrame`]（时间戳从 0 起、步长 60ms，可直接喂给
+    /// `playback_frames` / `play_greeting_frames`）；`None` 或空数组表示不播报，
+    /// 调用方仍应关闭连接结束对话。
+    ///
+    /// 实现方负责读取配置决定文案、TTS 合成、PCM → Opus 封装。
+    /// 默认实现返回 `None`（不播报），现有策略不受影响。
+    async fn goodbye_frames(&self, _session_id: &str) -> Option<Vec<AudioFrame>> {
+        None
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -404,5 +426,26 @@ mod tests {
         let strategy: Arc<dyn ResponseStrategy> = Arc::new(EchoStrategy);
         let result = strategy.wake_greeting("trait-object").await;
         assert!(result.is_none(), "trait object 分发后应仍返回 None");
+    }
+
+    // ─── 无语音超时默认行为（no-op） ─────────────────────
+
+    #[test]
+    fn test_t17_no_speech_completion_default_none() {
+        let strategy = EchoStrategy;
+        assert!(
+            strategy.no_speech_completion().is_none(),
+            "默认 no_speech_completion 应返回 None（不支持无语音超时信号）"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_t18_goodbye_frames_default_none() {
+        let strategy = EchoStrategy;
+        let result = strategy.goodbye_frames("test-session").await;
+        assert!(
+            result.is_none(),
+            "默认 goodbye_frames 应返回 None（不播告别）"
+        );
     }
 }

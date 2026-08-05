@@ -356,6 +356,8 @@ pub async fn get_tts_settings() -> Json<serde_json::Value> {
             "fixed_text": cfg.tts.fixed_text,
             "wake_greeting_enabled": cfg.tts.wake_greeting_enabled,
             "wake_greeting": cfg.tts.wake_greeting,
+            "no_speech_goodbye": cfg.tts.no_speech_goodbye,
+            "no_speech_timeout_ms": cfg.tts.no_speech_timeout_ms,
             "resolved": {
                 "api_key": cfg.tts.resolved_api_key().ok(),
                 "voice": Some(cfg.tts.resolved_voice()),
@@ -373,6 +375,8 @@ pub async fn get_tts_settings() -> Json<serde_json::Value> {
 /// - `fixed_text` — 固定文本内容
 /// - `wake_greeting_enabled` — 是否在设备唤醒时主动播报问候
 /// - `wake_greeting` — 唤醒问候文案（空串视为未设置，回退「你好」）
+/// - `no_speech_goodbye` — 无语音超时后的告别文案（空串视为未设置，回退「拜拜」）
+/// - `no_speech_timeout_ms` — 录音开始后累计无有效语音达到该毫秒数时播报告别并关闭连接（0 禁用）
 pub async fn update_tts_settings(
     State(tts_config): State<Arc<RwLock<TtsConfig>>>,
     Json(body): Json<serde_json::Value>,
@@ -425,6 +429,24 @@ pub async fn update_tts_settings(
         } else {
             Some(text.to_string())
         };
+    }
+
+    // 更新无语音告别文案（如果提供；空串视为未设置，回退「拜拜」）
+    if body.get("no_speech_goodbye").is_some() {
+        let text = body
+            .get("no_speech_goodbye")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        cfg.tts.no_speech_goodbye = if text.is_empty() {
+            None
+        } else {
+            Some(text.to_string())
+        };
+    }
+
+    // 更新无语音超时时长（如果提供；0 表示禁用）
+    if let Some(ms) = body.get("no_speech_timeout_ms").and_then(|v| v.as_u64()) {
+        cfg.tts.no_speech_timeout_ms = ms;
     }
 
     if let Err(e) = crate::config::settings::save_settings(&cfg) {

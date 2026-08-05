@@ -422,6 +422,9 @@ struct AsrPipelineState {
     silence_count: u64,
     /// 本地能量检测：是否检测到过有效语音（初始静音不计入 silence_count）
     speech_detected: bool,
+    /// 无语音超时：录音开始后累计的初始静音帧数（60ms/帧，speech_detected 前才累计），
+    /// 达到配置阈值时触发告别并关闭连接（不依赖 ASR 文本）
+    no_speech_frames: u64,
 }
 
 /// ASR → LLM → TTS 响应策略：将设备录制的语音识别为文字，
@@ -451,6 +454,8 @@ pub struct AsrLlmTtsStrategy {
     streaming_state: Mutex<Option<AsrPipelineState>>,
     /// VAD 端点通知器：ASR 检测到用户说完时触发（每录音周期创建新 Notify）
     vad_notify: Mutex<Arc<Notify>>,
+    /// 无语音超时通知器：录音开始后累计无有效语音达到阈值时触发（每录音周期创建新 Notify）
+    no_speech_notify: Mutex<Arc<Notify>>,
     /// 本地能量检测标记：静音超阈值后关闭 ASR 流，阻止后续帧重新初始化
     silence_closed: AtomicBool,
     /// ASR 是否已返回非空文本（用于决定是否允许本地 VAD 提前关闭流）
@@ -470,6 +475,11 @@ const SILENCE_RMS_THRESHOLD: f64 = 2000.0;
 
 /// 连续静音帧数阈值（60ms/帧），约 1.2s 静音后触发本地 VAD
 const MAX_SILENCE_FRAMES: u64 = 20;
+
+/// 无语音超时帧数阈值：按 60ms/帧向上取整，保证实际时长 ≥ 配置值
+fn no_speech_threshold_frames(timeout_ms: u64) -> u64 {
+    timeout_ms.div_ceil(60)
+}
 
 /// 计算 PCM16 mono 帧的 RMS 能量值
 fn compute_pcm_rms(pcm_bytes: &[u8]) -> f64 {
@@ -713,6 +723,7 @@ impl AsrLlmTtsStrategy {
             llm_session_id: Mutex::new(None),
             streaming_state: Mutex::new(None),
             vad_notify: Mutex::new(Arc::new(Notify::new())),
+            no_speech_notify: Mutex::new(Arc::new(Notify::new())),
             silence_closed: AtomicBool::new(false),
             asr_received_text: Arc::new(AtomicBool::new(false)),
         }
@@ -767,6 +778,7 @@ impl AsrLlmTtsStrategy {
             llm_session_id: Mutex::new(None),
             streaming_state: Mutex::new(None),
             vad_notify: Mutex::new(Arc::new(Notify::new())),
+            no_speech_notify: Mutex::new(Arc::new(Notify::new())),
             silence_closed: AtomicBool::new(false),
             asr_received_text: Arc::new(AtomicBool::new(false)),
         })
@@ -1078,6 +1090,7 @@ impl AsrLlmTtsStrategy {
             last_log_frame: 0,
             silence_count: 0,
             speech_detected: false,
+            no_speech_frames: 0,
         };
 
         let mut guard = self
@@ -1097,8 +1110,15 @@ impl AsrLlmTtsStrategy {
     /// 与 `generate_response` 批处理 TTS 段完全同构。
     /// 整个合成过程带 5 秒超时，防止 TTS 挂起拖死连接主循环。
     /// 任何失败（凭证缺失 / 合成失败 / 空音频 / 超时）都静默返回 `None`，
-    /// 不播 fallback 提示音——唤醒场景播「失败，请重试」是反效果。
-    async fn synthesize_greeting(&self, text: &str, session_id: &str) -> Option<Vec<AudioFrame>> {
+    /// 不播 fallback 提示音——唤醒/告别场景播「失败，请重试」是反效果。
+    ///
+    /// `purpose` 仅用于日志区分调用场景（如「唤醒问候」「无语音告别」）。
+    async fn synthesize_audio(
+        &self,
+        text: &str,
+        session_id: &str,
+        purpose: &str,
+    ) -> Option<Vec<AudioFrame>> {
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             // 在单独的块中获取并释放 TTS 配置锁，避免 RwLockReadGuard 跨越 .await
             let provider = {
@@ -1149,7 +1169,7 @@ impl AsrLlmTtsStrategy {
                     session_id = %session_id,
                     text = %text,
                     frame_count = frames.len(),
-                    "唤醒问候: TTS 合成完成",
+                    "{}: TTS 合成完成", purpose,
                 );
                 Some(frames)
             }
@@ -1158,7 +1178,7 @@ impl AsrLlmTtsStrategy {
                     session_id = %session_id,
                     text = %text,
                     error = %e,
-                    "唤醒问候: TTS 合成失败，静默跳过",
+                    "{}: TTS 合成失败，静默跳过", purpose,
                 );
                 None
             }
@@ -1166,11 +1186,16 @@ impl AsrLlmTtsStrategy {
                 tracing::warn!(
                     session_id = %session_id,
                     text = %text,
-                    "唤醒问候: TTS 合成超时（>5s），静默跳过",
+                    "{}: TTS 合成超时（>5s），静默跳过", purpose,
                 );
                 None
             }
         }
+    }
+
+    /// 唤醒问候合成（薄封装，日志标签固定为「唤醒问候」）
+    async fn synthesize_greeting(&self, text: &str, session_id: &str) -> Option<Vec<AudioFrame>> {
+        self.synthesize_audio(text, session_id, "唤醒问候").await
     }
 }
 
@@ -1214,6 +1239,9 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         *guard = None;
         // 创建全新 Notify 清除上一轮残留的通知信号
         if let Ok(mut ng) = self.vad_notify.lock() {
+            *ng = Arc::new(Notify::new());
+        }
+        if let Ok(mut ng) = self.no_speech_notify.lock() {
             *ng = Arc::new(Notify::new());
         }
         self.silence_closed.store(false, Ordering::Release);
@@ -1284,9 +1312,36 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             if rms >= SILENCE_RMS_THRESHOLD {
                 state.speech_detected = true;
                 state.silence_count = 0;
+                state.no_speech_frames = 0; // 检测到有效语音，无语音超时作废
             } else if state.speech_detected {
                 // 只在首次语音后的静音才累计
                 state.silence_count = state.silence_count.saturating_add(1);
+            } else {
+                // 初始静音（从头到尾没说话）：累计无语音超时帧数
+                state.no_speech_frames = state.no_speech_frames.saturating_add(1);
+            }
+
+            // 无语音超时：初始静音持续达到配置阈值 → 播报告别并关闭连接
+            // （与下方 VAD 互斥：speech_detected=true 后 no_speech_frames 恒为 0；
+            //   本路径置 silence_closed 后，后续帧在此前的短路处被忽略）
+            let no_speech_timeout_ms = self.tts_config.read().unwrap().no_speech_timeout_ms;
+            if no_speech_timeout_ms > 0
+                && state.no_speech_frames >= no_speech_threshold_frames(no_speech_timeout_ms)
+            {
+                // 关闭 ASR 流：替换 sender，令 ASR 后台任务感知流结束
+                let (new_tx, _) = mpsc::channel::<Vec<u8>>(1);
+                let _ = std::mem::replace(&mut state.pcm_tx, new_tx);
+                tracing::info!(
+                    "无语音超时: 录音开始后 {} 帧 ({}ms) 无有效语音，触发告别并关闭连接",
+                    state.no_speech_frames,
+                    state.no_speech_frames * 60,
+                );
+                self.silence_closed.store(true, Ordering::Release);
+                if let Ok(guard) = self.no_speech_notify.lock() {
+                    guard.notify_one();
+                }
+                // 不发送此静音帧
+                return Ok(());
             }
 
             if state.silence_count >= MAX_SILENCE_FRAMES
@@ -1332,6 +1387,25 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
 
     fn vad_completion(&self) -> Option<Arc<Notify>> {
         self.vad_notify.lock().ok().map(|g| g.clone())
+    }
+
+    // ────────── 无语音超时 ──────────
+
+    fn no_speech_completion(&self) -> Option<Arc<Notify>> {
+        self.no_speech_notify.lock().ok().map(|g| g.clone())
+    }
+
+    /// 无语音超时后的告别音频（如「拜拜」）：读配置文案，合成后返回帧
+    /// 交给 ws.rs 的 `play_greeting_frames` 播放。任何失败都静默跳过。
+    async fn goodbye_frames(&self, session_id: &str) -> Option<Vec<AudioFrame>> {
+        let text = {
+            let cfg = self.tts_config.read().unwrap();
+            cfg.no_speech_goodbye
+                .clone()
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| "拜拜".to_string())
+        };
+        self.synthesize_audio(&text, session_id, "无语音告别").await
     }
 
     /// 流式生成 ASR → LLM → TTS 响应并逐帧发送
@@ -3170,5 +3244,162 @@ mod tests {
             wake_greeting_text(&cfg).as_deref(),
             Some("我在，有什么可以帮你？")
         );
+    }
+
+    // ─── 无语音超时检测测试 ─────────────────────────────
+
+    /// 构造已预置流式管道状态的策略（跳过联网的 init_asr_pipeline）
+    fn make_strategy_with_pipeline(timeout_ms: u64) -> AsrLlmTtsStrategy {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        strategy.tts_config.write().unwrap().no_speech_timeout_ms = timeout_ms;
+
+        // 手动构造流式管道状态，避免真实 ASR 连接
+        let (pcm_tx, mut pcm_rx) = mpsc::channel::<Vec<u8>>(256);
+        // drain 任务消费 PCM，防止 on_audio_frame 的 send 阻塞
+        tokio::spawn(async move { while pcm_rx.recv().await.is_some() {} });
+        let asr_handle = tokio::spawn(async { Ok::<String, String>(String::new()) });
+        let decoder = Decoder::new(16000, Channels::Mono).expect("创建测试 Opus 解码器失败");
+        let state = AsrPipelineState {
+            pcm_tx,
+            asr_handle,
+            decoder,
+            frame_samples: 960,
+            frame_count: 0,
+            last_log_frame: 0,
+            silence_count: 0,
+            speech_detected: false,
+            no_speech_frames: 0,
+        };
+        *strategy.streaming_state.lock().unwrap() = Some(state);
+        strategy
+    }
+
+    /// 生成一帧 Opus 音频帧（16kHz 60ms）
+    fn make_audio_frame(pcm: &[u8]) -> AudioFrame {
+        let opus = pcm_to_opus_frames(pcm, 16000, 60)
+            .expect("Opus 编码失败")
+            .remove(0);
+        AudioFrame {
+            timestamp: 0,
+            data: opus,
+        }
+    }
+
+    /// 静音帧（全零 PCM，RMS≈0 < 2000 阈值）
+    fn silence_frame() -> AudioFrame {
+        make_audio_frame(&vec![0u8; 960 * 2])
+    }
+
+    /// 响亮帧（正弦，RMS ≈ 7071 > 2000 阈值）
+    fn loud_frame() -> AudioFrame {
+        let mut pcm = Vec::with_capacity(960 * 2);
+        for i in 0..960 {
+            let val = ((i as f64 * 0.1).sin() * 10000.0) as i16;
+            pcm.extend_from_slice(&val.to_le_bytes());
+        }
+        make_audio_frame(&pcm)
+    }
+
+    #[tokio::test]
+    async fn test_ns1_no_speech_triggers_after_timeout() {
+        // 300ms → 5 帧（ceil(300/60)）
+        let strategy = make_strategy_with_pipeline(300);
+        for _ in 0..5 {
+            strategy
+                .on_audio_frame(&silence_frame())
+                .await
+                .expect("喂帧应成功");
+        }
+        assert!(
+            strategy.silence_closed.load(Ordering::Acquire),
+            "初始静音达到阈值后应触发无语音超时并关闭管道"
+        );
+        let notify = strategy
+            .no_speech_completion()
+            .expect("应暴露无语音超时 Notify");
+        let fired = tokio::time::timeout(std::time::Duration::from_millis(1000), notify.notified())
+            .await
+            .is_ok();
+        assert!(fired, "无语音超时 Notify 应被触发");
+    }
+
+    #[tokio::test]
+    async fn test_ns2_no_speech_not_triggered_before_timeout() {
+        let strategy = make_strategy_with_pipeline(300); // 5 帧
+        for _ in 0..4 {
+            strategy
+                .on_audio_frame(&silence_frame())
+                .await
+                .expect("喂帧应成功");
+        }
+        assert!(
+            !strategy.silence_closed.load(Ordering::Acquire),
+            "未达到阈值时不应触发无语音超时"
+        );
+        let notify = strategy
+            .no_speech_completion()
+            .expect("应暴露无语音超时 Notify");
+        let fired = tokio::time::timeout(std::time::Duration::from_millis(200), notify.notified())
+            .await
+            .is_ok();
+        assert!(!fired, "未达到阈值时 Notify 不应被触发");
+    }
+
+    #[tokio::test]
+    async fn test_ns3_no_speech_resets_on_speech() {
+        let strategy = make_strategy_with_pipeline(300); // 5 帧
+        // 4 帧静音 + 1 帧响亮（检测到语音，无语音超时作废）
+        for _ in 0..4 {
+            strategy
+                .on_audio_frame(&silence_frame())
+                .await
+                .expect("喂帧应成功");
+        }
+        strategy
+            .on_audio_frame(&loud_frame())
+            .await
+            .expect("喂帧应成功");
+        // 之后大量静音帧：speech_detected=true，走 VAD 路径但 asr_received_text=false 不触发
+        for _ in 0..40 {
+            strategy
+                .on_audio_frame(&silence_frame())
+                .await
+                .expect("喂帧应成功");
+        }
+        assert!(
+            !strategy.silence_closed.load(Ordering::Acquire),
+            "检测到语音后无语音超时应作废（交给 VAD 流程）"
+        );
+        let notify = strategy
+            .no_speech_completion()
+            .expect("应暴露无语音超时 Notify");
+        let fired = tokio::time::timeout(std::time::Duration::from_millis(200), notify.notified())
+            .await
+            .is_ok();
+        assert!(!fired, "检测到语音后无语音超时 Notify 不应被触发");
+    }
+
+    #[tokio::test]
+    async fn test_ns4_no_speech_disabled_when_zero() {
+        let strategy = make_strategy_with_pipeline(0); // 0 = 禁用
+        for _ in 0..30 {
+            strategy
+                .on_audio_frame(&silence_frame())
+                .await
+                .expect("喂帧应成功");
+        }
+        assert!(
+            !strategy.silence_closed.load(Ordering::Acquire),
+            "timeout=0 应禁用无语音超时"
+        );
+    }
+
+    #[test]
+    fn test_ns5_no_speech_threshold_frames() {
+        assert_eq!(no_speech_threshold_frames(10000), 167);
+        assert_eq!(no_speech_threshold_frames(60), 1);
+        assert_eq!(no_speech_threshold_frames(120), 2);
+        assert_eq!(no_speech_threshold_frames(61), 2);
+        assert_eq!(no_speech_threshold_frames(0), 0);
     }
 }
