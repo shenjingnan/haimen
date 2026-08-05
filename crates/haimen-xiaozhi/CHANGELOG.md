@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/shenjingnan/haimen/compare/haimen-xiaozhi-v0.1.3...haimen-xiaozhi-v0.1.4) - 2026-08-05
+
+### Added
+
+- *(xiaozhi)* 录音无语音超时后播报告别语并结束对话 ([#155](https://github.com/shenjingnan/haimen/pull/155))
+- *(xiaozhi)* 硬件唤醒时服务端主动播报 TTS 问候 ([#153](https://github.com/shenjingnan/haimen/pull/153))
+
+### Fixed
+
+- *(xiaozhi)* 修复流式回放帧发送节奏，消除语音跳字与语速压缩 ([#154](https://github.com/shenjingnan/haimen/pull/154))
+
 ## [0.1.3](https://github.com/shenjingnan/haimen/compare/haimen-xiaozhi-v0.1.2...haimen-xiaozhi-v0.1.3) - 2026-08-01
 
 ### Added

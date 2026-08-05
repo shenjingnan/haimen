@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/shenjingnan/haimen/compare/haimen-core-v0.1.1...haimen-core-v0.1.2) - 2026-08-05
+
+### Added
+
+- *(xiaozhi)* Agent 处理期间 TTS 中间状态播报与工具级播报 ([#157](https://github.com/shenjingnan/haimen/pull/157))
+- *(agent)* 新增 Agent 调用日志（完整内容轨迹 + CLI + Web 展示） ([#152](https://github.com/shenjingnan/haimen/pull/152))
+
 ## [0.1.1](https://github.com/shenjingnan/haimen/compare/haimen-core-v0.1.0...haimen-core-v0.1.1) - 2026-08-01
 
 ### Added

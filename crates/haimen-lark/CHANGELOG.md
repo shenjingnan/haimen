@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/shenjingnan/haimen/compare/haimen-lark-v0.2.1...haimen-lark-v0.2.2) - 2026-08-05
+
+### Added
+
+- *(agent)* 新增 Agent 调用日志（完整内容轨迹 + CLI + Web 展示） ([#152](https://github.com/shenjingnan/haimen/pull/152))
+
 ## [0.2.1](https://github.com/shenjingnan/haimen/compare/haimen-lark-v0.2.0...haimen-lark-v0.2.1) - 2026-08-01
 
 ### Added

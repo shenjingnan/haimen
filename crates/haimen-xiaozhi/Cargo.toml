@@ -1,6 +1,6 @@
 [package]
 name = "haimen-xiaozhi"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 rust-version = "1.85"
 description = "小智硬件设备 WebSocket 音频协议连接器"

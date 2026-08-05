@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.11.0](https://github.com/shenjingnan/haimen/compare/v0.10.0...v0.11.0) - 2026-08-05
+
+### Added
+
+- *(xiaozhi)* Agent 处理期间 TTS 中间状态播报与工具级播报 ([#157](https://github.com/shenjingnan/haimen/pull/157))
+- *(xiaozhi)* 录音无语音超时后播报告别语并结束对话 ([#155](https://github.com/shenjingnan/haimen/pull/155))
+- *(xiaozhi)* 硬件唤醒时服务端主动播报 TTS 问候 ([#153](https://github.com/shenjingnan/haimen/pull/153))
+- *(agent)* 新增 Agent 调用日志（完整内容轨迹 + CLI + Web 展示） ([#152](https://github.com/shenjingnan/haimen/pull/152))
+
+### Fixed
+
+- *(xiaozhi)* 流式管线提前退出路径补齐 agent 调用日志 ([#156](https://github.com/shenjingnan/haimen/pull/156))
+- *(xiaozhi)* 修复流式回放帧发送节奏，消除语音跳字与语速压缩 ([#154](https://github.com/shenjingnan/haimen/pull/154))
+- *(xiaozhi)* 修复 LLM 大段 markdown 回复时 TTS 零音频 ([#145](https://github.com/shenjingnan/haimen/pull/145))
+
+### Other
+
+- *(deps)* bump webbrowser from 1.2.1 to 1.2.2 ([#151](https://github.com/shenjingnan/haimen/pull/151))
+- *(deps)* bump toml from 1.1.3+spec-1.1.0 to 1.1.4+spec-1.1.0 ([#150](https://github.com/shenjingnan/haimen/pull/150))
+- *(deps)* bump clap_complete from 4.6.7 to 4.6.8 ([#149](https://github.com/shenjingnan/haimen/pull/149))
+
 ## [0.10.0](https://github.com/shenjingnan/haimen/compare/v0.9.1...v0.10.0) - 2026-08-02
 
 ### Other
