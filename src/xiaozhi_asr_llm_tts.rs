@@ -699,6 +699,76 @@ impl AsrLlmTtsStrategy {
         });
     }
 
+    /// 取回 Agent 流式调用的事件轨迹（oneshot，5s 超时防御）
+    ///
+    /// 提前退出分支中，若 agent 后台读流任务尚未感知文本通道关闭（如模型仍在
+    /// thinking、未输出任何 text_delta），事件可能取不回，此时返回空。
+    async fn take_agent_events(rx: &mut Option<AgentEventReceiver>) -> Vec<AgentLogEvent> {
+        match rx.take() {
+            Some(mut rx) => tokio::time::timeout(std::time::Duration::from_secs(5), &mut rx)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+
+    /// agent 模式收尾：统一取回事件轨迹并记录 agent 日志
+    ///
+    /// 覆盖正常完成之外的提前退出路径（空回复 / 首文本超时 / TTS 下游失败 /
+    /// 回放管道关闭），确保每次已启动的 Agent 调用都有日志落盘。
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_agent_log(
+        &self,
+        agent_events_rx: &mut Option<AgentEventReceiver>,
+        user_text: &str,
+        session_id: &str,
+        output: Option<&str>,
+        status: &str,
+        error: Option<&str>,
+        started: std::time::Instant,
+    ) {
+        let events = Self::take_agent_events(agent_events_rx).await;
+        self.record_agent_log(
+            user_text,
+            session_id,
+            output,
+            status,
+            error,
+            started.elapsed(),
+            events,
+        );
+    }
+
+    /// 回放管道已关闭时的收尾：以「error/回放管道已关闭」记录 agent 日志
+    ///
+    /// `output` 为已累积的部分文本（设备可能在 agent 输出完成前断开）。
+    async fn record_pipeline_closed_log(
+        &self,
+        agent_events_rx: &mut Option<AgentEventReceiver>,
+        user_text: &str,
+        session_id: &str,
+        llm_response_full: &Arc<Mutex<String>>,
+        started: std::time::Instant,
+    ) {
+        let full = llm_response_full
+            .lock()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        self.finish_agent_log(
+            agent_events_rx,
+            user_text,
+            session_id,
+            Some(&full),
+            "error",
+            Some("回放管道已关闭"),
+            started,
+        )
+        .await;
+    }
+
     /// 创建 ASR → LLM → TTS 策略
     ///
     /// # 参数
@@ -1578,6 +1648,19 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 agg_handle.abort();
                 let _ = agg_handle.await;
                 drop(text_evt_tx);
+                // agent 模式空回复也计入日志（agent 已自然结束，事件轨迹可完整取回）
+                if agent_mode {
+                    self.finish_agent_log(
+                        &mut agent_events_rx,
+                        &user_text,
+                        session_id,
+                        None,
+                        "error",
+                        Some("AI Agent 返回空回复"),
+                        agent_start,
+                    )
+                    .await;
+                }
                 drain_screen_events(&mut text_evt_rx, &residual_shared, &frame_tx, session_id)
                     .await?;
                 return Ok(());
@@ -1592,6 +1675,24 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 agg_handle.abort();
                 let _ = agg_handle.await;
                 drop(text_evt_tx);
+                // 超时也计入 agent 日志；agent 可能仍在 thinking（未吐 text），
+                // 事件轨迹尽力取回（此时可能为空）
+                if agent_mode {
+                    let err_msg = format!(
+                        "等待首个可播文本超时 ({}s)",
+                        TTS_FIRST_TEXT_TIMEOUT.as_secs()
+                    );
+                    self.finish_agent_log(
+                        &mut agent_events_rx,
+                        &user_text,
+                        session_id,
+                        None,
+                        "timeout",
+                        Some(&err_msg),
+                        agent_start,
+                    )
+                    .await;
+                }
                 send_fallback_audio(&frame_tx, session_id).await?;
                 drain_screen_events(&mut text_evt_rx, &residual_shared, &frame_tx, session_id)
                     .await?;
@@ -1632,6 +1733,24 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 agg_handle.abort();
                 let _ = agg_handle.await;
                 drop(text_evt_tx);
+                // agent 已成功输出文本，下游 TTS 失败不改变 agent 调用本身：按 success 记录
+                if agent_mode {
+                    let full = llm_response_full
+                        .lock()
+                        .ok()
+                        .map(|g| g.clone())
+                        .unwrap_or_default();
+                    self.finish_agent_log(
+                        &mut agent_events_rx,
+                        &user_text,
+                        session_id,
+                        Some(&full),
+                        "success",
+                        None,
+                        agent_start,
+                    )
+                    .await;
+                }
                 send_fallback_audio(&frame_tx, session_id).await?;
                 drain_screen_events(&mut text_evt_rx, &residual_shared, &frame_tx, session_id)
                     .await?;
@@ -1658,6 +1777,24 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 // await 确保 text_evt_tx2 已 drop，再排空屏幕事件
                 let _ = agg_handle.await;
                 drop(text_evt_tx);
+                // agent 已成功输出文本，下游 TTS 失败不改变 agent 调用本身：按 success 记录
+                if agent_mode {
+                    let full = llm_response_full
+                        .lock()
+                        .ok()
+                        .map(|g| g.clone())
+                        .unwrap_or_default();
+                    self.finish_agent_log(
+                        &mut agent_events_rx,
+                        &user_text,
+                        session_id,
+                        Some(&full),
+                        "success",
+                        None,
+                        agent_start,
+                    )
+                    .await;
+                }
                 send_fallback_audio(&frame_tx, session_id).await?;
                 drain_screen_events(&mut text_evt_rx, &residual_shared, &frame_tx, session_id)
                     .await?;
@@ -1685,6 +1822,17 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                     .is_err()
                 {
                     tracing::info!(session_id = %session_id, "TTS-STREAM: 回放管道已关闭，停止生成");
+                    // 设备已断开：尽力记录已启动的 agent 调用
+                    if agent_mode {
+                        self.record_pipeline_closed_log(
+                            &mut agent_events_rx,
+                            &user_text,
+                            session_id,
+                            &llm_response_full,
+                            agent_start,
+                        )
+                        .await;
+                    }
                     return Ok(());
                 }
             }
@@ -1711,6 +1859,16 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                                 session_id = %session_id,
                                 "TTS-STREAM: 回放管道已关闭，停止生成",
                             );
+                            if agent_mode {
+                                self.record_pipeline_closed_log(
+                                    &mut agent_events_rx,
+                                    &user_text,
+                                    session_id,
+                                    &llm_response_full,
+                                    agent_start,
+                                )
+                                .await;
+                            }
                             return Ok(());
                         }
                         timestamp = timestamp.wrapping_add(60);
@@ -1764,6 +1922,16 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                                     session_id = %session_id,
                                     "TTS-STREAM: 回放管道已关闭，停止生成",
                                 );
+                                if agent_mode {
+                                    self.record_pipeline_closed_log(
+                                        &mut agent_events_rx,
+                                        &user_text,
+                                        session_id,
+                                        &llm_response_full,
+                                        agent_start,
+                                    )
+                                    .await;
+                                }
                                 return Ok(());
                             }
                             timestamp = timestamp.wrapping_add(60);
@@ -1804,6 +1972,16 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                         session_id = %session_id,
                         "TTS-STREAM: 回放管道已关闭，停止生成",
                     );
+                    if agent_mode {
+                        self.record_pipeline_closed_log(
+                            &mut agent_events_rx,
+                            &user_text,
+                            session_id,
+                            &llm_response_full,
+                            agent_start,
+                        )
+                        .await;
+                    }
                     return Ok(());
                 }
                 timestamp = timestamp.wrapping_add(60);
@@ -1829,23 +2007,16 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         // agent 模式成功完成才记录（固定文本模式无 LLM 调用）
         if agent_mode {
             // 文本流已排空 → 后台读流任务已完成并投递事件轨迹；加超时防御
-            let events = match agent_events_rx.take() {
-                Some(mut rx) => tokio::time::timeout(std::time::Duration::from_secs(5), &mut rx)
-                    .await
-                    .ok()
-                    .and_then(|r| r.ok())
-                    .unwrap_or_default(),
-                None => Vec::new(),
-            };
-            self.record_agent_log(
+            self.finish_agent_log(
+                &mut agent_events_rx,
                 &user_text,
                 session_id,
                 Some(&full_response),
                 "success",
                 None,
-                agent_start.elapsed(),
-                events,
-            );
+                agent_start,
+            )
+            .await;
         }
 
         tracing::info!(
@@ -3401,5 +3572,103 @@ mod tests {
         assert_eq!(no_speech_threshold_frames(120), 2);
         assert_eq!(no_speech_threshold_frames(61), 2);
         assert_eq!(no_speech_threshold_frames(0), 0);
+    }
+
+    // ─── agent 日志收尾（提前退出路径记录） ──────────────
+
+    #[tokio::test]
+    async fn test_le1_take_agent_events_delivered() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Vec<AgentLogEvent>>();
+        let _ = tx.send(vec![AgentLogEvent::Thinking {
+            thinking: "思考中".to_string(),
+        }]);
+        let mut opt = Some(rx);
+        let events = AsrLlmTtsStrategy::take_agent_events(&mut opt).await;
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            AgentLogEvent::Thinking { thinking } if thinking == "思考中"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_le2_take_agent_events_already_taken() {
+        let mut opt: Option<AgentEventReceiver> = None;
+        let events = AsrLlmTtsStrategy::take_agent_events(&mut opt).await;
+        assert!(events.is_empty(), "None 时应返回空事件");
+    }
+
+    #[tokio::test]
+    async fn test_le3_finish_agent_log_timeout_writes_record() {
+        crate::test_util::run_with_temp_home_async(move |home| async move {
+            let strategy = make_strategy(Arc::new(MockAgent));
+            let (tx, rx) = tokio::sync::oneshot::channel::<Vec<AgentLogEvent>>();
+            let _ = tx.send(vec![AgentLogEvent::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "Bash".to_string(),
+                input: serde_json::json!({ "command": "ls" }),
+            }]);
+            let mut opt = Some(rx);
+            strategy
+                .finish_agent_log(
+                    &mut opt,
+                    "你好",
+                    "session-1",
+                    None,
+                    "timeout",
+                    Some("等待首个可播文本超时 (60s)"),
+                    std::time::Instant::now(),
+                )
+                .await;
+
+            let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let path = home.join(format!(".haimen/agent-logs/{}.jsonl", day));
+            let content = std::fs::read_to_string(&path).expect("日志文件应存在");
+            let line = content.lines().last().expect("应有日志行");
+            let rec: crate::agent_log::AgentLogRecord =
+                serde_json::from_str(line).expect("日志行应可解析");
+            assert_eq!(rec.source, "xiaozhi");
+            assert_eq!(rec.status, "timeout");
+            assert_eq!(rec.output, None);
+            assert_eq!(rec.error.as_deref(), Some("等待首个可播文本超时 (60s)"));
+            assert_eq!(rec.events.len(), 1);
+            assert!(matches!(
+                &rec.events[0],
+                AgentLogEvent::ToolUse { name, .. } if name == "Bash"
+            ));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_le4_finish_agent_log_success_with_partial_output() {
+        crate::test_util::run_with_temp_home_async(move |home| async move {
+            let strategy = make_strategy(Arc::new(MockAgent));
+            // 无事件投递的 receiver：验证空事件也能正常记录
+            let (_, rx) = tokio::sync::oneshot::channel::<Vec<AgentLogEvent>>();
+            let mut opt = Some(rx);
+            strategy
+                .finish_agent_log(
+                    &mut opt,
+                    "你好",
+                    "session-2",
+                    Some("部分回复"),
+                    "success",
+                    None,
+                    std::time::Instant::now(),
+                )
+                .await;
+
+            let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let path = home.join(format!(".haimen/agent-logs/{}.jsonl", day));
+            let content = std::fs::read_to_string(&path).expect("日志文件应存在");
+            let line = content.lines().last().expect("应有日志行");
+            let rec: crate::agent_log::AgentLogRecord =
+                serde_json::from_str(line).expect("日志行应可解析");
+            assert_eq!(rec.status, "success");
+            assert_eq!(rec.output.as_deref(), Some("部分回复"));
+            assert_eq!(rec.error, None);
+        })
+        .await;
     }
 }
