@@ -542,6 +542,12 @@ pub struct TtsConfig {
     /// 固定文本内容（仅 fixed_text_enabled 为 true 时生效）
     #[serde(default)]
     pub fixed_text: Option<String>,
+    /// 是否在设备检测到唤醒词时主动播报问候（默认开启）
+    #[serde(default)]
+    pub wake_greeting_enabled: bool,
+    /// 唤醒问候文案（None 或空串时回退为「你好」）
+    #[serde(default)]
+    pub wake_greeting: Option<String>,
 }
 
 /// 旧格式 TTS 配置（用于向后兼容反序列化）
@@ -556,6 +562,8 @@ struct TtsConfigLegacy {
     providers: Option<HashMap<String, HashMap<String, String>>>,
     fixed_text_enabled: Option<bool>,
     fixed_text: Option<String>,
+    wake_greeting_enabled: Option<bool>,
+    wake_greeting: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for TtsConfig {
@@ -572,6 +580,8 @@ impl<'de> Deserialize<'de> for TtsConfig {
                 providers: legacy.providers.unwrap_or_default(),
                 fixed_text_enabled: legacy.fixed_text_enabled.unwrap_or(false),
                 fixed_text: legacy.fixed_text,
+                wake_greeting_enabled: legacy.wake_greeting_enabled.unwrap_or(true),
+                wake_greeting: legacy.wake_greeting,
             });
         }
 
@@ -605,6 +615,8 @@ impl<'de> Deserialize<'de> for TtsConfig {
             providers,
             fixed_text_enabled: legacy.fixed_text_enabled.unwrap_or(false),
             fixed_text: legacy.fixed_text,
+            wake_greeting_enabled: legacy.wake_greeting_enabled.unwrap_or(true),
+            wake_greeting: legacy.wake_greeting,
         })
     }
 }
@@ -620,6 +632,8 @@ impl Default for TtsConfig {
             providers: HashMap::new(),
             fixed_text_enabled: false,
             fixed_text: None,
+            wake_greeting_enabled: true,
+            wake_greeting: None,
         }
     }
 }
@@ -1506,6 +1520,76 @@ api_key = "qwen-api-key"
                     .unwrap(),
                 "qwen-api-key"
             );
+        });
+    }
+
+    #[test]
+    fn test_tts_wake_greeting_default_enabled() {
+        let cfg = TtsConfig::default();
+        assert!(cfg.wake_greeting_enabled, "唤醒问候默认应开启");
+        assert_eq!(cfg.wake_greeting, None, "默认文案应为 None（回退「你好」）");
+    }
+
+    #[test]
+    fn test_tts_wake_greeting_new_format() {
+        run_with_temp_home(|home| {
+            write_toml_settings(
+                home,
+                r#"
+[tts]
+active_provider = "doubao"
+wake_greeting_enabled = false
+wake_greeting = "早上好"
+
+[tts.providers.doubao]
+api_key = "key"
+"#,
+            );
+            let result = load_settings().unwrap().unwrap();
+            assert!(!result.tts.wake_greeting_enabled);
+            assert_eq!(result.tts.wake_greeting.as_deref(), Some("早上好"));
+        });
+    }
+
+    #[test]
+    fn test_tts_wake_greeting_old_format_defaults_enabled() {
+        // 旧格式迁移时未提供新字段，应回退为默认开启（保真既有行为不回归）
+        run_with_temp_home(|home| {
+            write_toml_settings(
+                home,
+                r#"
+[tts]
+provider = "doubao"
+app_key = "old-key"
+"#,
+            );
+            let result = load_settings().unwrap().unwrap();
+            assert!(result.tts.wake_greeting_enabled);
+            assert_eq!(result.tts.wake_greeting, None);
+        });
+    }
+
+    #[test]
+    fn test_tts_wake_greeting_roundtrip() {
+        // save → load 往返，新字段不应丢失
+        run_with_temp_home(|home| {
+            let mut providers = HashMap::new();
+            let mut creds = HashMap::new();
+            creds.insert("api_key".to_string(), "key".to_string());
+            providers.insert("doubao".to_string(), creds);
+
+            let config = AppConfig {
+                tts: TtsConfig {
+                    wake_greeting_enabled: true,
+                    wake_greeting: Some("你好".to_string()),
+                    ..Default::default()
+                },
+                ..AppConfig::default()
+            };
+            save_settings(&config).unwrap();
+            let loaded = load_settings().unwrap().unwrap();
+            assert!(loaded.tts.wake_greeting_enabled);
+            assert_eq!(loaded.tts.wake_greeting.as_deref(), Some("你好"));
         });
     }
 

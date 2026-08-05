@@ -150,6 +150,23 @@ pub trait ResponseStrategy: Send + Sync {
     fn vad_completion(&self) -> Option<Arc<Notify>> {
         None
     }
+
+    // ────────── 主动问候（可选覆盖） ──────────
+
+    /// 设备唤醒问候：设备检测到唤醒词（`listen/detect`）时，服务端主动播报。
+    ///
+    /// 返回要播放的 [`AudioFrame`]（时间戳从 0 起、步长 60ms，与 [`generate_response`]
+    /// 批处理路径产出格式一致，可直接喂给 `playback_frames`）；`None` 表示不播报。
+    ///
+    /// 实现方负责读取配置判断是否启用、TTS 合成、PCM → Opus 封装。
+    /// 默认实现返回 `None`（不播报），现有策略不受影响。
+    ///
+    /// # 参数
+    ///
+    /// * `session_id` — 当前 WebSocket 会话 ID，用于日志和状态关联
+    async fn wake_greeting(&self, _session_id: &str) -> Option<Vec<AudioFrame>> {
+        None
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -370,5 +387,22 @@ mod tests {
             other => panic!("默认实现应发送 Audio 事件，得到 {:?}", other),
         }
         assert!(rx.recv().await.is_none(), "发送端 drop 后应收到 None");
+    }
+
+    // ─── 唤醒问候默认行为（no-op） ──────────────────────
+
+    #[tokio::test]
+    async fn test_t15_wake_greeting_default_none() {
+        let strategy = EchoStrategy;
+        let result = strategy.wake_greeting("test-session").await;
+        assert!(result.is_none(), "默认 wake_greeting 应返回 None（不播报）");
+    }
+
+    /// 通过 trait object 调用 wake_greeting 确保 vtable 分发正确
+    #[tokio::test]
+    async fn test_t16_wake_greeting_via_trait_object() {
+        let strategy: Arc<dyn ResponseStrategy> = Arc::new(EchoStrategy);
+        let result = strategy.wake_greeting("trait-object").await;
+        assert!(result.is_none(), "trait object 分发后应仍返回 None");
     }
 }

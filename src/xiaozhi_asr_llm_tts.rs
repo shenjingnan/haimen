@@ -1090,6 +1090,88 @@ impl AsrLlmTtsStrategy {
 
         Ok(())
     }
+
+    /// 合成唤醒问候音频（统一入口，供 [`wake_greeting`](Self::wake_greeting) 使用）
+    ///
+    /// 流程：建 provider → `synthesize`（PCM）→ PCM→Opus 帧 → AudioFrame 封装，
+    /// 与 `generate_response` 批处理 TTS 段完全同构。
+    /// 整个合成过程带 5 秒超时，防止 TTS 挂起拖死连接主循环。
+    /// 任何失败（凭证缺失 / 合成失败 / 空音频 / 超时）都静默返回 `None`，
+    /// 不播 fallback 提示音——唤醒场景播「失败，请重试」是反效果。
+    async fn synthesize_greeting(&self, text: &str, session_id: &str) -> Option<Vec<AudioFrame>> {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            // 在单独的块中获取并释放 TTS 配置锁，避免 RwLockReadGuard 跨越 .await
+            let provider = {
+                let cfg = self.tts_config.read().unwrap();
+                let mut work_cfg = cfg.clone();
+                if let Some(ref voice) = self.voice_override {
+                    work_cfg
+                        .providers
+                        .entry(work_cfg.active_provider.clone())
+                        .or_default()
+                        .insert("voice".to_string(), voice.clone());
+                }
+                crate::tts_factory::create_tts_provider(&work_cfg)?
+            };
+            let response = provider
+                .synthesize(TtsRequest {
+                    text: text.to_string(),
+                    options: None,
+                })
+                .await
+                .map_err(|e| format!("TTS 合成失败: {}", e))?;
+
+            if response.audio.is_empty() {
+                return Err::<Vec<AudioFrame>, String>("TTS 返回空音频".to_string());
+            }
+
+            // PCM → Opus 编码 (24kHz, 60ms)，与 generate_response 批处理路径一致
+            let opus_frames = pcm_to_opus_frames(&response.audio, 24000, 60)
+                .map_err(|e| format!("Opus 编码失败: {}", e))?;
+
+            let mut frames = Vec::with_capacity(opus_frames.len());
+            let mut timestamp: u32 = 0;
+            for opus in opus_frames {
+                frames.push(AudioFrame {
+                    timestamp,
+                    data: opus,
+                });
+                timestamp = timestamp.wrapping_add(60);
+            }
+
+            Ok::<Vec<AudioFrame>, String>(frames)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(frames)) => {
+                tracing::info!(
+                    session_id = %session_id,
+                    text = %text,
+                    frame_count = frames.len(),
+                    "唤醒问候: TTS 合成完成",
+                );
+                Some(frames)
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    text = %text,
+                    error = %e,
+                    "唤醒问候: TTS 合成失败，静默跳过",
+                );
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    text = %text,
+                    "唤醒问候: TTS 合成超时（>5s），静默跳过",
+                );
+                None
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -1913,6 +1995,37 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
 
         Ok(frames)
     }
+
+    /// 设备唤醒问候：设备检测到唤醒词（`listen/detect`）时主动播报 TTS 问候。
+    ///
+    /// 读配置判断是否启用与文案（[`wake_greeting_text`]），合成后返回音频帧
+    /// 交给 ws.rs 的 `playback_frames` 播放。任何失败都静默跳过，不影响录音轮。
+    async fn wake_greeting(&self, session_id: &str) -> Option<Vec<AudioFrame>> {
+        let text = {
+            let cfg = self.tts_config.read().unwrap();
+            wake_greeting_text(&cfg)?
+        };
+        self.synthesize_greeting(&text, session_id).await
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 唤醒问候文本解析
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 解析唤醒问候配置 → 待播报文案
+///
+/// - 配置关闭（`wake_greeting_enabled=false`）→ `None`（不播报）
+/// - `wake_greeting` 为 None / 空串 / 纯空白 → 回退默认「你好」
+/// - 其余返回原文案
+fn wake_greeting_text(cfg: &TtsConfig) -> Option<String> {
+    if !cfg.wake_greeting_enabled {
+        return None;
+    }
+    cfg.wake_greeting
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| Some("你好".to_string()))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -3015,6 +3128,46 @@ mod tests {
         assert_eq!(
             full.lines().collect::<String>(),
             "今天天气很好。我们去公园吧！"
+        );
+    }
+
+    // ─── 唤醒问候文本解析 ──────────────────────────────
+
+    #[test]
+    fn test_g1_wake_greeting_disabled_returns_none() {
+        let mut cfg = test_tts_config();
+        cfg.wake_greeting_enabled = false;
+        cfg.wake_greeting = Some("你好".to_string());
+        assert!(wake_greeting_text(&cfg).is_none());
+    }
+
+    #[test]
+    fn test_g2_wake_greeting_none_text_falls_back() {
+        let cfg = test_tts_config(); // 默认 enabled=true, text=None
+        assert_eq!(wake_greeting_text(&cfg).as_deref(), Some("你好"));
+    }
+
+    #[test]
+    fn test_g3_wake_greeting_empty_text_falls_back() {
+        let mut cfg = test_tts_config();
+        cfg.wake_greeting = Some(String::new());
+        assert_eq!(wake_greeting_text(&cfg).as_deref(), Some("你好"));
+    }
+
+    #[test]
+    fn test_g4_wake_greeting_whitespace_text_falls_back() {
+        let mut cfg = test_tts_config();
+        cfg.wake_greeting = Some("   ".to_string());
+        assert_eq!(wake_greeting_text(&cfg).as_deref(), Some("你好"));
+    }
+
+    #[test]
+    fn test_g5_wake_greeting_custom_text_preserved() {
+        let mut cfg = test_tts_config();
+        cfg.wake_greeting = Some("我在，有什么可以帮你？".to_string());
+        assert_eq!(
+            wake_greeting_text(&cfg).as_deref(),
+            Some("我在，有什么可以帮你？")
         );
     }
 }
