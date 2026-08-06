@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.11.2](https://github.com/shenjingnan/haimen/compare/v0.11.1...v0.11.2) - 2026-08-06
+
+### Added
+
+- *(xiaozhi)* 连续音频管道——断档静音填充消除播放 underrun ([#162](https://github.com/shenjingnan/haimen/pull/162))
+
 ## [0.11.1](https://github.com/shenjingnan/haimen/compare/v0.11.0...v0.11.1) - 2026-08-06
 
 ### Other

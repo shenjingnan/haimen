@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/shenjingnan/haimen/compare/haimen-xiaozhi-v0.1.4...haimen-xiaozhi-v0.1.5) - 2026-08-06
+
+### Added
+
+- *(xiaozhi)* 连续音频管道——断档静音填充消除播放 underrun ([#162](https://github.com/shenjingnan/haimen/pull/162))
+
 ## [0.1.4](https://github.com/shenjingnan/haimen/compare/haimen-xiaozhi-v0.1.3...haimen-xiaozhi-v0.1.4) - 2026-08-05
 
 ### Added
