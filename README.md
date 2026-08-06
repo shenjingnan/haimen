@@ -17,26 +17,50 @@
 
 ### 方式一：一键安装脚本（推荐）
 
-从 GitHub Release 下载并运行 cargo-dist 安装器：
+从 GitHub Release 下载并运行 cargo-dist 安装器，脚本会自动检测平台、下载对应二进制归档、验证完整性，并配置 PATH。
+
+**macOS / Linux**
 
 ```bash
-# macOS / Linux
 curl -fsSL https://github.com/shenjingnan/haimen/releases/latest/download/haimen-installer.sh | sh
+```
 
-# Windows PowerShell
-$r = Invoke-WebRequest https://github.com/shenjingnan/haimen/releases/latest/download/haimen-installer.ps1; iex $r.Content
+**Windows (PowerShell)**
+
+在 PowerShell 中（推荐）：
+
+```powershell
+irm https://github.com/shenjingnan/haimen/releases/latest/download/haimen-installer.ps1 | iex
+```
+
+在 cmd.exe 中：
+
+```powershell
+powershell -c "irm https://github.com/shenjingnan/haimen/releases/latest/download/haimen-installer.ps1 | iex"
 ```
 
 > Windows 二进制依赖 **Microsoft Visual C++ Redistributable**（大多数系统已内置），若运行时报缺少 `vcruntime140.dll`，请先安装 [VC++ 运行库](https://aka.ms/vs/17/release/vc_redist.x64.exe)。
 
 **国内用户（中国大陆）**：如果 GitHub 访问缓慢，可使用 Gitee 镜像安装
 
-```bash
-# macOS / Linux
-curl -fsSL https://gitee.com/shenjingnan/haimen/raw/main/docs/public/install-gitee.sh | sh
+**macOS / Linux**
 
-# Windows PowerShell
-$r = Invoke-WebRequest https://gitee.com/shenjingnan/haimen/raw/main/docs/public/install-gitee.ps1; iex $r.Content
+```bash
+curl -fsSL https://gitee.com/shenjingnan/haimen/raw/main/docs/public/install-gitee.sh | sh
+```
+
+**Windows (PowerShell)**
+
+在 PowerShell 中（推荐）：
+
+```powershell
+irm https://gitee.com/shenjingnan/haimen/raw/main/docs/public/install-gitee.ps1 | iex
+```
+
+在 cmd.exe 中：
+
+```powershell
+powershell -c "irm https://gitee.com/shenjingnan/haimen/raw/main/docs/public/install-gitee.ps1 | iex"
 ```
 
 ### 方式二：cargo install
