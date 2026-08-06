@@ -2945,6 +2945,10 @@ pub(crate) struct PumpConfig {
     pub(crate) tick_ms: u64,
     /// 收尾时追加的尾静音帧数（防尾音截断），默认 2
     pub(crate) tail_silence_frames: usize,
+    /// 静音帧去重：编码器喂零收敛为逐字节相同的 8 字节静音帧后，复用缓存帧
+    /// 免重复编码（省 CPU）。内容到达会打断静音态，需过渡 ~5 帧后重新收敛。
+    /// 关闭则每 tick 都喂零编码（保底正确）。默认开启。
+    pub(crate) silence_dedup: bool,
 }
 
 impl Default for PumpConfig {
@@ -2952,6 +2956,7 @@ impl Default for PumpConfig {
         Self {
             tick_ms: 60,
             tail_silence_frames: 2,
+            silence_dedup: true,
         }
     }
 }
@@ -2972,6 +2977,8 @@ const PUMP_FRAME_PCM_BYTES: usize = 2880;
 /// - 时间戳由 pump 统一维护（会话级单调 +60），消除各 TTS 段从 0 重启的跳变。
 /// - `biased` select：真实 PCM 优先于零填充；空闲 tick 兜底，保证窗口内 0 断档。
 /// - 编码器内部残片缓存天然处理子帧间隙：不足 60ms 的空闲不会产出额外静音帧。
+/// - 静音帧去重（`silence_dedup`）：喂零收敛为逐字节相同的 8 字节静音帧后
+///   复用缓存，免重复编码；内容打断后过渡 ~5 帧重新收敛，期间仍正常编码。
 pub(crate) async fn run_continuity_pump(
     mut pcm_rx: mpsc::Receiver<Vec<u8>>,
     frame_tx: mpsc::Sender<PlaybackEvent>,
@@ -2985,6 +2992,13 @@ pub(crate) async fn run_continuity_pump(
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(cfg.tick_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // ── 静音帧去重状态 ──
+    // 编码器喂零会收敛为逐字节相同的 8 字节静音帧（稳态历史无关，内容中断后
+    // 过渡 ~5 帧重新收敛到同一帧）。收敛后复用缓存帧免编码，比特流与不去重
+    // 逐字节相同。内容到达会打断静音态，须回到喂零编码直到再次收敛。
+    let mut cached_silence: Option<Vec<u8>> = None;
+    let mut silence_ready = false;
+
     loop {
         tokio::select! {
             biased;
@@ -2995,6 +3009,10 @@ pub(crate) async fn run_continuity_pump(
                         for opus in frames {
                             pump_send_frame(&frame_tx, &mut timestamp, opus).await?;
                             sent_frames += 1;
+                        }
+                        // 内容到达：编码器离开静音稳态，须重新收敛后才能复用
+                        if cfg.silence_dedup {
+                            silence_ready = false;
                         }
                     }
                     None => {
@@ -3021,10 +3039,31 @@ pub(crate) async fn run_continuity_pump(
                 }
             }
             _ = ticker.tick() => {
+                if cfg.silence_dedup && silence_ready {
+                    // 收敛态：复用缓存静音帧，免重复编码（比特流与喂零逐字节相同）
+                    if let Some(cached) = &cached_silence {
+                        pump_send_frame(&frame_tx, &mut timestamp, cached.clone()).await?;
+                        sent_frames += 1;
+                        continue;
+                    }
+                }
                 let frames = enc.feed(&zero_pcm)?;
                 for opus in frames {
-                    pump_send_frame(&frame_tx, &mut timestamp, opus).await?;
+                    pump_send_frame(&frame_tx, &mut timestamp, opus.clone()).await?;
                     sent_frames += 1;
+                    if cfg.silence_dedup {
+                        match &cached_silence {
+                            Some(c) if c == &opus => silence_ready = true,
+                            Some(_) => silence_ready = false,
+                            // 首帧 8 字节即视为进入稳态候选（过渡帧 >8 字节）；
+                            // 待下一帧确认后才标记 ready，避免把瞬时帧当作稳态复用。
+                            None if opus.len() == 8 => {
+                                cached_silence = Some(opus);
+                                silence_ready = false;
+                            }
+                            None => {}
+                        }
+                    }
                 }
             }
         }
@@ -4497,6 +4536,7 @@ mod tests {
         let cfg = PumpConfig {
             tick_ms: 5,
             tail_silence_frames: 2,
+            ..PumpConfig::default()
         };
         let handle = tokio::spawn(run_continuity_pump(
             pcm_rx,
@@ -4554,6 +4594,7 @@ mod tests {
         let cfg = PumpConfig {
             tick_ms: 5,
             tail_silence_frames: 2,
+            ..PumpConfig::default()
         };
         let handle = tokio::spawn(run_continuity_pump(
             pcm_rx,
@@ -4629,5 +4670,49 @@ mod tests {
         drop(pcm_tx);
 
         guard.finish().await.expect("pump 正常收尾应返回 Ok");
+    }
+
+    /// 诊断：验证 StreamingOpusEncoder 对纯零输入是否收敛为逐字节相同的静音帧，
+    /// 且该收敛静音态在内容中断后依然复现（历史无关）。
+    ///
+    /// 若收敛且历史无关，pump 的静音帧去重（缓存复用收敛帧）可行且比特流与
+    /// 不去的逐字节相同（编码器处于收敛静音态时，喂零产出 == 缓存复用帧）。
+    #[test]
+    fn test_silence_frames_convergence_diag() {
+        let mut enc = StreamingOpusEncoder::new(24000, 60).expect("创建编码器失败");
+        let zero = vec![0u8; 2880];
+        let content = make_sine_pcm(300, 440.0, 8000.0); // 0.3s 内容,打断静音态
+
+        // 第一段静音:收敛
+        let mut seg1: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..30 {
+            seg1.extend(enc.feed(&zero).expect("编码失败"));
+        }
+        // 内容打断
+        enc.feed(&content).expect("编码失败");
+        // 第二段静音:再次收敛
+        let mut seg2: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..30 {
+            seg2.extend(enc.feed(&zero).expect("编码失败"));
+        }
+
+        // 找各段的收敛帧：首帧 size==8 即视为进入静音稳态（过渡帧 >8 字节）
+        fn converged_baseline(seg: &[Vec<u8>]) -> Option<&Vec<u8>> {
+            seg.iter().find(|f| f.len() == 8)
+        }
+        let b1 = converged_baseline(&seg1).expect("seg1 应出现 8 字节静音帧");
+        let b2 = converged_baseline(&seg2).expect("seg2 应出现 8 字节静音帧");
+        // 从基线位置之后所有帧都应逐字节等于基线
+        let pos1 = seg1.iter().position(|f| f == b1).unwrap();
+        let pos2 = seg2.iter().position(|f| f == b2).unwrap();
+        let seg1_identical = seg1[pos1..].iter().all(|f| f == b1);
+        let seg2_identical = seg2[pos2..].iter().all(|f| f == b2);
+
+        // 断言：两段静音均收敛且收敛帧逐字节相同（静音稳态历史无关）。
+        // 这是 pump 静音帧去重（缓存复用收敛帧，比特流与喂零逐字节相同）的前提。
+        assert!(seg1_identical, "seg1 收敛后应逐字节相同");
+        assert!(seg2_identical, "seg2 收敛后应逐字节相同");
+        assert_eq!(b1, b2, "内容中断后应收敛到同一静音帧");
+        assert_eq!(b1.len(), 8, "收敛静音帧应为 8 字节");
     }
 }

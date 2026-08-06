@@ -695,9 +695,12 @@ async fn playback_frames_stream(
     // ── 诊断：帧到达间隔追踪 ──
     // 记录相邻 Audio 帧到达 frame_rx 的时间间隔，间隔超过阈值即视为 TTS 合成
     // 断档（固件播放缓冲会 underrun → 跳帧，听感"半个字/几个字压缩在一起"）。
-    // 真机跑一轮后据日志判断断档频率与大小，再针对性优化合成节奏。
+    // 连续音频管道（ContinuityPump）接入后，帧到达间隔应恒 ≤60ms（无断档），
+    // 本诊断退化为"连续供给被破坏"的回归探测器：汇总日志 max_gap_ms / warn_count
+    // 均应为 0 附近，若出现大 gap 说明连续供给被破坏，需回归排查。
     let mut last_frame_arrival: Option<Instant> = None;
     let mut gap_warn_count: usize = 0;
+    let mut max_gap_ms: u128 = 0;
 
     // ── Phase 1: 预缓冲 ─────────────────────────────────────────
     // 在开始播放前先收集若干帧，给 TTS 生成足够的 head start。
@@ -736,6 +739,7 @@ async fn playback_frames_stream(
                                     session,
                                     &mut last_frame_arrival,
                                     &mut gap_warn_count,
+                                    &mut max_gap_ms,
                                     "prebuffer",
                                 );
                                 prebuffer.push(frame.clone());
@@ -871,6 +875,7 @@ async fn playback_frames_stream(
                                     session,
                                     &mut last_frame_arrival,
                                     &mut gap_warn_count,
+                                    &mut max_gap_ms,
                                     "steady",
                                 );
 
@@ -930,6 +935,7 @@ async fn playback_frames_stream(
                             session,
                             &mut last_frame_arrival,
                             &mut gap_warn_count,
+                            &mut max_gap_ms,
                             "drain",
                         );
                         // drain 阶段同样受发送时钟约束，避免突发快发
@@ -971,13 +977,27 @@ async fn playback_frames_stream(
         "Streaming playback completed",
     );
 
+    // 帧供给诊断汇总：连续音频管道正常时 max_gap_ms 应远小于 300ms（帧间隔恒 60ms）、
+    // gap_warn_count=0。max_gap_ms 明显偏大或 warn_count>0 说明连续供给被破坏（回归信号）。
     if gap_warn_count > 0 {
         tracing::warn!(
             device_id = %session.device_id,
             frame_count = frame_count,
+            audio_ms = frame_count as u64 * 60u64,
+            max_gap_ms = max_gap_ms,
             gap_warn_count = gap_warn_count,
-            "流式回放诊断汇总: 播放期间发生 {} 次合成断档（帧到达间隔 > 300ms）",
+            "流式回放诊断汇总: 播放期间发生 {} 次合成断档（帧到达间隔 > 300ms，max_gap={}ms）",
             gap_warn_count,
+            max_gap_ms,
+        );
+    } else {
+        tracing::debug!(
+            device_id = %session.device_id,
+            frame_count = frame_count,
+            audio_ms = frame_count as u64 * 60u64,
+            max_gap_ms = max_gap_ms,
+            "流式回放诊断汇总: 连续供给正常（无断档，max_gap={}ms）",
+            max_gap_ms,
         );
     }
 }
@@ -1145,11 +1165,15 @@ fn record_frame_arrival_gap(
     session: &Session,
     last_frame_arrival: &mut Option<Instant>,
     gap_warn_count: &mut usize,
+    max_gap_ms: &mut u128,
     phase: &str,
 ) {
     let now = Instant::now();
     if let Some(last) = last_frame_arrival {
         let gap_ms = now.duration_since(*last).as_millis();
+        if gap_ms > *max_gap_ms {
+            *max_gap_ms = gap_ms;
+        }
         if gap_ms > FRAME_GAP_WARN_MS {
             *gap_warn_count += 1;
             tracing::warn!(
