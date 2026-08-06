@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1](https://github.com/shenjingnan/haimen/compare/v0.11.0...v0.11.1) - 2026-08-06
+
+### Other
+
+- 补充 Windows PowerShell 一键安装说明 ([#160](https://github.com/shenjingnan/haimen/pull/160))
+- 同步 README 中的 CLI 命令与配置示例 ([#158](https://github.com/shenjingnan/haimen/pull/158))
+
 ## [0.11.0](https://github.com/shenjingnan/haimen/compare/v0.10.0...v0.11.0) - 2026-08-05
 
 ### Added
