@@ -1273,18 +1273,22 @@ impl AsrLlmTtsStrategy {
     async fn play_timeout_feedback(
         &self,
         timeout_text: &str,
-        frame_tx: &tokio::sync::mpsc::Sender<PlaybackEvent>,
+        pcm_tx: &mpsc::Sender<Vec<u8>>,
+        frame_tx: &mpsc::Sender<PlaybackEvent>,
         session_id: &str,
     ) -> Result<(), String> {
-        if let Some(frames) = self
-            .synthesize_audio(timeout_text, session_id, "处理超时提示")
-            .await
+        if let Some(pcm) = synthesize_status_pcm(
+            &self.tts_config,
+            &self.voice_override,
+            timeout_text,
+            session_id,
+            "处理超时提示",
+        )
+        .await
         {
-            for frame in frames {
-                if frame_tx.send(PlaybackEvent::Audio(frame)).await.is_err() {
-                    tracing::info!(session_id = %session_id, "超时提示播放管道已关闭");
-                    return Ok(());
-                }
+            if pcm_tx.send(pcm).await.is_err() {
+                tracing::info!(session_id = %session_id, "超时提示播放管道已关闭");
+                return Ok(());
             }
             tracing::info!(
                 session_id = %session_id,
@@ -1301,10 +1305,14 @@ impl AsrLlmTtsStrategy {
     /// 等待首个可播文本。统一处理「功能关闭 / 仅超时兜底 / 周期提示+超时兜底」三种配置。
     ///
     /// Timeout 时已在本方法内播放兜底音频（兜底文案或 fallback 提示音），调用方只做收尾。
+    ///
+    /// 进度提示与超时文案的音频经 `pcm_tx` 汇入 ContinuityPump 统一编码（比特流连续），
+    /// fallback 提示音仍直接经 `frame_tx`（内置 WAV，非流式窗口，不做编码连续性保证）。
     async fn wait_first_text(
         &self,
         agg_rx: &mut mpsc::Receiver<String>,
-        frame_tx: &tokio::sync::mpsc::Sender<PlaybackEvent>,
+        pcm_tx: &mpsc::Sender<Vec<u8>>,
+        frame_tx: &mpsc::Sender<PlaybackEvent>,
         session_id: &str,
     ) -> Result<FirstTextOutcome, String> {
         let (enabled, interval_ms) = {
@@ -1326,14 +1334,17 @@ impl AsrLlmTtsStrategy {
                     let interval = std::time::Duration::from_millis(interval_ms);
                     let fb_for_tick = fb.clone();
                     let on_tick = || async {
-                        if let Some(frames) = self
-                            .synthesize_audio(&fb_for_tick, session_id, "处理进度提示")
-                            .await
+                        if let Some(pcm) = synthesize_status_pcm(
+                            &self.tts_config,
+                            &self.voice_override,
+                            &fb_for_tick,
+                            session_id,
+                            "处理进度提示",
+                        )
+                        .await
                         {
-                            for frame in frames {
-                                if frame_tx.send(PlaybackEvent::Audio(frame)).await.is_err() {
-                                    return false;
-                                }
+                            if pcm_tx.send(pcm).await.is_err() {
+                                return false;
                             }
                         }
                         true
@@ -1350,7 +1361,7 @@ impl AsrLlmTtsStrategy {
                             FirstTextOutcome::Text(t) => FirstTextOutcome::Text(t),
                             FirstTextOutcome::StreamEnded => FirstTextOutcome::StreamEnded,
                             FirstTextOutcome::Timeout => {
-                                self.play_timeout_feedback(&to, frame_tx, session_id)
+                                self.play_timeout_feedback(&to, pcm_tx, frame_tx, session_id)
                                     .await?;
                                 FirstTextOutcome::Timeout
                             }
@@ -1363,7 +1374,7 @@ impl AsrLlmTtsStrategy {
                         Ok(Some(t)) => FirstTextOutcome::Text(t),
                         Ok(None) => FirstTextOutcome::StreamEnded,
                         Err(_) => {
-                            self.play_timeout_feedback(&to, frame_tx, session_id)
+                            self.play_timeout_feedback(&to, pcm_tx, frame_tx, session_id)
                                 .await?;
                             FirstTextOutcome::Timeout
                         }
@@ -1634,6 +1645,21 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             return Ok(());
         }
 
+        // ── 连续音频管道（ContinuityPump）──
+        // 立即启动：TTS::Start 窗口内设备始终以 60ms 节奏收到帧（有内容发内容，
+        // 无内容喂零产静音），杜绝播放缓冲 underrun。所有真实音频 PCM（主回答、
+        // 进度提示、工具提示、超时兜底）经 `pcm_tx` 汇入 pump 统一编码，保证
+        // 比特流连续（避免孤立 Opus 帧沙沙声）；时间戳由 pump 会话级单调维护。
+        // 生命周期由 `pump_guard`（Drop 时 abort）兜底，任何提前退出路径不泄漏。
+        let (pcm_tx, pcm_rx) = mpsc::channel::<Vec<u8>>(64);
+        let pump_handle = tokio::spawn(run_continuity_pump(
+            pcm_rx,
+            frame_tx.clone(),
+            session_id.to_string(),
+            PumpConfig::default(),
+        ));
+        let pump_guard = PumpGuard::new(pump_handle);
+
         // ════════════════════════════════════════════════════════════════
         // Phase 2: 生成回复文本（AI Agent 或固定文本）
         // ════════════════════════════════════════════════════════════════
@@ -1712,7 +1738,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                     events_log.clone(),
                     self.tts_config.clone(),
                     self.voice_override.clone(),
-                    frame_tx.clone(),
+                    pcm_tx.clone(),
                     session_id.to_string(),
                 );
                 agent_events = Some(AgentEventsHandle {
@@ -1775,7 +1801,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         // 等待期间若 Agent 长时间无文本输出（思考/调用工具），按配置周期播报处理进度提示；
         // 超时（TTS_FIRST_TEXT_TIMEOUT）时兜底音频已由 wait_first_text 播放（文案或 fallback）。
         let first = match self
-            .wait_first_text(&mut agg_rx, &frame_tx, session_id)
+            .wait_first_text(&mut agg_rx, &pcm_tx, &frame_tx, session_id)
             .await?
         {
             FirstTextOutcome::Text(first) => first,
@@ -1938,21 +1964,15 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             }
         };
 
-        // ── Phase 3f: 流式 Opus 编码 + 即时下发 ────────────────────
-        // 使用持久化的 StreamingOpusEncoder 处理流式 PCM，
-        // 每完成一帧 Opus 就立即通过 frame_tx 下发到硬件端。
-        // 这样硬件端在 ~600ms（10帧预缓冲）后即可开始播放，
-        // 无需等待全部 TTS 合成完成。
-        let mut frame_count: usize = 0;
+        // ── Phase 3f: 流式 PCM 汇入 ContinuityPump（由泵统一编码 + 下发）──
+        // 主回答 / 断档反馈 / 进度提示 / 工具提示全部经 pcm_tx 汇入 pump，由唯一
+        // StreamingOpusEncoder 编码（比特流连续，时间戳会话级单调）；pump 空闲
+        // 时喂零产静音帧，设备播放缓冲永不 underrun。
+        let mut content_received = false;
         let mut total_audio_bytes: usize = 0;
         let mut raw_pcm: Vec<u8> = Vec::new();
-        let mut stream_enc = StreamingOpusEncoder::new(24000, 60)?;
-        let mut timestamp: u32 = 0;
 
-        // ── 断档处理：模型思考/调用工具时长时间无主音频帧。之前用预生成静音帧
-        //    填充保持设备播放，但孤立 Opus 帧在设备端解码会产生沙沙声，故移除；
-        //    改为断档超时后按 thinking_feedback_interval_ms 周期播报进度提示
-        //    （正常 TTS 语音），让用户知道仍在处理。
+        // ── 断档反馈：模型思考/调用工具时无主音频帧，按配置周期播报进度提示 ──
         let (feedback_enabled, feedback_interval_ms) = {
             let cfg = self.tts_config.read().unwrap();
             (
@@ -1965,10 +1985,19 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         } else {
             None
         };
-        // 断档检测阈值：主音频无帧超过该时长视为断档（正常流式合成间隔远小于此）
-        const GAP_KEEPALIVE_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(2000);
-        // 距上次播报进度提示的时间点
-        let mut last_feedback_at = tokio::time::Instant::now();
+        // 可复位的反馈计时器：内容到达即重置，仅断档满 interval 才播报。
+        // 0 间隔 = 仅超时兜底，不周期播报（feedback_on=false，分支禁用）。
+        let feedback_interval = std::time::Duration::from_millis(feedback_interval_ms);
+        let feedback_on = feedback_enabled && feedback_interval_ms > 0 && feedback_text.is_some();
+        let feedback_delay = tokio::time::sleep(feedback_interval);
+        tokio::pin!(feedback_delay);
+
+        // 定期 tick：驱动循环回到顶部重新排空句子事件（audio_stream 长时空闲时
+        // 屏幕文本不滞留）
+        const GAP_HOUSEKEEPING_MS: u64 = 2000;
+        let mut housekeeping =
+            tokio::time::interval(std::time::Duration::from_millis(GAP_HOUSEKEEPING_MS));
+        housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             // 排空句切分器产生的句子事件（先于本块音频进入通道，保持文本先于语音）
@@ -1994,97 +2023,90 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 }
             }
 
-            let result = match tokio::time::timeout(GAP_KEEPALIVE_THRESHOLD, audio_stream.next())
-                .await
-            {
-                Ok(Some(result)) => Some(result),
-                Ok(None) => None, // TTS 流正常结束
-                Err(_) => {
-                    // ── 断档：按配置周期播报进度提示（正常 TTS 语音） ──
-                    if let Some(text) = &feedback_text {
-                        if feedback_interval_ms > 0
-                            && last_feedback_at.elapsed()
-                                >= std::time::Duration::from_millis(feedback_interval_ms)
-                        {
-                            last_feedback_at = tokio::time::Instant::now();
-                            if let Some(frames) =
-                                self.synthesize_audio(text, session_id, "断档提示").await
-                            {
-                                for frame in frames {
-                                    if frame_tx.send(PlaybackEvent::Audio(frame)).await.is_err() {
-                                        tracing::info!(
-                                            session_id = %session_id,
-                                            "TTS-STREAM: 回放管道已关闭，停止生成",
-                                        );
-                                        if agent_mode {
-                                            self.record_pipeline_closed_log(
-                                                &mut agent_events,
-                                                &user_text,
-                                                session_id,
-                                                &llm_response_full,
-                                                agent_start,
-                                            )
-                                            .await;
-                                        }
-                                        return Ok(());
-                                    }
+            tokio::select! {
+                biased;
+                chunk = audio_stream.next() => {
+                    match chunk {
+                        Some(Ok(chunk)) => {
+                            content_received = true;
+                            total_audio_bytes += chunk.audio_chunk.len();
+                            raw_pcm.extend_from_slice(&chunk.audio_chunk);
+                            if pcm_tx.send(chunk.audio_chunk).await.is_err() {
+                                tracing::info!(
+                                    session_id = %session_id,
+                                    "TTS-STREAM: 回放管道已关闭，停止生成",
+                                );
+                                if agent_mode {
+                                    self.record_pipeline_closed_log(
+                                        &mut agent_events,
+                                        &user_text,
+                                        session_id,
+                                        &llm_response_full,
+                                        agent_start,
+                                    )
+                                    .await;
                                 }
+                                return Ok(());
                             }
+                            // 内容到达：重置反馈计时器（仅在断档时播报反馈）
+                            feedback_delay
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + feedback_interval);
                         }
+                        Some(Err(e)) => {
+                            tracing::warn!("流式 TTS 音频块错误: {}", e);
+                        }
+                        None => break, // TTS 流正常结束
                     }
-                    continue;
                 }
-            };
-
-            match result {
-                Some(Ok(chunk)) => {
-                    total_audio_bytes += chunk.audio_chunk.len();
-                    raw_pcm.extend_from_slice(&chunk.audio_chunk);
-
-                    let opus_frames = stream_enc
-                        .feed(&chunk.audio_chunk)
-                        .map_err(|e| format!("Opus 编码失败: {}", e))?;
-
-                    for opus in opus_frames {
-                        if frame_tx
-                            .send(PlaybackEvent::Audio(AudioFrame {
-                                timestamp,
-                                data: opus,
-                            }))
-                            .await
-                            .is_err()
+                _ = &mut feedback_delay, if feedback_on => {
+                    // 断档满 feedback_interval 无内容：播报一次进度提示（正常 TTS 语音）。
+                    // pump 已在空闲喂零，设备播放缓冲不欠载；此处仅补充「正在处理」语音。
+                    if let Some(text) = &feedback_text {
+                        if let Some(pcm) = synthesize_status_pcm(
+                            &self.tts_config,
+                            &self.voice_override,
+                            text,
+                            session_id,
+                            "断档提示",
+                        )
+                        .await
                         {
-                            tracing::info!(
-                                session_id = %session_id,
-                                "TTS-STREAM: 回放管道已关闭，停止生成",
-                            );
-                            if agent_mode {
-                                self.record_pipeline_closed_log(
-                                    &mut agent_events,
-                                    &user_text,
-                                    session_id,
-                                    &llm_response_full,
-                                    agent_start,
-                                )
-                                .await;
+                            if pcm_tx.send(pcm).await.is_err() {
+                                tracing::info!(
+                                    session_id = %session_id,
+                                    "TTS-STREAM: 回放管道已关闭，停止生成",
+                                );
+                                if agent_mode {
+                                    self.record_pipeline_closed_log(
+                                        &mut agent_events,
+                                        &user_text,
+                                        session_id,
+                                        &llm_response_full,
+                                        agent_start,
+                                    )
+                                    .await;
+                                }
+                                return Ok(());
                             }
-                            return Ok(());
                         }
-                        timestamp = timestamp.wrapping_add(60);
-                        frame_count += 1;
                     }
+                    // 播报后重新计时
+                    feedback_delay
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + feedback_interval);
                 }
-                Some(Err(e)) => {
-                    tracing::warn!("流式 TTS 音频块错误: {}", e);
+                _ = housekeeping.tick() => {
+                    // 周期性 housekeeping：让循环回到顶部排空屏幕文本事件
                 }
-                None => break,
             }
         }
 
-        // ── 零音频兜底：流式合成有文本却一帧未出 → 用累积全文重建会话重试一次 ──
+        // ── 零音频兜底：流式合成有文本却无真实音频块 → 用累积全文重试一次 ──
         // speak_stream 返回了 Ok 流但无任何音频（例如会话中途被服务端回收），
         // 用聚合任务累积的清洗全文走 synthesize（doubao 每次自建新 WS 会话）重试。
-        if frame_count == 0 {
+        // pump 持续喂零，因此「无音频」须用内容块计数而非总帧数判断。
+        if !content_received {
             let full = cleaned_full
                 .lock()
                 .ok()
@@ -2104,38 +2126,25 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                     .await
                 {
                     Ok(resp) if !resp.audio.is_empty() => {
+                        content_received = true;
                         total_audio_bytes += resp.audio.len();
                         raw_pcm.extend_from_slice(&resp.audio);
-                        let opus_frames = stream_enc
-                            .feed(&resp.audio)
-                            .map_err(|e| format!("Opus 编码失败: {}", e))?;
-                        for opus in opus_frames {
-                            if frame_tx
-                                .send(PlaybackEvent::Audio(AudioFrame {
-                                    timestamp,
-                                    data: opus,
-                                }))
-                                .await
-                                .is_err()
-                            {
-                                tracing::info!(
-                                    session_id = %session_id,
-                                    "TTS-STREAM: 回放管道已关闭，停止生成",
-                                );
-                                if agent_mode {
-                                    self.record_pipeline_closed_log(
-                                        &mut agent_events,
-                                        &user_text,
-                                        session_id,
-                                        &llm_response_full,
-                                        agent_start,
-                                    )
-                                    .await;
-                                }
-                                return Ok(());
+                        if pcm_tx.send(resp.audio).await.is_err() {
+                            tracing::info!(
+                                session_id = %session_id,
+                                "TTS-STREAM: 回放管道已关闭，停止生成",
+                            );
+                            if agent_mode {
+                                self.record_pipeline_closed_log(
+                                    &mut agent_events,
+                                    &user_text,
+                                    session_id,
+                                    &llm_response_full,
+                                    agent_start,
+                                )
+                                .await;
                             }
-                            timestamp = timestamp.wrapping_add(60);
-                            frame_count += 1;
+                            return Ok(());
                         }
                     }
                     _ => {
@@ -2153,50 +2162,10 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         drop(audio_stream);
         drop(text_evt_tx);
 
-        // ── Phase 3g: 编码最后残片 ─────────────────────────────────
-        // TTS 合成完成后，flush 缓存中的不足一帧的残片（零填充后编码）
-        {
-            let last_frames = stream_enc
-                .flush()
-                .map_err(|e| format!("Opus 编码失败: {}", e))?;
-            for opus in last_frames {
-                if frame_tx
-                    .send(PlaybackEvent::Audio(AudioFrame {
-                        timestamp,
-                        data: opus,
-                    }))
-                    .await
-                    .is_err()
-                {
-                    tracing::info!(
-                        session_id = %session_id,
-                        "TTS-STREAM: 回放管道已关闭，停止生成",
-                    );
-                    if agent_mode {
-                        self.record_pipeline_closed_log(
-                            &mut agent_events,
-                            &user_text,
-                            session_id,
-                            &llm_response_full,
-                            agent_start,
-                        )
-                        .await;
-                    }
-                    return Ok(());
-                }
-                timestamp = timestamp.wrapping_add(60);
-                frame_count += 1;
-            }
-        }
-
-        // ── 排空剩余句子事件 + 补发最后残句 ──────────────────────
-        // 确保所有 LLM 文本在 Ok(()) 返回前进入回放通道，先于 ws.rs 的 Tts::Stop。
-        drain_screen_events(&mut text_evt_rx, &residual_shared, &frame_tx, session_id).await?;
-
-        // ── 保存 TTS 音频到本地 ───────────────────────────────────
-        if !raw_pcm.is_empty() {
-            save_tts_audio_as_wav(&raw_pcm, session_id);
-        }
+        // 关闭 PCM 源：drop 本地 pcm_tx。事件消费任务（spawn_agent_event_consumer）
+        // 仍持有 clone，需在其退出（finish_agent_log 内部 join）后 pump 才会收到
+        // pcm_rx None 收尾，因此先记录 agent 日志，再等 pump。
+        drop(pcm_tx);
 
         let full_response = llm_response_full
             .lock()
@@ -2206,7 +2175,8 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
 
         // agent 模式成功完成才记录（固定文本模式无 LLM 调用）
         if agent_mode {
-            // 文本流已排空 → 后台读流任务已完成并投递事件轨迹；加超时防御
+            // 文本流已排空 → 后台读流任务已完成并投递事件轨迹；加超时防御。
+            // 内部 join 事件消费任务，释放其持有的 pcm_tx clone。
             self.finish_agent_log(
                 &mut agent_events,
                 &user_text,
@@ -2219,10 +2189,33 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             .await;
         }
 
+        // ── 泵收尾：flush 残片 + 追加尾静音帧（防尾音截断）──
+        // 所有 PCM 发送端已释放（本地 pcm_tx drop + 事件消费任务 join），
+        // pump 收到 pcm_rx None 后自动收尾。带超时兜底：若事件消费任务未及时
+        // 释放其 clone（take_agent_events 5s 超时场景），超时则 abort pump 防泄漏。
+        match tokio::time::timeout(std::time::Duration::from_secs(5), pump_guard.finish()).await {
+            Ok(res) => res?,
+            Err(_) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "ContinuityPump 收尾超时，已中止",
+                );
+            }
+        }
+
+        // ── 排空剩余句子事件 + 补发最后残句 ──────────────────────
+        // 确保所有 LLM 文本在 Ok(()) 返回前进入回放通道，先于 ws.rs 的 Tts::Stop。
+        drain_screen_events(&mut text_evt_rx, &residual_shared, &frame_tx, session_id).await?;
+
+        // ── 保存 TTS 音频到本地 ───────────────────────────────────
+        if !raw_pcm.is_empty() {
+            save_tts_audio_as_wav(&raw_pcm, session_id);
+        }
+
         tracing::info!(
             session_id = %session_id,
             total_audio_bytes = total_audio_bytes,
-            frame_count = frame_count,
+            content_received = content_received,
             response_len = full_response.len(),
             response = %full_response,
             "TTS-STREAM: 流式合成完成",
@@ -2503,16 +2496,21 @@ fn thinking_timeout_text(cfg: &TtsConfig) -> Option<String> {
         .or_else(|| Some(DEFAULT_THINKING_TIMEOUT_TEXT.to_string()))
 }
 
-/// 合成一段状态提示音频（模块级，供策略方法与独立事件播报任务共用）。
+/// 合成一段状态提示音频的原始 PCM（模块级，供策略方法与独立事件播报任务共用）。
 ///
-/// 任意文本 → TTS 合成 → 编码为 Opus 帧。5s 超时兜底，任何失败静默返回 None。
-async fn synthesize_status_audio(
+/// 任意文本 → TTS 合成 → 返回原始 PCM（24kHz 16-bit mono）。
+/// 5s 超时兜底，任何失败静默返回 None。
+///
+/// 返回 PCM 而非 Opus 帧，是为了让流式回放窗口内所有音频（内容 / 进度提示 / 工具提示）
+/// 都能汇入统一的 [`StreamingOpusEncoder`]（ContinuityPump），保证比特流连续，
+/// 避免"孤立 Opus 帧"在设备端解码产生沙沙声。
+async fn synthesize_status_pcm(
     tts_config: &SharedTtsConfig,
     voice_override: &Option<String>,
     text: &str,
     session_id: &str,
     purpose: &str,
-) -> Option<Vec<AudioFrame>> {
+) -> Option<Vec<u8>> {
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         // 在单独的块中获取并释放 TTS 配置锁，避免 RwLockReadGuard 跨越 .await
         let provider = {
@@ -2536,36 +2534,21 @@ async fn synthesize_status_audio(
             .map_err(|e| format!("TTS 合成失败: {}", e))?;
 
         if response.audio.is_empty() {
-            return Err::<Vec<AudioFrame>, String>("TTS 返回空音频".to_string());
+            return Err::<Vec<u8>, String>("TTS 返回空音频".to_string());
         }
-
-        // PCM → Opus 编码 (24kHz, 60ms)，与 generate_response 批处理路径一致
-        let opus_frames = pcm_to_opus_frames(&response.audio, 24000, 60)
-            .map_err(|e| format!("Opus 编码失败: {}", e))?;
-
-        let mut frames = Vec::with_capacity(opus_frames.len());
-        let mut timestamp: u32 = 0;
-        for opus in opus_frames {
-            frames.push(AudioFrame {
-                timestamp,
-                data: opus,
-            });
-            timestamp = timestamp.wrapping_add(60);
-        }
-
-        Ok::<Vec<AudioFrame>, String>(frames)
+        Ok::<Vec<u8>, String>(response.audio)
     })
     .await;
 
     match result {
-        Ok(Ok(frames)) => {
+        Ok(Ok(pcm)) => {
             tracing::info!(
                 session_id = %session_id,
                 text = %text,
-                frame_count = frames.len(),
+                pcm_len = pcm.len(),
                 "{}: TTS 合成完成", purpose,
             );
-            Some(frames)
+            Some(pcm)
         }
         Ok(Err(e)) => {
             tracing::warn!(
@@ -2585,6 +2568,37 @@ async fn synthesize_status_audio(
             None
         }
     }
+}
+
+/// 合成一段状态提示音频（模块级，供策略方法与独立事件播报任务共用）。
+///
+/// 任意文本 → TTS 合成 → 编码为 Opus 帧（时间戳从 0 起、逐帧 +60）。
+/// 5s 超时兜底，任何失败静默返回 None。
+///
+/// 用于非流式窗口（唤醒问候 / 告别 / 超时兜底）；流式回放窗口内的反馈提示
+/// 应走 [`synthesize_status_pcm`] 把 PCM 汇入统一编码器，避免比特流不连续。
+async fn synthesize_status_audio(
+    tts_config: &SharedTtsConfig,
+    voice_override: &Option<String>,
+    text: &str,
+    session_id: &str,
+    purpose: &str,
+) -> Option<Vec<AudioFrame>> {
+    let pcm = synthesize_status_pcm(tts_config, voice_override, text, session_id, purpose).await?;
+
+    // PCM → Opus 编码 (24kHz, 60ms)，与 generate_response 批处理路径一致
+    let opus_frames = pcm_to_opus_frames(&pcm, 24000, 60).ok()?;
+
+    let mut frames = Vec::with_capacity(opus_frames.len());
+    let mut timestamp: u32 = 0;
+    for opus in opus_frames {
+        frames.push(AudioFrame {
+            timestamp,
+            data: opus,
+        });
+        timestamp = timestamp.wrapping_add(60);
+    }
+    Some(frames)
 }
 
 /// 工具名 → TTS 播报文案映射（仅对可能耗时较长的工具播报，未知工具返回 None 不打扰）
@@ -2621,7 +2635,7 @@ fn spawn_agent_event_consumer(
     events_log: Arc<Mutex<Vec<AgentLogEvent>>>,
     tts_config: SharedTtsConfig,
     voice_override: Option<String>,
-    frame_tx: tokio::sync::mpsc::Sender<PlaybackEvent>,
+    pcm_tx: mpsc::Sender<Vec<u8>>,
     session_id: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -2654,19 +2668,12 @@ fn spawn_agent_event_consumer(
                 tool = %name,
                 "Agent 工具调用：播报进度提示",
             );
-            if let Some(frames) = synthesize_status_audio(
-                &tts_config,
-                &voice_override,
-                &text,
-                &session_id,
-                "工具提示",
-            )
-            .await
+            if let Some(pcm) =
+                synthesize_status_pcm(&tts_config, &voice_override, &text, &session_id, "工具提示")
+                    .await
             {
-                for frame in frames {
-                    if frame_tx.send(PlaybackEvent::Audio(frame)).await.is_err() {
-                        return;
-                    }
+                if pcm_tx.send(pcm).await.is_err() {
+                    return;
                 }
             }
         }
@@ -2924,6 +2931,153 @@ impl StreamingOpusEncoder {
         self.partial.clear();
 
         Ok(vec![self.opus_buf[..encoded_len].to_vec()])
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 连续音频管道（ContinuityPump）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 连续音频管道配置
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PumpConfig {
+    /// 空闲时静音帧发送周期（ms），默认 60
+    pub(crate) tick_ms: u64,
+    /// 收尾时追加的尾静音帧数（防尾音截断），默认 2
+    pub(crate) tail_silence_frames: usize,
+}
+
+impl Default for PumpConfig {
+    fn default() -> Self {
+        Self {
+            tick_ms: 60,
+            tail_silence_frames: 2,
+        }
+    }
+}
+
+/// 一帧 60ms @ 24kHz 16-bit mono 的 PCM 字节数（与 `StreamingOpusEncoder` 的 frame_bytes 一致）
+const PUMP_FRAME_PCM_BYTES: usize = 2880;
+
+/// 连续音频管道（ContinuityPump）
+///
+/// 持有唯一 [`StreamingOpusEncoder`]，在整个回放窗口内持续向 `frame_tx` 推送音频帧：
+/// - 收到真实 PCM（经 `pcm_rx`）立即编码下发
+/// - 空闲时按 `tick_ms` 喂零 PCM，产出比特流连续的真静音帧
+/// - 所有 PCM 源关闭后：`flush()` 残片 + 追加尾静音帧，再退出
+///
+/// # 设计要点
+/// - 静音帧由**同一编码器喂零**产出（比特流连续），避免历史"孤立 Opus 帧"在
+///   设备端解码产生沙沙声的问题。
+/// - 时间戳由 pump 统一维护（会话级单调 +60），消除各 TTS 段从 0 重启的跳变。
+/// - `biased` select：真实 PCM 优先于零填充；空闲 tick 兜底，保证窗口内 0 断档。
+/// - 编码器内部残片缓存天然处理子帧间隙：不足 60ms 的空闲不会产出额外静音帧。
+pub(crate) async fn run_continuity_pump(
+    mut pcm_rx: mpsc::Receiver<Vec<u8>>,
+    frame_tx: mpsc::Sender<PlaybackEvent>,
+    session_id: String,
+    cfg: PumpConfig,
+) -> Result<(), String> {
+    let mut enc = StreamingOpusEncoder::new(24000, 60)?;
+    let mut timestamp: u32 = 0;
+    let mut sent_frames: u64 = 0;
+    let zero_pcm = vec![0u8; PUMP_FRAME_PCM_BYTES];
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(cfg.tick_ms));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+            pcm = pcm_rx.recv() => {
+                match pcm {
+                    Some(pcm) => {
+                        let frames = enc.feed(&pcm)?;
+                        for opus in frames {
+                            pump_send_frame(&frame_tx, &mut timestamp, opus).await?;
+                            sent_frames += 1;
+                        }
+                    }
+                    None => {
+                        // 所有 PCM 源已关闭：flush 残片 + 追加尾静音帧，然后退出
+                        let flush_frames = enc.flush()?;
+                        for opus in flush_frames {
+                            pump_send_frame(&frame_tx, &mut timestamp, opus).await?;
+                            sent_frames += 1;
+                        }
+                        for _ in 0..cfg.tail_silence_frames {
+                            let frames = enc.feed(&zero_pcm)?;
+                            for opus in frames {
+                                pump_send_frame(&frame_tx, &mut timestamp, opus).await?;
+                                sent_frames += 1;
+                            }
+                        }
+                        tracing::debug!(
+                            session_id = %session_id,
+                            sent_frames = sent_frames,
+                            "ContinuityPump 收尾完成（flush 残片 + 尾静音）",
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            _ = ticker.tick() => {
+                let frames = enc.feed(&zero_pcm)?;
+                for opus in frames {
+                    pump_send_frame(&frame_tx, &mut timestamp, opus).await?;
+                    sent_frames += 1;
+                }
+            }
+        }
+    }
+}
+
+/// 封装一帧 Opus 为 `AudioFrame` 并推入回放管道（会话级单调时间戳 +60/帧）
+async fn pump_send_frame(
+    frame_tx: &mpsc::Sender<PlaybackEvent>,
+    timestamp: &mut u32,
+    opus: Vec<u8>,
+) -> Result<(), String> {
+    let evt = PlaybackEvent::Audio(AudioFrame {
+        timestamp: *timestamp,
+        data: opus,
+    });
+    if frame_tx.send(evt).await.is_err() {
+        return Err("回放管道已关闭".into());
+    }
+    *timestamp = timestamp.wrapping_add(60);
+    Ok(())
+}
+
+/// 连续音频管道生命周期守卫：drop 时 abort 未完成的 pump 任务，防任务泄漏
+///
+/// 正常收尾调用 [`finish`](Self::finish) 等待 pump 完成（flush + 尾静音）后退出；
+/// 任何提前退出路径直接 drop 本守卫即自动取消 pump。
+pub(crate) struct PumpGuard(Option<tokio::task::JoinHandle<Result<(), String>>>);
+
+impl PumpGuard {
+    /// 创建守卫并接管 pump 任务句柄
+    pub(crate) fn new(handle: tokio::task::JoinHandle<Result<(), String>>) -> Self {
+        Self(Some(handle))
+    }
+
+    /// 正常收尾：等待 pump 任务完成（flush 残片 + 尾静音后退出）
+    pub(crate) async fn finish(mut self) -> Result<(), String> {
+        if let Some(handle) = self.0.take() {
+            match handle.await {
+                Ok(res) => res,
+                Err(e) => Err(format!("pump 任务 panicked: {}", e)),
+            }
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for PumpGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -4283,5 +4437,197 @@ mod tests {
             assert_eq!(rec.error, None);
         })
         .await;
+    }
+
+    // ─── 连续音频管道（ContinuityPump）测试 ─────────────────────
+
+    /// 生成正弦波 PCM（24kHz 16-bit mono）
+    fn make_sine_pcm(millis: u64, freq: f64, amp: f64) -> Vec<u8> {
+        let samples = (24000 * millis / 1000) as usize;
+        let mut pcm = Vec::with_capacity(samples * 2);
+        for i in 0..samples {
+            let t = i as f64 / 24000.0;
+            let val = ((t * freq * 2.0 * std::f64::consts::PI).sin() * amp) as i16;
+            pcm.extend_from_slice(&val.to_le_bytes());
+        }
+        pcm
+    }
+
+    /// 收集回放管道中的所有音频帧（按到达顺序）
+    fn drain_audio_frames(frame_rx: &mut mpsc::Receiver<PlaybackEvent>) -> Vec<AudioFrame> {
+        let mut frames = Vec::new();
+        while let Ok(evt) = frame_rx.try_recv() {
+            if let PlaybackEvent::Audio(f) = evt {
+                frames.push(f);
+            }
+        }
+        frames
+    }
+
+    /// 全量解码并返回每帧 RMS 与是否出现解码错误
+    fn decode_frames(frames: &[AudioFrame]) -> Result<(Vec<f64>, usize), String> {
+        let mut decoder =
+            Decoder::new(24000, Channels::Mono).map_err(|e| format!("创建解码器失败: {}", e))?;
+        let mut pcm_buf = vec![0i16; 2880];
+        let mut rms_per_frame = Vec::with_capacity(frames.len());
+        let mut total_samples = 0usize;
+        for f in frames {
+            let n = decoder
+                .decode(&f.data, &mut pcm_buf, false)
+                .map_err(|e| format!("Opus 解码失败: {}", e))?;
+            let mut sum_sq = 0.0f64;
+            for &s in &pcm_buf[..n] {
+                sum_sq += (s as f64) * (s as f64);
+            }
+            rms_per_frame.push((sum_sq / n as f64).sqrt());
+            total_samples += n;
+        }
+        Ok((rms_per_frame, total_samples))
+    }
+
+    /// 泵在纯空闲（喂零）下应持续产出比特流连续的静音帧：
+    /// - 时间戳单调 +60（会话级）
+    /// - 每帧解码为 60ms @ 24kHz = 2880 采样，无解码错误
+    /// - 静音区 RMS≈0
+    /// - pcm_rx 关闭后 pump flush 残片 + 追加尾静音帧后正常退出
+    #[tokio::test]
+    async fn test_pump_zero_fill_continuous_monotonic_silence() {
+        let (pcm_tx, pcm_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (frame_tx, mut frame_rx) = mpsc::channel::<PlaybackEvent>(512);
+        let cfg = PumpConfig {
+            tick_ms: 5,
+            tail_silence_frames: 2,
+        };
+        let handle = tokio::spawn(run_continuity_pump(
+            pcm_rx,
+            frame_tx,
+            "test".to_string(),
+            cfg,
+        ));
+
+        // 保持 pcm_tx 存活，让 pump 空转一小段（5ms/tick → ~120ms/5ms ≈ 24 帧）
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        drop(pcm_tx);
+
+        handle
+            .await
+            .expect("pump 任务不应 panic")
+            .expect("pump 收尾不应失败");
+
+        let frames = drain_audio_frames(&mut frame_rx);
+        // 120ms 空转 + 2 尾帧；宽松断言，避免 CI 时序抖动
+        assert!(
+            frames.len() >= 15,
+            "空闲喂零应产出足够静音帧, got {}",
+            frames.len()
+        );
+
+        // 时间戳单调 +60（含 flush + 尾静音帧，序列连续）
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.timestamp,
+                (i as u32) * 60,
+                "第 {} 帧时间戳应为 {}*60",
+                i,
+                i
+            );
+        }
+
+        // 解码无错 + 时长正确 + 静音 RMS≈0
+        let (rms_list, total_samples) = decode_frames(&frames).expect("解码应无错");
+        assert_eq!(
+            total_samples,
+            frames.len() * 1440,
+            "每帧应解码 60ms@24kHz = 1440 采样"
+        );
+        let max_rms = rms_list.iter().cloned().fold(0.0f64, f64::max);
+        assert!(max_rms < 300.0, "静音帧 RMS 应≈0, got max_rms={}", max_rms);
+    }
+
+    /// 内容 PCM 交错喂零后，泵应产出比特流连续、时间戳单调的帧序列：
+    /// - 内容块与静音帧交错，全量解码无错（无爆音/断流）
+    /// - 时间戳单调 +60
+    #[tokio::test]
+    async fn test_pump_content_zero_interleave_continuous() {
+        let (pcm_tx, pcm_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (frame_tx, mut frame_rx) = mpsc::channel::<PlaybackEvent>(512);
+        let cfg = PumpConfig {
+            tick_ms: 5,
+            tail_silence_frames: 2,
+        };
+        let handle = tokio::spawn(run_continuity_pump(
+            pcm_rx,
+            frame_tx,
+            "test".to_string(),
+            cfg,
+        ));
+
+        // 两段 0.5s 内容(440Hz 正弦),中间空转 30ms(喂零静音)
+        let content = make_sine_pcm(500, 440.0, 10000.0);
+        pcm_tx
+            .send(content.clone())
+            .await
+            .expect("发送内容 PCM 失败");
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        pcm_tx.send(content).await.expect("发送内容 PCM 失败");
+        // 给 pump 消化时间,再关闭 PCM 源
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        drop(pcm_tx);
+
+        handle
+            .await
+            .expect("pump 任务不应 panic")
+            .expect("pump 收尾不应失败");
+
+        let frames = drain_audio_frames(&mut frame_rx);
+        // 0.5s×2 = 16 内容帧 + 空转静音帧 + 2 尾帧
+        assert!(
+            frames.len() >= 18,
+            "应产出内容+静音帧, got {}",
+            frames.len()
+        );
+
+        // 时间戳单调 +60
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.timestamp,
+                (i as u32) * 60,
+                "第 {} 帧时间戳应为 {}*60",
+                i,
+                i
+            );
+        }
+
+        // 全量解码无错（交错喂零后比特流仍连续，无爆音/断流）
+        let (rms_list, total_samples) = decode_frames(&frames).expect("解码应无错");
+        assert_eq!(total_samples, frames.len() * 1440);
+        // 存在内容帧（RMS 显著非零）
+        let max_rms = rms_list.iter().cloned().fold(0.0f64, f64::max);
+        assert!(
+            max_rms > 5000.0,
+            "应包含内容帧(高 RMS), got max_rms={}",
+            max_rms
+        );
+    }
+
+    /// `PumpGuard::finish`：PCM 源关闭后，pump 正常 flush + 尾静音并返回 Ok
+    #[tokio::test]
+    async fn test_pump_guard_finish_normal_exit() {
+        let (pcm_tx, pcm_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (frame_tx, _frame_rx) = mpsc::channel::<PlaybackEvent>(64);
+        let handle = tokio::spawn(run_continuity_pump(
+            pcm_rx,
+            frame_tx,
+            "test".to_string(),
+            PumpConfig::default(),
+        ));
+        let guard = PumpGuard::new(handle);
+
+        // 跑一小段让 pump 产出帧
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        // 关闭 PCM 源 → pump flush + 尾静音后正常退出
+        drop(pcm_tx);
+
+        guard.finish().await.expect("pump 正常收尾应返回 Ok");
     }
 }

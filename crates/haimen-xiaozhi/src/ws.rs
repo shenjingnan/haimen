@@ -1067,6 +1067,22 @@ async fn wait_frame_interrupt(socket: &mut WebSocket) -> Option<PlaybackInterrup
     }
 }
 
+/// 发送时钟追赶修正：时钟落后实时超过一帧时长（60ms）时，快进到当前时刻。
+///
+/// 断档（TTS 合成暂停 / LLM 思考）期间没有帧可发，`next_send_at` 停留在
+/// 最后一次发送的时刻而逐渐落后于实时。若不清零，恢复后的积压帧会在
+/// `wait == 0` 分支被瞬间连发（突发快发），冲击设备 jitter buffer 使其
+/// 快速排空积压音频——听感"多个字挤压在一起快速念完"。快进到当前时刻后，
+/// 恢复的帧从下一帧起按正常 60ms 节奏发送。
+///
+/// 落后不足一帧（60ms）属于正常调度抖动，不清零（保持原有立即发送 + 累加行为）。
+fn snap_send_clock(next_send_at: &mut Instant, now: Instant) {
+    let one_frame = Duration::from_millis(60);
+    if *next_send_at + one_frame < now {
+        *next_send_at = now;
+    }
+}
+
 /// 等待至「发送时钟」的下一帧时刻（距上次发送 60ms），期间监听中断
 ///
 /// 与 [`wait_frame_interrupt`] 的区别：后者每次调用都重新起一个 60ms 计时，
@@ -1074,13 +1090,17 @@ async fn wait_frame_interrupt(socket: &mut WebSocket) -> Option<PlaybackInterrup
 /// `next_send_at` 这个绝对时刻对齐，socket 有消息时忽略并继续等待，
 /// 保证帧发送间隔稳定在 60ms，避免设备 jitter buffer 因快慢不均而丢帧。
 ///
+/// 断档恢复后由 [`snap_send_clock`] 修正时钟，避免积压帧被瞬间连发。
+///
 /// 返回 `Some` 表示收到中断信号；`None` 表示已到发送时刻，可发送下一帧。
 async fn wait_until_send_slot(
     socket: &mut WebSocket,
     next_send_at: &mut Instant,
 ) -> Option<PlaybackInterrupt> {
     loop {
-        let wait = next_send_at.saturating_duration_since(Instant::now());
+        let now = Instant::now();
+        snap_send_clock(next_send_at, now);
+        let wait = next_send_at.saturating_duration_since(now);
         if wait.is_zero() {
             return None;
         }
@@ -1383,5 +1403,179 @@ mod tests {
         assert!(saw_binary, "应收到拜拜音频帧");
         assert!(saw_tts_stop, "应收到 TTS::Stop（播报结束）");
         assert!(saw_close, "服务端应主动发送 Close 帧结束对话");
+    }
+
+    // ─── 断档恢复发送节奏 ────────────────────────────────
+
+    /// 测试用策略：先发预缓冲帧，暂停一段时长（模拟 LLM 思考断档），再发后续帧。
+    /// 用于验证断档恢复后帧不被突发连发（应保持 ~60ms 发送节奏）。
+    struct GapResumeStrategy {
+        pre_frames: usize,
+        gap: Duration,
+        post_frames: usize,
+    }
+
+    #[async_trait]
+    impl ResponseStrategy for GapResumeStrategy {
+        fn name(&self) -> &'static str {
+            "test-gap-resume"
+        }
+
+        async fn generate_response(
+            &self,
+            _audio_buffer: Vec<AudioFrame>,
+            _session_id: &str,
+        ) -> Result<Vec<AudioFrame>, String> {
+            Ok(Vec::new())
+        }
+
+        fn supports_streaming_playback(&self) -> bool {
+            true
+        }
+
+        async fn generate_response_stream(
+            &self,
+            _audio_buffer: Vec<AudioFrame>,
+            _session_id: &str,
+            frame_tx: tokio::sync::mpsc::Sender<PlaybackEvent>,
+        ) -> Result<(), String> {
+            for i in 0..self.pre_frames {
+                let frame = AudioFrame {
+                    timestamp: (i as u32) * 60,
+                    data: vec![0x01, 0x02],
+                };
+                if frame_tx.send(PlaybackEvent::Audio(frame)).await.is_err() {
+                    return Err("回放管道已关闭".into());
+                }
+            }
+            tokio::time::sleep(self.gap).await;
+            for i in 0..self.post_frames {
+                let frame = AudioFrame {
+                    timestamp: ((self.pre_frames + i) as u32) * 60,
+                    data: vec![0x03, 0x04],
+                };
+                if frame_tx.send(PlaybackEvent::Audio(frame)).await.is_err() {
+                    return Err("回放管道已关闭".into());
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// 端到端：断档（帧到达暂停）后恢复的帧应保持 ~60ms 发送节奏，
+    /// 而不是被瞬间连发——突发快发会冲击设备 jitter buffer，听感"多个字挤在一起"。
+    #[tokio::test]
+    async fn test_post_gap_frames_sent_at_steady_cadence() {
+        use crate::add_routes;
+
+        let strategy = Arc::new(GapResumeStrategy {
+            pre_frames: 10,
+            gap: Duration::from_millis(1500),
+            post_frames: 10,
+        });
+        let app = add_routes(axum::Router::new(), strategy);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定测试端口失败");
+        let addr = listener.local_addr().expect("获取测试端口失败");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("测试服务器启动失败");
+        });
+
+        let url = format!("ws://{}/xiaozhi/ws", addr);
+        let (mut ws, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("连接测试服务器失败");
+
+        // HELLO 握手
+        let hello = r#"{"type":"hello","version":3,"transport":"websocket","audio_params":{"format":"opus","sample_rate":16000,"channels":1,"frame_duration":60},"features":{}}"#;
+        ws.send(TMessage::Text(hello.into()))
+            .await
+            .expect("发送 HELLO 失败");
+        let resp = ws.next().await.expect("读取 HELLO 响应失败").unwrap();
+        assert!(matches!(resp, TMessage::Text(_)), "应收到 HELLO 响应");
+
+        // 开始录音并停止，触发策略回放
+        let listen = r#"{"type":"listen","state":"start","mode":"auto"}"#;
+        ws.send(TMessage::Text(listen.into()))
+            .await
+            .expect("发送 listen start 失败");
+        let stop = r#"{"type":"listen","state":"stop","mode":"auto"}"#;
+        ws.send(TMessage::Text(stop.into()))
+            .await
+            .expect("发送 listen stop 失败");
+
+        // 读取消息：Tts::Start → 10 预缓冲帧 → [断档] → 10 恢复帧 → Tts::Stop
+        let mut frame_times: Vec<(usize, Instant)> = Vec::new();
+        let mut saw_start = false;
+        let mut saw_stop = false;
+        for _ in 0..100 {
+            let msg = match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+                Ok(Some(m)) => m.expect("读消息失败"),
+                _ => break,
+            };
+            match msg {
+                TMessage::Text(t) => {
+                    let s = t.to_string();
+                    if s.contains("\"type\":\"tts\"") && s.contains("\"state\":\"start\"") {
+                        saw_start = true;
+                    }
+                    if s.contains("\"type\":\"tts\"") && s.contains("\"state\":\"stop\"") {
+                        saw_stop = true;
+                    }
+                }
+                TMessage::Binary(_) => {
+                    frame_times.push((frame_times.len(), Instant::now()));
+                }
+                _ => {}
+            }
+            if saw_stop {
+                break;
+            }
+        }
+
+        assert!(saw_start, "应收到 TTS::Start");
+        assert!(saw_stop, "应收到 TTS::Stop");
+        assert_eq!(frame_times.len(), 20, "应收到 10 预缓冲帧 + 10 断档恢复帧");
+
+        // 恢复帧 = 索引 10..20。它们应保持 ~60ms 发送节奏，
+        // 而非断档恢复后瞬间连发。9 个 60ms 间隔 ≈ 540ms；
+        // 断言 >= 300ms 以容忍 CI 抖动，同时远大于突发连发（毫秒级）。
+        let first_resume = frame_times[10].1;
+        let last_resume = frame_times[19].1;
+        let resume_span = last_resume.duration_since(first_resume);
+
+        assert!(
+            resume_span >= Duration::from_millis(300),
+            "断档恢复后的帧被突发连发（耗时仅 {:?}），会冲击设备 jitter buffer 导致语速压缩",
+            resume_span,
+        );
+    }
+
+    /// `snap_send_clock`：时钟落后超过一帧时长才快进，正常抖动（< 一帧）不动作
+    #[test]
+    fn test_snap_send_clock() {
+        // 时钟在未来：不应快进
+        let now = Instant::now();
+        let future = now + Duration::from_millis(50);
+        let mut ts = future;
+        snap_send_clock(&mut ts, now);
+        assert_eq!(ts, future, "时钟在未来不应被快进");
+
+        // 落后不足一帧（<60ms）：正常调度抖动，不清零
+        let now = Instant::now();
+        let slightly_behind = now - Duration::from_millis(50);
+        let mut ts = slightly_behind;
+        snap_send_clock(&mut ts, now);
+        assert_eq!(ts, slightly_behind, "落后不足一帧时不应快进");
+
+        // 落后超过一帧（断档场景）：快进到当前时刻，避免积压帧突发连发
+        let now = Instant::now();
+        let far_behind = now - Duration::from_millis(2000);
+        let mut ts = far_behind;
+        snap_send_clock(&mut ts, now);
+        assert_eq!(ts, now, "落后超过一帧时应快进到当前时刻");
     }
 }
