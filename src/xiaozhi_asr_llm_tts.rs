@@ -4545,8 +4545,23 @@ mod tests {
             cfg,
         ));
 
-        // 保持 pcm_tx 存活，让 pump 空转一小段（5ms/tick → ~120ms/5ms ≈ 24 帧）
-        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        // 保持 pcm_tx 存活，轮询收集静音帧直到达到目标数量或超时。
+        // 不用固定 sleep 计数——CI（尤其 Windows）慢 runner 上 pump 任务调度
+        // 可能被挤压，固定时长内帧数不足会误报；轮询式等待只依赖 pump 产出帧
+        // 本身，与调度频率解耦。3s 兜底超时远大于 5ms/tick × 目标帧数所需时间。
+        let mut frames: Vec<AudioFrame> = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while frames.len() < 30 {
+            while let Ok(evt) = frame_rx.try_recv() {
+                if let PlaybackEvent::Audio(f) = evt {
+                    frames.push(f);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         drop(pcm_tx);
 
         handle
@@ -4554,10 +4569,10 @@ mod tests {
             .expect("pump 任务不应 panic")
             .expect("pump 收尾不应失败");
 
-        let frames = drain_audio_frames(&mut frame_rx);
-        // 120ms 空转 + 2 尾帧；宽松断言，避免 CI 时序抖动
+        // 收尾阶段 pump 可能还有 flush 残片 + 尾静音帧
+        frames.extend(drain_audio_frames(&mut frame_rx));
         assert!(
-            frames.len() >= 15,
+            frames.len() >= 30,
             "空闲喂零应产出足够静音帧, got {}",
             frames.len()
         );
