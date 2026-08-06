@@ -88,7 +88,7 @@ haimen uninstall
 | 名称        | 类型          | 说明                 |
 | ----------- | ------------- | -------------------- |
 | Claude Code | AgentProvider | 通过 Claude CLI 交互 |
-| Codex       | AgentProvider | OpenAI Codex 集成    |
+| Codex       | AgentProvider | Codex CLI 集成        |
 
 ### 消息渠道
 
@@ -118,14 +118,21 @@ COMMANDS:
   config              显示配置信息
   start               启动所有启用的连接器和 Agent
     --echo            回声模式（消息原样返回，不经过 Agent）
-    --no-browser      不自动打开浏览器
+    --open-browser    启动成功后自动打开浏览器打开 Web 控制台
+    --log-level       终端日志级别（默认关闭终端日志，仅记录到文件）
   agent               AI Agent 调试
-    run               单轮对话
+    run               单次运行 Agent
+      <PROMPT>        发送给 Agent 的消息（位置参数）
       --provider      Agent 提供者（claude-code / codex）
-      --prompt        对话提示词
-    chat              交互式对话
+    chat              交互式 Agent 会话（支持 resume）
       --provider      Agent 提供者（claude-code / codex）
-  serve               启动 HTTP 服务器
+    log               查看 Agent 调用日志
+      --limit         显示条数（默认 20）
+      --day           只显示指定日期 (YYYY-MM-DD)
+      --source        只显示指定来源（网关 / 语音 / CLI 调试）
+      --chat          只显示指定会话 chat_id
+      --json          以 JSON 数组输出
+  serve               启动 HTTP Web 服务器（xiaozhi WebSocket + GitHub Webhook）
     --host            监听地址（默认 0.0.0.0）
     --port            监听端口（默认 9527）
     --no-browser      不自动打开浏览器
@@ -148,9 +155,11 @@ COMMANDS:
 debug = false
 log_level = "info"
 
-[web]
+[http]
+enabled = true
 host = "0.0.0.0"
 port = 9527
+auto_open_browser = true
 
 # 连接器配置
 [connectors.lark]
@@ -186,8 +195,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]
 active_provider = "doubao"
 
 [asr.providers.doubao]
-app_key = "${env.DOUBAO_APP_KEY}"
-access_key = "${env.DOUBAO_ACCESS_KEY}"
+api_key = "${env.DOUBAO_API_KEY}"
 
 [asr.providers.qwen]
 api_key = "${env.QWEN_API_KEY}"
@@ -197,8 +205,8 @@ api_key = "${env.QWEN_API_KEY}"
 active_provider = "doubao"
 
 [tts.providers.doubao]
-app_key = "${env.DOUBAO_APP_KEY}"
-access_token = "${env.DOUBAO_ACCESS_TOKEN}"
+api_key = "${env.DOUBAO_API_KEY}"
+voice = "zh_female_xiaohe_uranus_bigtts"
 
 [tts.providers.openai]
 api_key = "${env.OPENAI_API_KEY}"
