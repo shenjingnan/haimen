@@ -52,7 +52,7 @@ use univoice::asr::{
 use univoice::tts::TtsRequest;
 
 use crate::config::settings::{AsrConfig, TtsConfig};
-use crate::gateway::provider::{AgentEventStream, AgentLogEvent, AgentProvider};
+use crate::gateway::provider::{AgentEventStream, AgentLogEvent};
 use crate::xiaozhi_tts::pcm_to_opus_frames;
 
 /// 共享 TTS 配置类型
@@ -491,6 +491,18 @@ struct AsrPipelineState {
     no_speech_frames: u64,
 }
 
+/// LLM 会话记录：绑定产生它的 Agent 代数
+///
+/// Agent 运行时热切换（换代）后，旧会话 ID 属于旧 Agent，传给新 Agent
+/// resume 必然失败（如 codex 报 "no rollout found for thread id"）。
+/// 因此存储会话 ID 时同时记录当时的 Agent 代数，读取时若代数不匹配则作废。
+struct LlmSession {
+    /// 产生该会话时的 Agent 代数
+    generation: u64,
+    /// Agent 返回的 session_id
+    session_id: String,
+}
+
 /// ASR → LLM → TTS 响应策略：将设备录制的语音识别为文字，
 /// 送 AI Agent 处理，再将回复合成为语音回传
 ///
@@ -515,8 +527,8 @@ pub struct AsrLlmTtsStrategy {
     agent: crate::gateway::agent_handle::SharedAgent,
     /// Agent 子进程工作目录
     work_dir: String,
-    /// LLM 会话 ID，用于多轮对话上下文连续
-    llm_session_id: Mutex<Option<String>>,
+    /// LLM 会话（绑定创建时的 Agent 代数，换代后作废），用于多轮对话上下文连续
+    llm_session_id: Mutex<Option<LlmSession>>,
     /// 流式 ASR 管道状态（录音期间启用，录音结束时消耗）
     streaming_state: Mutex<Option<AsrPipelineState>>,
     /// VAD 端点通知器：ASR 检测到用户说完时触发（每录音周期创建新 Notify）
@@ -749,7 +761,11 @@ impl AsrLlmTtsStrategy {
         latency: std::time::Duration,
         events: Vec<AgentLogEvent>,
     ) {
-        let llm_session = self.llm_session_id.lock().ok().and_then(|g| (*g).clone());
+        let llm_session = self
+            .llm_session_id
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|e| e.session_id.clone()));
         crate::agent_log::record(&crate::agent_log::AgentLogRecord {
             timestamp: crate::datetime::iso_timestamp_now(),
             source: "xiaozhi".to_string(),
@@ -841,9 +857,29 @@ impl AsrLlmTtsStrategy {
     ///
     /// # 参数
     ///
-    /// 取当前生效的 Agent（每次调用读共享句柄，支持运行时热切换）
-    fn current_agent(&self) -> Arc<dyn AgentProvider> {
-        crate::gateway::agent_handle::current_agent(&self.agent)
+    /// 读取指定 Agent 代数对应的 LLM 会话
+    ///
+    /// 会话绑定的代数与 `generation` 不一致（Agent 已切换）时返回 `None`，
+    /// 强制开启新会话，避免把旧 Agent 的 session_id 传给新 Agent。
+    fn llm_session_at(&self, generation: u64) -> Result<Option<String>, String> {
+        let guard = self
+            .llm_session_id
+            .lock()
+            .map_err(|e| format!("LLM session_id 锁获取失败: {}", e))?;
+        match &*guard {
+            Some(entry) if entry.generation == generation => Ok(Some(entry.session_id.clone())),
+            _ => Ok(None),
+        }
+    }
+
+    /// 以指定 Agent 代数记录 LLM 会话（与产生该会话的 Agent 保持一致）
+    fn store_llm_session_at(&self, session_id: String, generation: u64) {
+        if let Ok(mut guard) = self.llm_session_id.lock() {
+            *guard = Some(LlmSession {
+                generation,
+                session_id,
+            });
+        }
     }
 
     /// * `asr_config` — ASR 配置（Arc<RwLock>，支持运行时热加载）
@@ -1710,16 +1746,15 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 Box::new(stream::iter(vec![fixed_text]))
             } else {
                 // 普通模式：走 AI Agent 流式处理
-                let current_llm_session = self
-                    .llm_session_id
-                    .lock()
-                    .map_err(|e| format!("LLM session_id 锁获取失败: {}", e))?
-                    .clone();
+                // 快照一次当前 Agent（含代数），整段话语用同一个 agent/gen，
+                // 会话在换代后自动作废（避免把旧 Agent 的 session_id 传给新 Agent）
+                let agent_snap = crate::gateway::agent_handle::snapshot(&self.agent);
+                let current_llm_session = self.llm_session_at(agent_snap.generation)?;
 
                 agent_mode = true;
                 agent_start = std::time::Instant::now();
-                let (text_stream_inner, new_llm_session_id, events_rx) = match self
-                    .current_agent()
+                let (text_stream_inner, new_llm_session_id, events_rx) = match agent_snap
+                    .agent
                     .process_stream(&user_text, current_llm_session.as_deref(), &self.work_dir)
                     .await
                 {
@@ -1754,10 +1789,8 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                     log: events_log,
                 });
 
-                // 立即更新 LLM 会话 ID（用于多轮对话）
-                if let Ok(mut session) = self.llm_session_id.lock() {
-                    *session = Some(new_llm_session_id);
-                }
+                // 立即更新 LLM 会话 ID（绑定当前 Agent 代数，用于多轮对话）
+                self.store_llm_session_at(new_llm_session_id, agent_snap.generation);
 
                 tracing::info!(
                     session_id = %session_id,
@@ -2291,16 +2324,15 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 "ASR-LLM-TTS: 开始 AI Agent 处理",
             );
 
-            let current_llm_session = self
-                .llm_session_id
-                .lock()
-                .map_err(|e| format!("LLM session_id 锁获取失败: {}", e))?
-                .clone();
+            // 快照一次当前 Agent（含代数），整次处理用同一个 agent/gen，
+            // 会话在换代后自动作废（避免把旧 Agent 的 session_id 传给新 Agent）
+            let agent_snap = crate::gateway::agent_handle::snapshot(&self.agent);
+            let current_llm_session = self.llm_session_at(agent_snap.generation)?;
 
             let start = std::time::Instant::now();
             let llm_response = tokio::time::timeout(
                 std::time::Duration::from_secs(60),
-                self.current_agent().process(
+                agent_snap.agent.process(
                     &user_text,
                     current_llm_session.as_deref(),
                     &self.work_dir,
@@ -2351,10 +2383,8 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 return Err("AI Agent 返回空回复".to_string());
             }
 
-            // 更新 LLM 会话 ID（用于多轮对话）
-            if let Ok(mut session) = self.llm_session_id.lock() {
-                *session = Some(new_llm_session_id);
-            }
+            // 更新 LLM 会话 ID（绑定当前 Agent 代数，用于多轮对话）
+            self.store_llm_session_at(new_llm_session_id, agent_snap.generation);
 
             self.record_agent_log(
                 &user_text,
@@ -3234,6 +3264,7 @@ fn make_fallback_audio_frames() -> Result<Vec<AudioFrame>, String> {
 mod tests {
     use super::*;
     use crate::gateway::provider::AgentOutput;
+    use crate::gateway::provider::AgentProvider;
     use crate::xiaozhi_tts::pcm_to_opus_frames;
 
     // ─── 模拟 Agent —— 用于测试 ──────────────────────────────
@@ -3518,15 +3549,32 @@ mod tests {
     #[test]
     fn test_t18_llm_session_id_update() {
         let strategy = make_strategy(Arc::new(MockAgent));
-        {
-            let mut session = strategy.llm_session_id.lock().unwrap();
-            *session = Some("test-session-123".to_string());
-        }
+        strategy.store_llm_session_at("test-session-123".to_string(), 0);
         let session = strategy.llm_session_id.lock().unwrap();
         assert_eq!(
-            session.as_deref(),
+            session.as_ref().map(|e| e.session_id.as_str()),
             Some("test-session-123"),
             "session_id 应被更新"
+        );
+    }
+
+    #[test]
+    fn test_t18b_llm_session_invalidated_on_agent_switch() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        // 记录 gen0 的会话
+        strategy.store_llm_session_at("old-session".to_string(), 0);
+        // 同代数可复用
+        assert_eq!(
+            strategy.llm_session_at(0).unwrap().as_deref(),
+            Some("old-session"),
+            "同代数应复用旧会话"
+        );
+        // 切换 Agent（换代 gen0 → gen1），旧会话作废
+        strategy.agent.write().unwrap().swap(Arc::new(MockAgent));
+        assert_eq!(
+            strategy.llm_session_at(1).unwrap(),
+            None,
+            "Agent 换代后旧会话应作废，避免传给新 Agent"
         );
     }
 
