@@ -147,9 +147,9 @@ COMMANDS:
   agent               AI Agent 调试
     run               单次运行 Agent
       <PROMPT>        发送给 Agent 的消息（位置参数）
-      --provider      Agent 提供者（claude-code / codex）
+      --provider      Agent 提供者（claude-code / codex / openclaw / hermes）
     chat              交互式 Agent 会话（支持 resume）
-      --provider      Agent 提供者（claude-code / codex）
+      --provider      Agent 提供者（claude-code / codex / openclaw / hermes）
     log               查看 Agent 调用日志
       --limit         显示条数（默认 20）
       --day           只显示指定日期 (YYYY-MM-DD)
@@ -209,6 +209,9 @@ active_provider = "claude-code"
 # CLI 工具无需额外凭证；建议 openclaw gateway 常驻（缺失时自动降级 embedded）
 # 可选：openclaw agent id（默认 "main"，OpenClaw 保留 agent）
 # agent = "ops"
+
+[gateway.providers.hermes]
+# CLI 工具无需额外凭证；Hermes Agent 经 `hermes chat -q -Q` 子进程调用
 
 [gateway.providers.openai]
 api_key = "${env.OPENAI_API_KEY}"

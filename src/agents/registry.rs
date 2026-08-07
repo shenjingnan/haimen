@@ -11,6 +11,7 @@ use crate::config::settings::GatewayConfig;
 use crate::gateway::provider::AgentProvider;
 use haimen_claude_code::ClaudeAgent;
 use haimen_codex::{CodexAgent, DEFAULT_SANDBOX};
+use haimen_hermes::HermesAgent;
 use haimen_openclaw::{DEFAULT_AGENT_ID, OpenClawAgent};
 
 /// Agent 提供商的展示信息（供 Web API / 前端渲染）
@@ -142,6 +143,13 @@ fn builtin() -> AgentRegistry {
         })
         .expect("内置 Agent openclaw 注册失败");
     registry
+        .register("hermes", "Hermes", |config| {
+            // 极简：仅 timeout（haimen 侧等待子进程退出上限，hermes 无 CLI 侧超时）；
+            // model/provider 透传留作后续扩展
+            Ok(Box::new(HermesAgent::new(config.agent_timeout_secs)))
+        })
+        .expect("内置 Agent hermes 注册失败");
+    registry
 }
 
 static REGISTRY: OnceLock<AgentRegistry> = OnceLock::new();
@@ -165,6 +173,7 @@ mod tests {
         assert!(registry().has("claude-code"));
         assert!(registry().has("codex"));
         assert!(registry().has("openclaw"));
+        assert!(registry().has("hermes"));
     }
 
     #[test]
@@ -183,6 +192,11 @@ mod tests {
             .build("openclaw", &test_config())
             .expect("openclaw 应可构造");
         assert_eq!(openclaw.name(), "openclaw");
+
+        let hermes = registry()
+            .build("hermes", &test_config())
+            .expect("hermes 应可构造");
+        assert_eq!(hermes.name(), "hermes");
     }
 
     #[test]
@@ -201,6 +215,7 @@ mod tests {
         assert!(ids.contains(&"claude-code"));
         assert!(ids.contains(&"codex"));
         assert!(ids.contains(&"openclaw"));
+        assert!(ids.contains(&"hermes"));
     }
 
     #[test]

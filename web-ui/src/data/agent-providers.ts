@@ -17,6 +17,14 @@ export const AGENT_PROVIDERS: ProviderInfo[] = [
     id: 'codex',
     name: 'Codex CLI',
   },
+  {
+    id: 'openclaw',
+    name: 'OpenClaw',
+  },
+  {
+    id: 'hermes',
+    name: 'Hermes',
+  },
 ];
 
 /** 按 id 查找提供商信息 */
