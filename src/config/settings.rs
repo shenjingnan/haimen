@@ -153,6 +153,10 @@ pub struct ConnectorsSection {
 ///
 /// [gateway.providers.codex]
 /// # CLI 工具无需额外凭证
+/// # 可选：codex 沙箱策略（read-only / workspace-write / danger-full-access），
+/// # 默认 danger-full-access（放开沙箱）。默认 workspace-write 会阻止子进程
+/// # 访问 macOS 钥匙串等系统资源（如 lark-cli 读取凭据）。
+/// # sandbox = "workspace-write"
 /// ```
 ///
 /// # 向后兼容

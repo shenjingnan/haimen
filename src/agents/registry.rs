@@ -96,7 +96,12 @@ fn builtin() -> AgentRegistry {
         })
         .expect("内置 Agent claude-code 注册失败");
     registry
-        .register("codex", "Codex CLI", |_config| Ok(Box::new(CodexAgent)))
+        .register("codex", "Codex CLI", |config| {
+            // 沙箱策略从 providers.codex.sandbox 读取，默认放开沙箱：
+            // Codex 默认 workspace-write 会阻止子进程访问 macOS 钥匙串等系统资源
+            let sandbox = super::codex::agent::resolve_sandbox(config);
+            Ok(Box::new(CodexAgent::new(sandbox)))
+        })
         .expect("内置 Agent codex 注册失败");
     registry
 }
