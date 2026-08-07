@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## [0.12.0](https://github.com/shenjingnan/haimen/compare/v0.11.2...v0.12.0) - 2026-08-07
+
+### Added
+
+- *(agent)* 新增 Hermes Agent 后端 ([#169](https://github.com/shenjingnan/haimen/pull/169))
+- *(agent)* Web 端切换 Agent 实时生效，无需重启 ([#168](https://github.com/shenjingnan/haimen/pull/168))
+- *(agent)* 新增 OpenClaw Agent 后端 ([#167](https://github.com/shenjingnan/haimen/pull/167))
+
+### Fixed
+
+- *(codex)* 放开沙箱并修复 resume 会话 JSON 输出 ([#164](https://github.com/shenjingnan/haimen/pull/164))
+
+### Other
+
+- *(agents)* 拆分 claude-code/codex 为独立 workspace crate ([#166](https://github.com/shenjingnan/haimen/pull/166))
+
 ### Added
 
 - *(agent)* Web 端切换 Agent 实时生效，无需重启——IM 网关 / xiaozhi 语音 / GitHub Webhook 三路径共享同一 Agent 句柄，切换后下一条消息即用新 Agent；因会话语义为切换即重置，切换后进行中的会话自动开启新对话
