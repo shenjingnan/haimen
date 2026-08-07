@@ -157,6 +157,11 @@ pub struct ConnectorsSection {
 /// # 默认 danger-full-access（放开沙箱）。默认 workspace-write 会阻止子进程
 /// # 访问 macOS 钥匙串等系统资源（如 lark-cli 读取凭据）。
 /// # sandbox = "workspace-write"
+///
+/// [gateway.providers.openclaw]
+/// # CLI 工具无需额外凭证；建议 openclaw gateway 常驻（缺失时自动降级 embedded）
+/// # 可选：openclaw agent id（默认 "main"，OpenClaw 保留 agent）
+/// # agent = "ops"
 /// ```
 ///
 /// # 向后兼容

@@ -11,6 +11,7 @@ use crate::config::settings::GatewayConfig;
 use crate::gateway::provider::AgentProvider;
 use haimen_claude_code::ClaudeAgent;
 use haimen_codex::{CodexAgent, DEFAULT_SANDBOX};
+use haimen_openclaw::{DEFAULT_AGENT_ID, OpenClawAgent};
 
 /// Agent 提供商的展示信息（供 Web API / 前端渲染）
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +101,21 @@ fn resolve_codex_sandbox(config: &GatewayConfig) -> String {
         .unwrap_or_else(|| DEFAULT_SANDBOX.to_string())
 }
 
+/// 从网关配置解析 openclaw agent id
+///
+/// 优先读取 `[gateway.providers.openclaw] agent`，缺省使用
+/// [`haimen_openclaw::DEFAULT_AGENT_ID`]。`GatewayConfig` 保留在主 crate，
+/// 故该解析逻辑留在注册表而非 haimen-openclaw crate。
+fn resolve_openclaw_agent(config: &GatewayConfig) -> String {
+    config
+        .providers
+        .get("openclaw")
+        .and_then(|p| p.get("agent"))
+        .filter(|v| !v.is_empty())
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_AGENT_ID.to_string())
+}
+
 /// 内置 Agent 注册（新增 Agent 只需在此加一行）
 fn builtin() -> AgentRegistry {
     let mut registry = AgentRegistry::new();
@@ -116,6 +132,15 @@ fn builtin() -> AgentRegistry {
             Ok(Box::new(CodexAgent::new(sandbox)))
         })
         .expect("内置 Agent codex 注册失败");
+    registry
+        .register("openclaw", "OpenClaw", |config| {
+            // agent id 从 providers.openclaw.agent 读取，默认 "main"（OpenClaw 保留 agent）；
+            // --timeout 与网关 agent_timeout_secs 对齐
+            let agent = resolve_openclaw_agent(config);
+            let timeout = config.agent_timeout_secs;
+            Ok(Box::new(OpenClawAgent::new(agent, timeout)))
+        })
+        .expect("内置 Agent openclaw 注册失败");
     registry
 }
 
@@ -139,6 +164,7 @@ mod tests {
         // 默认 active_provider 是 "claude-code"，必须恒注册，否则默认启动即报错
         assert!(registry().has("claude-code"));
         assert!(registry().has("codex"));
+        assert!(registry().has("openclaw"));
     }
 
     #[test]
@@ -152,6 +178,11 @@ mod tests {
             .build("codex", &test_config())
             .expect("codex 应可构造");
         assert_eq!(codex.name(), "codex");
+
+        let openclaw = registry()
+            .build("openclaw", &test_config())
+            .expect("openclaw 应可构造");
+        assert_eq!(openclaw.name(), "openclaw");
     }
 
     #[test]
@@ -169,6 +200,7 @@ mod tests {
         let ids: Vec<&str> = list.iter().map(|info| info.id).collect();
         assert!(ids.contains(&"claude-code"));
         assert!(ids.contains(&"codex"));
+        assert!(ids.contains(&"openclaw"));
     }
 
     #[test]
@@ -228,5 +260,36 @@ mod tests {
         providers.insert("claude-code".to_string(), params);
         config.providers = providers;
         assert_eq!(resolve_codex_sandbox(&config), DEFAULT_SANDBOX);
+    }
+
+    #[test]
+    fn test_resolve_openclaw_agent_default() {
+        // 未配置时回退到默认 agent
+        let config = GatewayConfig::default();
+        assert_eq!(resolve_openclaw_agent(&config), DEFAULT_AGENT_ID);
+    }
+
+    #[test]
+    fn test_resolve_openclaw_agent_custom() {
+        // 配置 [gateway.providers.openclaw] agent 后应被读取
+        let mut config = GatewayConfig::default();
+        let mut providers = HashMap::new();
+        let mut params = HashMap::new();
+        params.insert("agent".to_string(), "ops".to_string());
+        providers.insert("openclaw".to_string(), params);
+        config.providers = providers;
+        assert_eq!(resolve_openclaw_agent(&config), "ops");
+    }
+
+    #[test]
+    fn test_resolve_openclaw_agent_ignores_other_providers() {
+        // 其他 provider 的 agent 配置不影响 openclaw
+        let mut config = GatewayConfig::default();
+        let mut providers = HashMap::new();
+        let mut params = HashMap::new();
+        params.insert("agent".to_string(), "whatever".to_string());
+        providers.insert("codex".to_string(), params);
+        config.providers = providers;
+        assert_eq!(resolve_openclaw_agent(&config), DEFAULT_AGENT_ID);
     }
 }
