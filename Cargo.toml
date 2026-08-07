@@ -3,6 +3,8 @@ members = [
     "crates/haimen-core",
     "crates/haimen-lark",
     "crates/haimen-xiaozhi",
+    "crates/haimen-claude-code",
+    "crates/haimen-codex",
     ".",    # 根目录的主 crate
 ]
 
@@ -121,6 +123,8 @@ tokio-stream = { workspace = true }
 haimen-core = { path = "crates/haimen-core", version = "0.1.2" }
 haimen-lark = { path = "crates/haimen-lark", version = "0.2.2" }
 haimen-xiaozhi = { path = "crates/haimen-xiaozhi", version = "0.1.5" }
+haimen-claude-code = { path = "crates/haimen-claude-code", version = "0.1.0" }
+haimen-codex = { path = "crates/haimen-codex", version = "0.1.0" }
 univoice = { version = "0.1.6", features = ["opus-encoder"] }
 opus2 = { workspace = true }
 webbrowser = { workspace = true }

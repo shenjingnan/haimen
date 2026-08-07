@@ -1,5 +1,3 @@
-pub mod claude_code;
-pub mod codex;
 pub mod error;
 pub mod mcp_client;
 pub mod registry;

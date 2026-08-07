@@ -9,9 +9,8 @@ use std::sync::OnceLock;
 
 use crate::config::settings::GatewayConfig;
 use crate::gateway::provider::AgentProvider;
-
-use super::claude_code::agent::ClaudeAgent;
-use super::codex::agent::CodexAgent;
+use haimen_claude_code::ClaudeAgent;
+use haimen_codex::{CodexAgent, DEFAULT_SANDBOX};
 
 /// Agent 提供商的展示信息（供 Web API / 前端渲染）
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +86,20 @@ impl Default for AgentRegistry {
     }
 }
 
+/// 从网关配置解析 codex 沙箱策略
+///
+/// 优先读取 `[gateway.providers.codex] sandbox`，缺省使用
+/// [`haimen_codex::DEFAULT_SANDBOX`]。`GatewayConfig` 保留在主 crate，
+/// 故该解析逻辑留在注册表而非 haimen-codex crate。
+fn resolve_codex_sandbox(config: &GatewayConfig) -> String {
+    config
+        .providers
+        .get("codex")
+        .and_then(|p| p.get("sandbox"))
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_SANDBOX.to_string())
+}
+
 /// 内置 Agent 注册（新增 Agent 只需在此加一行）
 fn builtin() -> AgentRegistry {
     let mut registry = AgentRegistry::new();
@@ -99,7 +112,7 @@ fn builtin() -> AgentRegistry {
         .register("codex", "Codex CLI", |config| {
             // 沙箱策略从 providers.codex.sandbox 读取，默认放开沙箱：
             // Codex 默认 workspace-write 会阻止子进程访问 macOS 钥匙串等系统资源
-            let sandbox = super::codex::agent::resolve_sandbox(config);
+            let sandbox = resolve_codex_sandbox(config);
             Ok(Box::new(CodexAgent::new(sandbox)))
         })
         .expect("内置 Agent codex 注册失败");
@@ -184,5 +197,36 @@ mod tests {
         .expect("注册成功");
         let agent = reg.build("cfg-agent", &test_config()).expect("构造成功");
         assert_eq!(agent.name(), "claude-code");
+    }
+
+    #[test]
+    fn test_resolve_codex_sandbox_default() {
+        // 未配置时回退到默认（放开沙箱）
+        let config = GatewayConfig::default();
+        assert_eq!(resolve_codex_sandbox(&config), DEFAULT_SANDBOX);
+    }
+
+    #[test]
+    fn test_resolve_codex_sandbox_custom() {
+        // 配置 [gateway.providers.codex] sandbox 后应被读取
+        let mut config = GatewayConfig::default();
+        let mut providers = HashMap::new();
+        let mut params = HashMap::new();
+        params.insert("sandbox".to_string(), "workspace-write".to_string());
+        providers.insert("codex".to_string(), params);
+        config.providers = providers;
+        assert_eq!(resolve_codex_sandbox(&config), "workspace-write");
+    }
+
+    #[test]
+    fn test_resolve_codex_sandbox_ignores_other_providers() {
+        // 其他 provider 的 sandbox 配置不影响 codex
+        let mut config = GatewayConfig::default();
+        let mut providers = HashMap::new();
+        let mut params = HashMap::new();
+        params.insert("sandbox".to_string(), "read-only".to_string());
+        providers.insert("claude-code".to_string(), params);
+        config.providers = providers;
+        assert_eq!(resolve_codex_sandbox(&config), DEFAULT_SANDBOX);
     }
 }

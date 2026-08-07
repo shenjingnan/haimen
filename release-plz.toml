@@ -19,3 +19,9 @@ name = "haimen-lark"
 
 [[package]]
 name = "haimen-xiaozhi"
+
+[[package]]
+name = "haimen-claude-code"
+
+[[package]]
+name = "haimen-codex"
