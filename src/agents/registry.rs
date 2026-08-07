@@ -12,6 +12,7 @@ use crate::gateway::provider::AgentProvider;
 
 use super::claude_code::agent::ClaudeAgent;
 use super::codex::agent::CodexAgent;
+use super::openclaw::agent::OpenClawAgent;
 
 /// Agent 提供商的展示信息（供 Web API / 前端渲染）
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +105,15 @@ fn builtin() -> AgentRegistry {
         })
         .expect("内置 Agent codex 注册失败");
     registry
+        .register("openclaw", "OpenClaw", |config| {
+            // agent id 从 providers.openclaw.agent 读取，默认 "main"（OpenClaw 保留 agent）；
+            // --timeout 与网关 agent_timeout_secs 对齐
+            let agent = super::openclaw::agent::resolve_agent(config);
+            let timeout = config.agent_timeout_secs;
+            Ok(Box::new(OpenClawAgent::new(agent, timeout)))
+        })
+        .expect("内置 Agent openclaw 注册失败");
+    registry
 }
 
 static REGISTRY: OnceLock<AgentRegistry> = OnceLock::new();
@@ -126,6 +136,7 @@ mod tests {
         // 默认 active_provider 是 "claude-code"，必须恒注册，否则默认启动即报错
         assert!(registry().has("claude-code"));
         assert!(registry().has("codex"));
+        assert!(registry().has("openclaw"));
     }
 
     #[test]
@@ -139,6 +150,11 @@ mod tests {
             .build("codex", &test_config())
             .expect("codex 应可构造");
         assert_eq!(codex.name(), "codex");
+
+        let openclaw = registry()
+            .build("openclaw", &test_config())
+            .expect("openclaw 应可构造");
+        assert_eq!(openclaw.name(), "openclaw");
     }
 
     #[test]
@@ -156,6 +172,7 @@ mod tests {
         let ids: Vec<&str> = list.iter().map(|info| info.id).collect();
         assert!(ids.contains(&"claude-code"));
         assert!(ids.contains(&"codex"));
+        assert!(ids.contains(&"openclaw"));
     }
 
     #[test]

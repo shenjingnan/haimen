@@ -205,6 +205,11 @@ active_provider = "claude-code"
 [gateway.providers.codex]
 # CLI 工具无需额外凭证
 
+[gateway.providers.openclaw]
+# CLI 工具无需额外凭证；建议 openclaw gateway 常驻（缺失时自动降级 embedded）
+# 可选：openclaw agent id（默认 "main"，OpenClaw 保留 agent）
+# agent = "ops"
+
 [gateway.providers.openai]
 api_key = "${env.OPENAI_API_KEY}"
 model = "gpt-4o"
