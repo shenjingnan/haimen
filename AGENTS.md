@@ -116,10 +116,7 @@ cargo tarpaulin                     # 生成覆盖率报告
 │   │   │   └── config.rs  # GitHub 配置
 │   │   └── mod.rs
 │   ├── agents/          # AI Agent 实现
-│   │   ├── claude_code/ # Claude Code Agent (claude --print)
-│   │   │   ├── mod.rs
-│   │   │   └── agent.rs # ClaudeAgent: impl AgentProvider
-│   │   ├── codex/       # Codex Agent（占位）
+│   │   ├── registry.rs  # AgentRegistry 注册表（内置 Agent 分发）
 │   │   ├── error.rs     # Agent 错误类型
 │   │   ├── mcp_client.rs# MCP 协议客户端
 │   │   ├── mcp_agent.rs # McpAgent: impl AgentProvider
@@ -137,6 +134,12 @@ cargo tarpaulin                     # 生成覆盖率报告
 │   ├── logging.rs       # tracing 双层日志
 │   ├── datetime.rs      # 日期时间工具
 │   └── commands/        # 工具命令（completion, upgrade, uninstall）
+├── crates/              # 独立 workspace crate
+│   ├── haimen-core/     # 共享抽象层（Message / MessageChannel / AgentProvider）
+│   ├── haimen-lark/     # Lark/飞书消息通道连接器
+│   ├── haimen-xiaozhi/  # Xiaozhi 音频/WebSocket 集成
+│   ├── haimen-claude-code/ # Claude Code Agent（claude --print）
+│   └── haimen-codex/    # Codex CLI Agent（codex exec --json）
 ├── tests/               # 集成测试
 ├── .agents/             # 架构方案/计划
 ├── .github/             # CI/CD 配置
