@@ -517,7 +517,9 @@ mod tests {
     fn test_build_codex_args_resume_keeps_json() {
         // 回归：resume 会话必须保留 --json，否则 codex 输出纯文本而非 JSONL，
         // haimen 将无法提取 thread_id（found_assistant_message=false）
-        let args = build_codex_args("continue", Some("thr_123"), "danger-full-access");
+        // 使用真实 codex thread_id 格式（UUID 风格），避免 typos 误判
+        let thread_id = "019fd9cc-6b6a-7801-aec1-1984ac6da570";
+        let args = build_codex_args("continue", Some(thread_id), "danger-full-access");
         assert_eq!(
             args,
             vec![
@@ -526,7 +528,7 @@ mod tests {
                 "--sandbox".to_string(),
                 "danger-full-access".to_string(),
                 "resume".to_string(),
-                "thr_123".to_string(),
+                thread_id.to_string(),
                 "continue".to_string(),
             ]
         );
