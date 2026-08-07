@@ -130,6 +130,12 @@ export interface AgentSettings {
   resolved?: {
     agent: string;
   };
+  /** 保存是否已热切换生效 */
+  applied?: boolean;
+  /** 运行时实际生效的 Agent 提供商 */
+  applied_agent?: string;
+  /** 当前 Agent 代数（每次切换 +1） */
+  generation?: number;
 }
 
 // ── 消息渠道（Connector）配置 ──

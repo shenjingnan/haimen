@@ -2,13 +2,10 @@ pub mod config;
 pub mod handler;
 pub mod types;
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use axum::http::HeaderMap;
 use tracing;
 
-use crate::gateway::provider::AgentProvider;
 use crate::gateway::webhook::{WebhookHandler, WebhookResult};
 
 pub use config::GitHubConfig;
@@ -16,8 +13,8 @@ pub use config::GitHubConfig;
 /// GitHub Webhook 连接器
 pub struct GitHubConnector {
     config: GitHubConfig,
-    /// 使用 Arc 而非 Box：handle() 中需要 clone 到 tokio::spawn 的异步闭包
-    agent: Arc<dyn AgentProvider>,
+    /// 共享 Agent 句柄：支持运行时热切换，handle() 每次事件读取当前 Agent
+    agent: crate::gateway::agent_handle::SharedAgent,
     /// Agent 子进程工作目录
     work_dir: String,
     /// Webhook 幂等性去重缓存（最多保留 1000 条 delivery_id）
@@ -53,7 +50,11 @@ impl DedupCache {
 }
 
 impl GitHubConnector {
-    pub fn new(config: GitHubConfig, agent: Arc<dyn AgentProvider>, work_dir: String) -> Self {
+    pub fn new(
+        config: GitHubConfig,
+        agent: crate::gateway::agent_handle::SharedAgent,
+        work_dir: String,
+    ) -> Self {
         Self {
             config,
             agent,
@@ -127,7 +128,8 @@ impl WebhookHandler for GitHubConnector {
         );
 
         // === 异步阶段：后台处理，不阻塞 HTTP 响应 ===
-        let agent = self.agent.clone();
+        // 在事件到达时刻取当前 Agent，固定到本次 spawn 任务（切换只影响后续事件）
+        let agent = crate::gateway::agent_handle::current_agent(&self.agent);
         let token = self.config.token.clone();
         let issue = parsed.issue.clone();
         let work_dir = self.work_dir.clone();

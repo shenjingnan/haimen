@@ -74,15 +74,17 @@ function AgentSettingsPanel() {
   const handleSave = async () => {
     setSaving(true);
     try {
-      await updateAgentSettings({
+      const data = await updateAgentSettings({
         active_provider: activeProvider,
         providers: editState,
       });
-      setSaveResult('保存成功');
+      setSaveResult(
+        `保存成功，当前生效：${data.applied_agent ?? activeProvider}（进行中会话已重置）`,
+      );
       setVerifyResult(null);
       await reloadData();
-    } catch {
-      setSaveResult('保存失败');
+    } catch (e) {
+      setSaveResult(`保存失败：${e instanceof Error ? e.message : '未知错误'}`);
     } finally {
       setSaving(false);
       setTimeout(() => setSaveResult(null), 3000);
@@ -92,15 +94,17 @@ function AgentSettingsPanel() {
   const handleSetActive = async () => {
     setSaving(true);
     try {
-      await updateAgentSettings({
+      const data = await updateAgentSettings({
         active_provider: selectedTab,
         providers: editState,
       });
       setActiveProvider(selectedTab);
-      setSaveResult('已切换激活服务商');
+      setSaveResult(
+        `已切换激活服务商：${data.applied_agent ?? selectedTab}（进行中会话已重置）`,
+      );
       await reloadData();
-    } catch {
-      setSaveResult('保存失败');
+    } catch (e) {
+      setSaveResult(`切换失败：${e instanceof Error ? e.message : '未知错误'}`);
     } finally {
       setSaving(false);
       setTimeout(() => setSaveResult(null), 3000);

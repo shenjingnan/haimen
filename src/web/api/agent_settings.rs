@@ -1,17 +1,21 @@
 //! Agent 配置 REST API
 //!
 //! 提供对 `settings.toml` 中 `[gateway]` 的 Agent 配置的读写接口。
-//! 使用文件直接读写，不依赖 axum State（简化路由注册）。
+//!
+//! 与 ASR/TTS 一致，Agent 共享句柄经 axum State 注入：`PUT` 保存配置后
+//! 重建 Agent 并换入共享状态，实现运行时热切换（无需重启）。
 //!
 //! # 端点
 //!
-//! - `GET /api/v1/settings/agent` — 获取 Agent 配置（active_provider + providers）
-//! - `PUT /api/v1/settings/agent` — 更新 Agent 配置
+//! - `GET /api/v1/settings/agent` — 获取 Agent 配置（active_provider + providers + 当前生效 agent）
+//! - `PUT /api/v1/settings/agent` — 更新 Agent 配置并热切换
 //! - `GET /api/v1/agent/providers` — 列出注册表中所有 Agent 提供商
 //! - `POST /api/v1/settings/agent/verify` — 验证指定 Agent CLI 是否可用
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use axum::extract::State;
 use axum::{Json, http::StatusCode};
 
 use crate::config::settings::AppConfig;
@@ -52,8 +56,11 @@ fn load_config() -> AppConfig {
 
 /// `GET /api/v1/settings/agent`
 ///
-/// 返回完整的 Agent 配置：所有已配置的提供商参数 + 当前激活的提供商。
-pub async fn get_agent_settings() -> Json<serde_json::Value> {
+/// 返回完整的 Agent 配置：所有已配置的提供商参数 + 当前激活的提供商 +
+/// 运行时实际生效的 Agent（`applied_agent` + `generation`）。
+pub async fn get_agent_settings(
+    State(shared_agent): State<crate::gateway::agent_handle::SharedAgent>,
+) -> Json<serde_json::Value> {
     let cfg = load_config();
     Json(serde_json::json!({
         "success": true,
@@ -62,17 +69,24 @@ pub async fn get_agent_settings() -> Json<serde_json::Value> {
             "providers": cfg.gateway.providers,
             "resolved": {
                 "agent": cfg.gateway.resolved_agent(),
-            }
+            },
+            "applied_agent": crate::gateway::agent_handle::current_name(&shared_agent),
+            "generation": crate::gateway::agent_handle::current_generation(&shared_agent),
         }
     }))
 }
 
 /// `PUT /api/v1/settings/agent`
 ///
-/// 替换完整的 Agent 配置。支持以下字段：
+/// 替换完整的 Agent 配置并热切换。支持以下字段：
 /// - `active_provider` — 切换当前激活的 Agent 提供商
 /// - `providers` — 所有提供商的完整参数映射
+///
+/// 原子切换顺序：**构建候选 → check_available → 写盘 → 换入内存**。
+/// 任一步失败返回 4xx/5xx，磁盘与内存都停留在旧配置（自动回滚）。
+/// 成功后下一次消息/事件即使用新 Agent；会话因换代自动重置。
 pub async fn update_agent_settings(
+    State(shared_agent): State<crate::gateway::agent_handle::SharedAgent>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let mut cfg = load_config();
@@ -89,22 +103,65 @@ pub async fn update_agent_settings(
         cfg.gateway.providers = providers;
     }
 
+    let name = cfg.gateway.resolved_agent();
+
+    // 1. 构建候选（未注册的 provider → 400，零改动）
+    let candidate = match crate::agents::registry::registry().build(&name, &cfg.gateway) {
+        Ok(a) => a,
+        Err(e) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": e.clone(),
+                    "message": e,
+                })),
+            ));
+        }
+    };
+
+    // 2. check_available（CLI 不可用 → 400，零改动，旧 Agent 继续工作）
+    if let Err(e) = candidate.check_available().await {
+        let msg = format!("{} 不可用，配置未保存: {}", name, e);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": msg.clone(),
+                "message": msg,
+            })),
+        ));
+    }
+
+    // 3. 写盘（失败 → 500，内存未换入）
     if let Err(e) = crate::config::settings::save_settings(&cfg) {
         tracing::warn!(error = %e, "保存 Agent 配置到文件失败");
+        let msg = format!("保存配置失败: {}", e);
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
                 "success": false,
-                "error": format!("保存配置失败: {}", e)
+                "error": msg.clone(),
+                "message": msg,
             })),
         ));
     }
+
+    // 4. 换入内存（此刻才换代，单条赋值原子生效）
+    let (applied_agent, generation) = {
+        let mut guard = shared_agent.write().expect("agent handle 锁中毒");
+        guard.swap(Arc::from(candidate));
+        (guard.name.clone(), guard.generation)
+    };
 
     Ok(Json(serde_json::json!({
         "success": true,
         "data": {
             "active_provider": cfg.gateway.active_provider,
             "providers": cfg.gateway.providers,
+            "applied": true,
+            "applied_agent": applied_agent,
+            "generation": generation,
         }
     })))
 }
@@ -213,5 +270,57 @@ mod tests {
     fn test_parse_providers_missing() {
         let json = serde_json::json!({"other": "value"});
         assert!(parse_providers(&json).is_none());
+    }
+
+    // ─── 热切换原子性（回滚）测试 ─────────────────────────
+
+    use crate::gateway::provider::{AgentOutput, AgentProvider};
+    use crate::test_util::run_with_temp_home_async;
+    use async_trait::async_trait;
+
+    struct MockAgent;
+
+    #[async_trait]
+    impl AgentProvider for MockAgent {
+        fn name(&self) -> &str {
+            "mock-agent"
+        }
+
+        async fn check_available(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn process(
+            &self,
+            _msg: &str,
+            _session_id: Option<&str>,
+            _work_dir: &str,
+        ) -> Result<(AgentOutput, String), String> {
+            Ok((AgentOutput::default(), "mock-session".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_unknown_provider_rolls_back() {
+        run_with_temp_home_async(move |_home| async move {
+            let shared = crate::gateway::agent_handle::into_shared(Box::new(MockAgent));
+            let body = Json(serde_json::json!({ "active_provider": "does-not-exist" }));
+
+            let result = update_agent_settings(axum::extract::State(shared.clone()), body).await;
+            let (status, payload) = result.expect_err("未知 provider 应返回 400");
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let msg = payload.0["message"].as_str().unwrap_or_default();
+            assert!(
+                msg.contains("does-not-exist"),
+                "错误信息应包含 provider 名，实际: {}",
+                msg
+            );
+
+            // 回滚：共享状态保持原样（未换代）
+            let snap = crate::gateway::agent_handle::snapshot(&shared);
+            assert_eq!(snap.name, "mock-agent");
+            assert_eq!(snap.generation, 0);
+        })
+        .await;
     }
 }

@@ -1,3 +1,4 @@
+pub mod agent_handle;
 pub mod channel;
 pub mod chat_loop;
 pub mod model;
@@ -14,6 +15,7 @@ use crate::agents::registry::registry;
 use crate::config::settings::load_settings;
 use crate::connectors::dingtalk::channel::DingTalkChannel;
 use crate::connectors::github::GitHubConnector;
+use crate::gateway::agent_handle::{build_shared_agent, current_agent};
 use crate::gateway::channel::MessageChannel;
 use crate::gateway::provider::AgentProvider;
 use crate::gateway::webhook::WebhookState;
@@ -72,7 +74,9 @@ pub fn build_agent(
 /// 需要配置 ASR 和 TTS 提供商凭证。环境变量缺失时跳过 xiaozhi 路由（不挂载）。
 ///
 /// ASR 配置通过 Arc<RwLock> 共享，Web API 保存时同步更新此对象，实现运行时热加载。
+/// Agent 使用共享句柄，Web API 切换时同步更新，实现运行时热切换。
 fn build_xiaozhi_strategy(
+    shared_agent: crate::gateway::agent_handle::SharedAgent,
     config: &crate::config::settings::AppConfig,
     shared_asr_config: crate::xiaozhi_asr_llm_tts::SharedAsrConfig,
     shared_tts_config: crate::xiaozhi_asr_llm_tts::SharedTtsConfig,
@@ -99,20 +103,13 @@ fn build_xiaozhi_strategy(
         }
     }
 
-    let llm_agent: Arc<dyn AgentProvider> = match build_agent(config) {
-        Ok(a) => Arc::from(a),
-        Err(e) => {
-            tracing::warn!(error = %e, "构建 Agent 失败，xiaozhi WebSocket 不启动");
-            return None;
-        }
-    };
     let work_dir = resolve_work_dir_from_config(config);
     Some(Arc::new(
         crate::xiaozhi_asr_llm_tts::AsrLlmTtsStrategy::new(
             shared_asr_config,
             shared_tts_config,
             None, // voice_override
-            llm_agent,
+            shared_agent,
             work_dir,
         ),
     ))
@@ -163,6 +160,9 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
         signal_cancel.cancel();
     });
 
+    // 构建共享 Agent 句柄（所有消费路径共用，支持 Web API 运行时热切换）
+    let shared_agent = build_shared_agent(&config, None)?;
+
     // 启动 HTTP 服务器（xiaozhi + GitHub Webhook + Web 控制台）
     let http_handle = if config.http.enabled {
         let http_cancel = cancel.clone();
@@ -175,23 +175,17 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
         let work_dir = resolve_work_dir_from_config(&config);
 
         // GitHub Webhook（可选）
-        let webhook_state = config.github.clone().and_then(|cfg| {
-            let gh_agent: Arc<dyn AgentProvider> = match build_agent(&config) {
-                Ok(a) => Arc::from(a),
-                Err(e) => {
-                    tracing::warn!(error = %e, "构建 Agent 失败，GitHub Webhook 将不使用 Agent");
-                    return None;
-                }
-            };
-            let connector = GitHubConnector::new(cfg, gh_agent, work_dir.clone());
-            Some(WebhookState {
+        let webhook_state = config.github.clone().map(|cfg| {
+            let connector = GitHubConnector::new(cfg, shared_agent.clone(), work_dir.clone());
+            WebhookState {
                 github: Some(Arc::new(connector)),
-            })
+            }
         });
 
         let shared_asr_config = Arc::new(RwLock::new(config.asr.clone()));
         let shared_tts_config = Arc::new(RwLock::new(config.tts.clone()));
         let xiaozhi_strategy = build_xiaozhi_strategy(
+            shared_agent.clone(),
             &config,
             shared_asr_config.clone(),
             shared_tts_config.clone(),
@@ -208,6 +202,7 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
             }
         );
 
+        let http_shared_agent = shared_agent.clone();
         let handle = tokio::spawn(async move {
             let result = crate::web::start(
                 serve_config,
@@ -215,6 +210,7 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
                 xiaozhi_strategy,
                 shared_asr_config,
                 shared_tts_config,
+                http_shared_agent,
                 http_cancel,
             )
             .await;
@@ -231,8 +227,6 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
 
     // 运行网关（仅当有连接器时）
     if has_connectors {
-        let agent = build_agent(&config)?;
-
         // 并行健康检查，收集健康的连接器名
         let healthy: Vec<String> =
             futures_util::future::join_all(all_connectors.iter().map(|(name, ch)| {
@@ -292,7 +286,7 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
             channels.push((name.clone(), ch));
         }
 
-        agent.check_available().await?;
+        current_agent(&shared_agent).check_available().await?;
 
         tracing::info!(
             "haimen 已启动 — 连接器: {:?}, HTTP: {}, Agent: {}",
@@ -301,12 +295,16 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
                 .map(|(n, _)| n.as_str())
                 .collect::<Vec<&str>>(),
             if config.http.enabled { "是" } else { "否" },
-            agent.name(),
+            current_agent(&shared_agent).name(),
         );
 
-        let result =
-            chat_loop::run_unified_gateway(channels, &*agent, &config.gateway, cancel.clone())
-                .await;
+        let result = chat_loop::run_unified_gateway(
+            channels,
+            &shared_agent,
+            &config.gateway,
+            cancel.clone(),
+        )
+        .await;
 
         // 网关已停止，触发 HTTP 服务器关闭
         cancel.cancel();
@@ -367,10 +365,10 @@ pub async fn listen() -> Result<(), String> {
     let (name, channel) = channels.remove(0);
     tracing::info!(connector = %name, "单连接器模式");
 
-    let agent = build_agent(&config)?;
-    agent.check_available().await?;
+    let shared_agent = build_shared_agent(&config, None)?;
+    current_agent(&shared_agent).check_available().await?;
 
-    chat_loop::run_chat_loop(&*channel, &*agent, &config.gateway).await
+    chat_loop::run_chat_loop(&*channel, &shared_agent, &config.gateway).await
 }
 
 /// 启动网关监听（Echo 模式，取第一个启用的连接器）

@@ -509,7 +509,10 @@ pub struct AsrLlmTtsStrategy {
     /// CLI 音色覆盖（--xiaozhi-tts-voice），叠加到共享配置之上，不写入磁盘
     voice_override: Option<String>,
     /// AI Agent（Claude Code、Codex 等）
-    agent: Arc<dyn AgentProvider>,
+    ///
+    /// 使用共享句柄实现运行时热切换：Web UI 切换 Agent 时更新此共享对象，
+    /// 策略在每次调用时读取当前生效的 Agent。
+    agent: crate::gateway::agent_handle::SharedAgent,
     /// Agent 子进程工作目录
     work_dir: String,
     /// LLM 会话 ID，用于多轮对话上下文连续
@@ -750,7 +753,7 @@ impl AsrLlmTtsStrategy {
         crate::agent_log::record(&crate::agent_log::AgentLogRecord {
             timestamp: crate::datetime::iso_timestamp_now(),
             source: "xiaozhi".to_string(),
-            agent: self.agent.name().to_string(),
+            agent: crate::gateway::agent_handle::current_name(&self.agent),
             connector: None,
             chat_id: Some(session_id.to_string()),
             sender_id: None,
@@ -838,6 +841,11 @@ impl AsrLlmTtsStrategy {
     ///
     /// # 参数
     ///
+    /// 取当前生效的 Agent（每次调用读共享句柄，支持运行时热切换）
+    fn current_agent(&self) -> Arc<dyn AgentProvider> {
+        crate::gateway::agent_handle::current_agent(&self.agent)
+    }
+
     /// * `asr_config` — ASR 配置（Arc<RwLock>，支持运行时热加载）
     /// * `tts_config` — TTS 配置
     /// * `agent` — AI Agent 实例
@@ -846,7 +854,7 @@ impl AsrLlmTtsStrategy {
         asr_config: SharedAsrConfig,
         tts_config: SharedTtsConfig,
         voice_override: Option<String>,
-        agent: Arc<dyn AgentProvider>,
+        agent: crate::gateway::agent_handle::SharedAgent,
         work_dir: String,
     ) -> Self {
         Self {
@@ -873,7 +881,7 @@ impl AsrLlmTtsStrategy {
         asr_config: SharedAsrConfig,
         shared_tts_config: SharedTtsConfig,
         voice_override: Option<String>,
-        agent: Arc<dyn AgentProvider>,
+        agent: crate::gateway::agent_handle::SharedAgent,
         work_dir: String,
     ) -> Result<Self, String> {
         // 验证当前配置的凭证是否有效（构造时检查一次，运行时也会动态读取）
@@ -1711,7 +1719,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 agent_mode = true;
                 agent_start = std::time::Instant::now();
                 let (text_stream_inner, new_llm_session_id, events_rx) = match self
-                    .agent
+                    .current_agent()
                     .process_stream(&user_text, current_llm_session.as_deref(), &self.work_dir)
                     .await
                 {
@@ -1753,7 +1761,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
 
                 tracing::info!(
                     session_id = %session_id,
-                    agent = self.agent.name(),
+                    agent = crate::gateway::agent_handle::current_name(&self.agent),
                     "TTS-STREAM: Agent 流式输出已启动",
                 );
 
@@ -2279,7 +2287,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             // 普通模式：走 AI Agent 处理
             tracing::info!(
                 session_id = %session_id,
-                agent = self.agent.name(),
+                agent = crate::gateway::agent_handle::current_name(&self.agent),
                 "ASR-LLM-TTS: 开始 AI Agent 处理",
             );
 
@@ -2292,8 +2300,11 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             let start = std::time::Instant::now();
             let llm_response = tokio::time::timeout(
                 std::time::Duration::from_secs(60),
-                self.agent
-                    .process(&user_text, current_llm_session.as_deref(), &self.work_dir),
+                self.current_agent().process(
+                    &user_text,
+                    current_llm_session.as_deref(),
+                    &self.work_dir,
+                ),
             )
             .await;
 
@@ -3346,11 +3357,14 @@ mod tests {
     }
 
     fn make_strategy(agent: Arc<dyn AgentProvider>) -> AsrLlmTtsStrategy {
+        let shared = Arc::new(RwLock::new(crate::gateway::agent_handle::AgentHandle::new(
+            agent,
+        )));
         AsrLlmTtsStrategy::new(
             make_shared_asr_config(),
             make_shared_tts_config(),
             None, // voice_override
-            agent,
+            shared,
             "/tmp".to_string(),
         )
     }
@@ -3531,13 +3545,19 @@ mod tests {
         let strategy = make_strategy(Arc::new(FailingAgent));
         // 由于 ASR 会实际调用外部服务，跳过集成测试
         // 这里只验证策略能正常构建且 Send+Sync
-        assert_eq!(strategy.agent.name(), "failing-agent");
+        assert_eq!(
+            crate::gateway::agent_handle::current_name(&strategy.agent),
+            "failing-agent"
+        );
     }
 
     #[tokio::test]
     async fn test_t21_generate_response_llm_empty_response() {
         let strategy = make_strategy(Arc::new(EmptyResponseAgent));
-        assert_eq!(strategy.agent.name(), "empty-response-agent");
+        assert_eq!(
+            crate::gateway::agent_handle::current_name(&strategy.agent),
+            "empty-response-agent"
+        );
     }
 
     // ─── MockAgent process 行为验证 ──────────────────
