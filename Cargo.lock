@@ -930,8 +930,11 @@ dependencies = [
  "clap_complete",
  "dingtalk-stream",
  "futures-util",
+ "haimen-claude-code",
+ "haimen-codex",
  "haimen-core",
  "haimen-lark",
+ "haimen-openclaw",
  "haimen-xiaozhi",
  "hex",
  "hmac",
@@ -954,6 +957,32 @@ dependencies = [
  "tracing-subscriber",
  "univoice",
  "webbrowser",
+]
+
+[[package]]
+name = "haimen-claude-code"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "haimen-core",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
+name = "haimen-codex"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "haimen-core",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tracing",
 ]
 
 [[package]]
@@ -980,6 +1009,19 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "haimen-openclaw"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "haimen-core",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
  "tracing",
 ]
 

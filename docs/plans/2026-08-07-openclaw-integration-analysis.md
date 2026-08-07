@@ -193,16 +193,16 @@ OpenClaw 作为 agent 后端的真实增量价值是**多模型路由/failover**
 
 采用 L1（Agent 后端）+ 批处理（CLI 无流式，已实测确认）。改动清单：
 
-- **新增** `src/agents/openclaw/{mod.rs, agent.rs}`：`OpenClawAgent` 实现 `AgentProvider`（仿 codex）。核心设计：
+- **新增独立 crate** `crates/haimen-openclaw/`（跟随 origin/main 的 Agent 独立 crate 架构，与 `haimen-claude-code`/`haimen-codex` 一致）：`lib.rs` 导出 `OpenClawAgent`/`DEFAULT_AGENT_ID`，`agent.rs` 实现 `AgentProvider`。核心设计：
   - 子进程 `openclaw agent --json --timeout <s> --agent <id> --session-key <key> -m <msg>`
   - **haimen 自持唯一 session key**（`agent:<id>:haimen:<nanos><seq>`）显式传入——避免落到 openclaw 默认 `main` 会话导致多会话串上下文；resume 原样传回
   - 一次性 JSON 解析：文本取 `result.payloads[].text`，混入日志时 `extract_json_span` 兜底；错误文案透传
-  - 16 个纯函数单测
-- **修改** `src/agents/mod.rs`（`pub mod openclaw;`）、`src/agents/registry.rs`（注册 `openclaw` 一行 + 测试断言）、`src/config/settings.rs`（doc 注释示例）、`README.md`（配置示例）
+  - 13 个纯函数单测（`resolve_agent` 依赖 `GatewayConfig`，随拆分移到主 crate registry）
+- **修改** `src/agents/registry.rs`（引用 `haimen_openclaw` + `resolve_openclaw_agent` + 测试断言）、`Cargo.toml`（workspace member + 依赖）、`src/config/settings.rs`（doc 注释示例）、`README.md`（配置示例）；`src/agents/mod.rs` 不再有 openclaw 模块
 - **零改动**：Web API / 前端 / agent_log / chat_loop（由注册表自动驱动）
 
 验证结果：
-- `cargo fmt --check` + `cargo clippy -- -D warnings` + `cargo test`（465 单测 + 6 集成）全绿
+- `cargo fmt --check` + `cargo clippy -- -D warnings` + `cargo test --workspace` 全绿（主 crate 432 单测 + 6 集成 + haimen-openclaw 13 单测等）
 - `haimen agent run --provider openclaw`：返回文本，日志记录 session key `agent:main:haimen:*`
 - `haimen agent chat` 两轮对话（记住秘密数字 42 → 复述 42）：**resume 端到端生效**
 

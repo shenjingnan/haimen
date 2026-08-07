@@ -6,8 +6,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing;
 
-use crate::config::settings::GatewayConfig;
-use crate::gateway::provider::{
+use haimen_core::provider::{
     AgentEventStream, AgentLogEvent, AgentOutput, AgentProvider, TextStream,
 };
 
@@ -50,18 +49,6 @@ impl CodexAgent {
     pub(crate) fn sandbox(&self) -> &str {
         &self.sandbox
     }
-}
-
-/// 从网关配置解析 codex 沙箱策略
-///
-/// 优先读取 `[gateway.providers.codex] sandbox`，缺省使用 [`DEFAULT_SANDBOX`]。
-pub fn resolve_sandbox(config: &GatewayConfig) -> String {
-    config
-        .providers
-        .get("codex")
-        .and_then(|p| p.get("sandbox"))
-        .cloned()
-        .unwrap_or_else(|| DEFAULT_SANDBOX.to_string())
 }
 
 #[async_trait]
@@ -543,37 +530,6 @@ mod tests {
         let args = build_codex_args("hi", None, "workspace-write");
         assert!(args.contains(&"workspace-write".to_string()));
         assert!(args.contains(&"--sandbox".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_sandbox_default() {
-        // 未配置时回退到默认（放开沙箱）
-        let config = GatewayConfig::default();
-        assert_eq!(resolve_sandbox(&config), DEFAULT_SANDBOX);
-    }
-
-    #[test]
-    fn test_resolve_sandbox_custom() {
-        // 配置 [gateway.providers.codex] sandbox 后应被读取
-        let mut config = GatewayConfig::default();
-        let mut providers = std::collections::HashMap::new();
-        let mut params = std::collections::HashMap::new();
-        params.insert("sandbox".to_string(), "workspace-write".to_string());
-        providers.insert("codex".to_string(), params);
-        config.providers = providers;
-        assert_eq!(resolve_sandbox(&config), "workspace-write");
-    }
-
-    #[test]
-    fn test_resolve_sandbox_ignores_other_providers() {
-        // 其他 provider 的 sandbox 配置不影响 codex
-        let mut config = GatewayConfig::default();
-        let mut providers = std::collections::HashMap::new();
-        let mut params = std::collections::HashMap::new();
-        params.insert("sandbox".to_string(), "read-only".to_string());
-        providers.insert("claude-code".to_string(), params);
-        config.providers = providers;
-        assert_eq!(resolve_sandbox(&config), DEFAULT_SANDBOX);
     }
 
     #[test]

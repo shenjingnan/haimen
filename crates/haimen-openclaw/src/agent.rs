@@ -8,8 +8,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing;
 
-use crate::config::settings::GatewayConfig;
-use crate::gateway::provider::{
+use haimen_core::provider::{
     AgentEventStream, AgentLogEvent, AgentOutput, AgentProvider, TextStream,
 };
 
@@ -57,19 +56,6 @@ impl OpenClawAgent {
     pub(crate) fn timeout_secs(&self) -> u64 {
         self.timeout_secs
     }
-}
-
-/// 从网关配置解析 openclaw agent id
-///
-/// 优先读取 `[gateway.providers.openclaw] agent`，缺省使用 [`DEFAULT_AGENT_ID`]。
-pub fn resolve_agent(config: &GatewayConfig) -> String {
-    config
-        .providers
-        .get("openclaw")
-        .and_then(|p| p.get("agent"))
-        .filter(|v| !v.is_empty())
-        .cloned()
-        .unwrap_or_else(|| DEFAULT_AGENT_ID.to_string())
 }
 
 #[async_trait]
@@ -359,10 +345,6 @@ async fn check_openclaw_available() -> bool {
 mod tests {
     use super::*;
 
-    fn test_config() -> GatewayConfig {
-        GatewayConfig::default()
-    }
-
     #[test]
     fn test_openclaw_agent_name() {
         let agent = OpenClawAgent::new(DEFAULT_AGENT_ID, 300);
@@ -401,36 +383,6 @@ mod tests {
         assert!(args.contains(&"600".to_string()));
         assert!(args.contains(&"--session-key".to_string()));
         assert!(args.contains(&"agent:ops:haimen:xyz".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_agent_default() {
-        // 未配置时回退到默认 agent
-        assert_eq!(resolve_agent(&test_config()), DEFAULT_AGENT_ID);
-    }
-
-    #[test]
-    fn test_resolve_agent_custom() {
-        // 配置 [gateway.providers.openclaw] agent 后应被读取
-        let mut config = test_config();
-        let mut providers = std::collections::HashMap::new();
-        let mut params = std::collections::HashMap::new();
-        params.insert("agent".to_string(), "ops".to_string());
-        providers.insert("openclaw".to_string(), params);
-        config.providers = providers;
-        assert_eq!(resolve_agent(&config), "ops");
-    }
-
-    #[test]
-    fn test_resolve_agent_ignores_other_providers() {
-        // 其他 provider 的 agent 配置不影响 openclaw
-        let mut config = test_config();
-        let mut providers = std::collections::HashMap::new();
-        let mut params = std::collections::HashMap::new();
-        params.insert("agent".to_string(), "whatever".to_string());
-        providers.insert("codex".to_string(), params);
-        config.providers = providers;
-        assert_eq!(resolve_agent(&config), DEFAULT_AGENT_ID);
     }
 
     #[test]

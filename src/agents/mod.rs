@@ -1,8 +1,5 @@
-pub mod claude_code;
-pub mod codex;
 pub mod error;
 pub mod mcp_client;
-pub mod openclaw;
 pub mod registry;
 
 mod mcp_agent;
