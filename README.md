@@ -201,17 +201,25 @@ active_provider = "claude-code"
 
 [gateway.providers.claude-code]
 # CLI 工具无需额外凭证
+# 可选：claude CLI 可执行文件路径（留空按 PATH 查找 "claude"）
+# cli_path = "/opt/claude/bin/claude"
 
 [gateway.providers.codex]
 # CLI 工具无需额外凭证
+# 可选：codex CLI 可执行文件路径（留空按 PATH 查找 "codex"）
+# cli_path = "/opt/codex/bin/codex"
 
 [gateway.providers.openclaw]
 # CLI 工具无需额外凭证；建议 openclaw gateway 常驻（缺失时自动降级 embedded）
 # 可选：openclaw agent id（默认 "main"，OpenClaw 保留 agent）
 # agent = "ops"
+# 可选：openclaw CLI 可执行文件路径（留空按 PATH 查找 "openclaw"）
+# cli_path = "/opt/openclaw/bin/openclaw"
 
 [gateway.providers.hermes]
 # CLI 工具无需额外凭证；Hermes Agent 经 `hermes chat -q -Q` 子进程调用
+# 可选：hermes CLI 可执行文件路径（留空按 PATH 查找 "hermes"）
+# cli_path = "/opt/hermes/bin/hermes"
 
 [gateway.providers.openai]
 api_key = "${env.OPENAI_API_KEY}"

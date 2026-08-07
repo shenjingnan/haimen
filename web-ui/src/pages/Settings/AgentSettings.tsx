@@ -9,6 +9,7 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { AGENT_PROVIDERS, type ProviderInfo } from '@/data/agent-providers';
@@ -99,9 +100,7 @@ function AgentSettingsPanel() {
         providers: editState,
       });
       setActiveProvider(selectedTab);
-      setSaveResult(
-        `已切换激活服务商：${data.applied_agent ?? selectedTab}（进行中会话已重置）`,
-      );
+      setSaveResult(`已切换激活服务商：${data.applied_agent ?? selectedTab}（进行中会话已重置）`);
       await reloadData();
     } catch (e) {
       setSaveResult(`切换失败：${e instanceof Error ? e.message : '未知错误'}`);
@@ -111,10 +110,23 @@ function AgentSettingsPanel() {
     }
   };
 
+  /** 更新当前 Tab 的某个字段值（不可变更新，与 VoiceSettings 一致） */
+  const handleFieldChange = (key: string, value: string) => {
+    setEditState((prev) => ({
+      ...prev,
+      [selectedTab]: {
+        ...(prev[selectedTab] ?? {}),
+        [key]: value,
+      },
+    }));
+  };
+
   const handleVerify = async () => {
     setVerifying(true);
     try {
-      const result = await verifyAgentCredentials(selectedTab);
+      // 携带草稿 cli_path（未保存也能先验证路径是否正确）
+      const draftCliPath = editState[selectedTab]?.cli_path;
+      const result = await verifyAgentCredentials(selectedTab, draftCliPath);
       setVerifyResult(result);
     } catch {
       setVerifyResult({ valid: false, message: '网络请求失败' });
@@ -197,6 +209,20 @@ function AgentSettingsPanel() {
                 )}
               </div>
 
+              {/* 可配置字段（如 CLI 路径） */}
+              {p.fields.map((field) => (
+                <div key={field.key} className="space-y-2">
+                  <span className="text-sm font-medium">{field.label}</span>
+                  <Input
+                    id={`agent-${p.id}-${field.key}`}
+                    type="text"
+                    placeholder={field.placeholder ?? `输入${field.label}`}
+                    value={editState[p.id]?.[field.key] ?? ''}
+                    onChange={(e) => handleFieldChange(field.key, e.target.value)}
+                  />
+                </div>
+              ))}
+
               {/* 验证结果 */}
               {verifyResult && (
                 <Alert variant={verifyResult.valid ? 'default' : 'destructive'}>
@@ -246,7 +272,8 @@ export default function AgentSettings() {
       <div>
         <h1 className="text-2xl font-bold tracking-tight">Agent 配置</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          选择用于处理消息的 AI Agent。各 Agent 均使用本地安装的 CLI 工具， 无需额外配置凭证。
+          选择用于处理消息的 AI Agent。各 Agent 使用本地安装的 CLI 工具，
+          可配置可执行文件路径（留空按 PATH 查找）。
         </p>
       </div>
       <AgentSettingsPanel />

@@ -30,6 +30,8 @@ const SESSION_WAIT_SECS: u64 = 30;
 /// - 会话：haimen 侧生成/持有完整 session key（`agent:<id>:haimen:<unique>`），
 ///   新会话生成唯一 key，resume 时原样传回 `--session-key`。
 pub struct OpenClawAgent {
+    /// openclaw CLI 可执行文件路径（默认 "openclaw"，由 build_command 按 PATH 查找）
+    cli_path: String,
     /// openclaw agent id（`--agent <id>`），默认 "main"
     agent: String,
     /// 模型调用超时秒数（`--timeout`），与网关 agent_timeout_secs 对齐
@@ -37,12 +39,19 @@ pub struct OpenClawAgent {
 }
 
 impl OpenClawAgent {
-    /// 使用指定 agent id 与超时构造
-    pub fn new(agent: impl Into<String>, timeout_secs: u64) -> Self {
+    /// 使用指定 CLI 路径、agent id 与超时构造
+    pub fn new(cli_path: impl Into<String>, agent: impl Into<String>, timeout_secs: u64) -> Self {
         Self {
+            cli_path: cli_path.into(),
             agent: agent.into(),
             timeout_secs,
         }
+    }
+
+    /// 当前 CLI 路径（供测试断言使用）
+    #[cfg(test)]
+    pub(crate) fn cli_path(&self) -> &str {
+        &self.cli_path
     }
 
     /// 当前 agent id（供测试断言使用）
@@ -101,6 +110,7 @@ impl AgentProvider for OpenClawAgent {
             message,
             session_id,
             work_dir,
+            &self.cli_path,
             &self.agent,
             self.timeout_secs,
         )
@@ -111,10 +121,13 @@ impl AgentProvider for OpenClawAgent {
     }
 
     async fn check_available(&self) -> Result<(), String> {
-        if check_openclaw_available().await {
+        if check_openclaw_available(&self.cli_path).await {
             Ok(())
         } else {
-            Err("openclaw CLI 未安装。请执行: npm install -g openclaw".to_string())
+            Err(format!(
+                "openclaw CLI 不可用（路径: {}）。请检查 cli_path 配置或执行: npm install -g openclaw",
+                self.cli_path
+            ))
         }
     }
 }
@@ -144,6 +157,7 @@ async fn process_with_openclaw(
     prompt: &str,
     session_id: Option<&str>,
     work_dir: &str,
+    cli_path: &str,
     agent: &str,
     timeout_secs: u64,
 ) -> Result<(TextStream, String), String> {
@@ -158,7 +172,7 @@ async fn process_with_openclaw(
     tracing::debug!(args = ?args, "启动 openclaw 子进程");
 
     // Windows 上 openclaw 是 npm 安装的 .cmd shim，经 build_command 解析包装
-    let mut child = Command::from(haimen_core::process::build_command("openclaw", &args))
+    let mut child = Command::from(haimen_core::process::build_command(cli_path, &args))
         .current_dir(work_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -330,9 +344,9 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// 检查 openclaw CLI 是否可用
-async fn check_openclaw_available() -> bool {
+async fn check_openclaw_available(cli_path: &str) -> bool {
     Command::from(haimen_core::process::build_command(
-        "openclaw",
+        cli_path,
         &["--version".to_string()],
     ))
     .output()
@@ -347,8 +361,9 @@ mod tests {
 
     #[test]
     fn test_openclaw_agent_name() {
-        let agent = OpenClawAgent::new(DEFAULT_AGENT_ID, 300);
+        let agent = OpenClawAgent::new("openclaw", DEFAULT_AGENT_ID, 300);
         assert_eq!(agent.name(), "openclaw");
+        assert_eq!(agent.cli_path(), "openclaw");
         assert_eq!(agent.agent(), DEFAULT_AGENT_ID);
         assert_eq!(agent.timeout_secs(), 300);
     }

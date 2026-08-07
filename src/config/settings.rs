@@ -150,6 +150,9 @@ pub struct ConnectorsSection {
 ///
 /// [gateway.providers.claude-code]
 /// # CLI 工具无需额外凭证
+/// # 可选：claude CLI 可执行文件路径（留空按 PATH 查找 "claude"；填绝对路径或
+/// # 自定义命令名）。适用于 CLI 未装在标准 PATH 的环境。
+/// # cli_path = "/opt/claude/bin/claude"
 ///
 /// [gateway.providers.codex]
 /// # CLI 工具无需额外凭证
@@ -157,11 +160,20 @@ pub struct ConnectorsSection {
 /// # 默认 danger-full-access（放开沙箱）。默认 workspace-write 会阻止子进程
 /// # 访问 macOS 钥匙串等系统资源（如 lark-cli 读取凭据）。
 /// # sandbox = "workspace-write"
+/// # 可选：codex CLI 可执行文件路径（留空按 PATH 查找 "codex"）
+/// # cli_path = "/opt/codex/bin/codex"
 ///
 /// [gateway.providers.openclaw]
 /// # CLI 工具无需额外凭证；建议 openclaw gateway 常驻（缺失时自动降级 embedded）
 /// # 可选：openclaw agent id（默认 "main"，OpenClaw 保留 agent）
 /// # agent = "ops"
+/// # 可选：openclaw CLI 可执行文件路径（留空按 PATH 查找 "openclaw"）
+/// # cli_path = "/opt/openclaw/bin/openclaw"
+///
+/// [gateway.providers.hermes]
+/// # CLI 工具无需额外凭证
+/// # 可选：hermes CLI 可执行文件路径（留空按 PATH 查找 "hermes"）
+/// # cli_path = "/opt/hermes/bin/hermes"
 /// ```
 ///
 /// # 向后兼容
