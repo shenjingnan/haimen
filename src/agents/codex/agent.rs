@@ -6,9 +6,19 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing;
 
+use crate::config::settings::GatewayConfig;
 use crate::gateway::provider::{
     AgentEventStream, AgentLogEvent, AgentOutput, AgentProvider, TextStream,
 };
+
+/// Codex CLI 默认沙箱策略：`danger-full-access`（完全放开沙箱）。
+///
+/// Codex 默认以 `workspace-write` 沙箱执行模型生成的 shell 命令，会把子进程的
+/// 可写范围限制在工作区，并阻止访问 macOS 系统钥匙串等系统资源（例如 `lark-cli`
+/// 需要从钥匙串读取 master key）。放开沙箱后命令以完整用户权限运行，可满足
+/// 网关内各类工具命令（飞书/钉钉 CLI 等）的访问需求；如需收紧，可在配置中指定
+/// `[gateway.providers.codex] sandbox = "workspace-write"`。
+pub const DEFAULT_SANDBOX: &str = "danger-full-access";
 
 /// Codex CLI Agent
 ///
@@ -21,7 +31,38 @@ use crate::gateway::provider::{
 /// - `item.completed` with `item_type: "assistant_message"` — 回复文本
 /// - `item.completed` with `item_type: "reasoning"` — 推理过程（跳过）
 /// - `turn.completed` — turn 结束
-pub struct CodexAgent;
+pub struct CodexAgent {
+    /// codex 沙箱策略（`codex exec --sandbox <mode>`），合法值：
+    /// `read-only` / `workspace-write` / `danger-full-access`
+    sandbox: String,
+}
+
+impl CodexAgent {
+    /// 使用指定沙箱策略构造
+    pub fn new(sandbox: impl Into<String>) -> Self {
+        Self {
+            sandbox: sandbox.into(),
+        }
+    }
+
+    /// 当前沙箱策略（供测试断言使用）
+    #[cfg(test)]
+    pub(crate) fn sandbox(&self) -> &str {
+        &self.sandbox
+    }
+}
+
+/// 从网关配置解析 codex 沙箱策略
+///
+/// 优先读取 `[gateway.providers.codex] sandbox`，缺省使用 [`DEFAULT_SANDBOX`]。
+pub fn resolve_sandbox(config: &GatewayConfig) -> String {
+    config
+        .providers
+        .get("codex")
+        .and_then(|p| p.get("sandbox"))
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_SANDBOX.to_string())
+}
 
 #[async_trait]
 impl AgentProvider for CodexAgent {
@@ -63,7 +104,8 @@ impl AgentProvider for CodexAgent {
         session_id: Option<&str>,
         work_dir: &str,
     ) -> Result<(TextStream, String, AgentEventStream), String> {
-        let (stream, sid) = process_with_codex_stream(message, session_id, work_dir).await?;
+        let (stream, sid) =
+            process_with_codex_stream(message, session_id, work_dir, &self.sandbox).await?;
         // codex 的 reasoning/tool 轨迹捕获留作后续，事件流为空（sender 立即 drop）
         let (_tx, rx) = tokio::sync::mpsc::channel::<AgentLogEvent>(64);
         Ok((stream, sid, rx))
@@ -83,21 +125,9 @@ async fn process_with_codex_stream(
     prompt: &str,
     resume_session_id: Option<&str>,
     work_dir: &str,
+    sandbox: &str,
 ) -> Result<(TextStream, String), String> {
-    let mut args: Vec<String> = vec![];
-
-    if let Some(sid) = resume_session_id {
-        // 恢复现有会话：codex exec resume <thread_id> "prompt"
-        args.push("exec".to_string());
-        args.push("resume".to_string());
-        args.push(sid.to_string());
-    } else {
-        // 新会话：codex exec --json "prompt"
-        args.push("exec".to_string());
-        args.push("--json".to_string());
-    }
-
-    args.push(prompt.to_string());
+    let args = build_codex_args(prompt, resume_session_id, sandbox);
 
     tracing::debug!(args = ?args, "启动 codex 子进程");
 
@@ -289,6 +319,27 @@ async fn process_with_codex_stream(
     Ok((stream, sid))
 }
 
+/// 构建 `codex exec` 参数
+///
+/// 注意：`codex exec` 的选项（`--json` / `--sandbox`）必须放在子命令
+/// （`resume`）之前。**resume 会话同样需要 `--json`**——若缺失，codex 会把
+/// 完整会话转写输出到 stderr、最终答案以纯文本输出到 stdout，而非 JSONL
+/// 事件流，haimen 将无法提取 `thread_id` 与回复文本。
+fn build_codex_args(prompt: &str, resume_session_id: Option<&str>, sandbox: &str) -> Vec<String> {
+    let mut args = vec![
+        "exec".to_string(),
+        "--json".to_string(),
+        "--sandbox".to_string(),
+        sandbox.to_string(),
+    ];
+    if let Some(sid) = resume_session_id {
+        args.push("resume".to_string());
+        args.push(sid.to_string());
+    }
+    args.push(prompt.to_string());
+    args
+}
+
 /// 从 codex 的 assistant_message item.completed 事件中提取文本
 ///
 /// 支持多种格式：
@@ -441,8 +492,88 @@ mod tests {
 
     #[test]
     fn test_codex_agent_name() {
-        let agent = CodexAgent;
+        let agent = CodexAgent::new(DEFAULT_SANDBOX);
         assert_eq!(agent.name(), "codex");
+        assert_eq!(agent.sandbox(), DEFAULT_SANDBOX);
+    }
+
+    #[test]
+    fn test_build_codex_args_new_session() {
+        // 新会话：选项在 prompt 之前，必须带 --json 与 --sandbox
+        let args = build_codex_args("hello", None, "danger-full-access");
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_string(),
+                "--json".to_string(),
+                "--sandbox".to_string(),
+                "danger-full-access".to_string(),
+                "hello".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_codex_args_resume_keeps_json() {
+        // 回归：resume 会话必须保留 --json，否则 codex 输出纯文本而非 JSONL，
+        // haimen 将无法提取 thread_id（found_assistant_message=false）
+        // 使用真实 codex thread_id 格式（UUID 风格），避免 typos 误判
+        let thread_id = "019fd9cc-6b6a-7801-aec1-1984ac6da570";
+        let args = build_codex_args("continue", Some(thread_id), "danger-full-access");
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_string(),
+                "--json".to_string(),
+                "--sandbox".to_string(),
+                "danger-full-access".to_string(),
+                "resume".to_string(),
+                thread_id.to_string(),
+                "continue".to_string(),
+            ]
+        );
+        // --json 必须位于 resume 子命令之前
+        let json_pos = args.iter().position(|a| a == "--json").unwrap();
+        let resume_pos = args.iter().position(|a| a == "resume").unwrap();
+        assert!(json_pos < resume_pos, "--json 应在 resume 之前");
+    }
+
+    #[test]
+    fn test_build_codex_args_custom_sandbox() {
+        let args = build_codex_args("hi", None, "workspace-write");
+        assert!(args.contains(&"workspace-write".to_string()));
+        assert!(args.contains(&"--sandbox".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_sandbox_default() {
+        // 未配置时回退到默认（放开沙箱）
+        let config = GatewayConfig::default();
+        assert_eq!(resolve_sandbox(&config), DEFAULT_SANDBOX);
+    }
+
+    #[test]
+    fn test_resolve_sandbox_custom() {
+        // 配置 [gateway.providers.codex] sandbox 后应被读取
+        let mut config = GatewayConfig::default();
+        let mut providers = std::collections::HashMap::new();
+        let mut params = std::collections::HashMap::new();
+        params.insert("sandbox".to_string(), "workspace-write".to_string());
+        providers.insert("codex".to_string(), params);
+        config.providers = providers;
+        assert_eq!(resolve_sandbox(&config), "workspace-write");
+    }
+
+    #[test]
+    fn test_resolve_sandbox_ignores_other_providers() {
+        // 其他 provider 的 sandbox 配置不影响 codex
+        let mut config = GatewayConfig::default();
+        let mut providers = std::collections::HashMap::new();
+        let mut params = std::collections::HashMap::new();
+        params.insert("sandbox".to_string(), "read-only".to_string());
+        providers.insert("claude-code".to_string(), params);
+        config.providers = providers;
+        assert_eq!(resolve_sandbox(&config), DEFAULT_SANDBOX);
     }
 
     #[test]
