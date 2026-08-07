@@ -431,9 +431,11 @@ pub async fn run(cli: Cli) -> Result<(), String> {
                 .flatten()
                 .unwrap_or_default();
 
-            // 构建 webhook 和 LLM 使用的 Agent
-            let serve_agent: Arc<dyn crate::gateway::provider::AgentProvider> =
-                create_agent(xiaozhi_llm_provider.clone()).map(Arc::from)?;
+            // 构建共享 Agent 句柄（webhook / xiaozhi / Web API 共用，支持运行时热切换）
+            let serve_agent = crate::gateway::agent_handle::build_shared_agent(
+                &settings,
+                xiaozhi_llm_provider.as_deref(),
+            )?;
 
             let work_dir = resolve_work_dir();
 
@@ -473,7 +475,7 @@ pub async fn run(cli: Cli) -> Result<(), String> {
                     shared_asr_config.clone(),
                     shared_tts_config.clone(),
                     xiaozhi_tts_voice,
-                    serve_agent,
+                    serve_agent.clone(),
                     work_dir,
                 )?)
             };
@@ -489,6 +491,7 @@ pub async fn run(cli: Cli) -> Result<(), String> {
                 Some(xiaozhi_strategy),
                 shared_asr_config,
                 shared_tts_config,
+                serve_agent,
                 CancellationToken::new(),
             )
             .await

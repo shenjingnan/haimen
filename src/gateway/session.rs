@@ -21,6 +21,8 @@ pub struct SessionInfo {
     pub turn_count: u32,
     /// 最大轮次（达到后自动切）
     pub max_turns: u32,
+    /// 创建该会话时的 Agent 代数；与当前代数不一致视为失效
+    pub agent_gen: u64,
 }
 
 impl SessionInfo {
@@ -74,15 +76,26 @@ impl SessionManager {
     /// 获取或创建会话
     ///
     /// 返回 `(是否需要新会话, 可选的旧 session_id)`
-    /// - `(true, None)` — 需要启动新会话（无旧会话或旧会话已过期）
+    /// - `(true, None)` — 需要启动新会话（无旧会话、旧会话已过期，或 Agent 已换代）
     /// - `(false, Some(id))` — 应继续使用此 session_id 进行 resume
-    pub fn get_or_create(&mut self, key: &SessionKey) -> (bool, Option<String>) {
+    ///
+    /// `current_gen` 为当前 Agent 代数：会话绑定的 `agent_gen` 与当前不一致时
+    /// 视为失效（Agent 切换后强制开新会话，避免把旧 Agent 的 session_id
+    /// resume 到新 Agent）。
+    pub fn get_or_create(&mut self, key: &SessionKey, current_gen: u64) -> (bool, Option<String>) {
         self.cleanup_expired();
 
         if let Some(session) = self.sessions.get(key) {
-            if session.is_expired(self.idle_timeout) || session.is_max_turns_reached() {
+            let gen_changed = session.agent_gen != current_gen;
+            if gen_changed
+                || session.is_expired(self.idle_timeout)
+                || session.is_max_turns_reached()
+            {
                 tracing::info!(
                     session_key = %key,
+                    gen_changed = gen_changed,
+                    agent_gen = session.agent_gen,
+                    current_gen = current_gen,
                     expired = session.is_expired(self.idle_timeout),
                     max_turns = session.is_max_turns_reached(),
                     "会话需要轮转"
@@ -97,7 +110,13 @@ impl SessionManager {
     }
 
     /// 记录一个新会话
-    pub fn create_session(&mut self, key: &SessionKey, claude_session_id: &str, cwd: &str) {
+    pub fn create_session(
+        &mut self,
+        key: &SessionKey,
+        claude_session_id: &str,
+        cwd: &str,
+        agent_gen: u64,
+    ) {
         let session = SessionInfo {
             claude_session_id: claude_session_id.to_string(),
             cwd: cwd.to_string(),
@@ -105,6 +124,7 @@ impl SessionManager {
             last_active: Utc::now(),
             turn_count: 0,
             max_turns: self.default_max_turns,
+            agent_gen,
         };
         tracing::info!(
             session_key = %key,
@@ -167,6 +187,7 @@ mod tests {
             last_active: Utc::now(),
             turn_count: 0,
             max_turns: 20,
+            agent_gen: 0,
         };
         assert!(!info.is_expired(Duration::from_secs(60)));
         assert!(!info.is_max_turns_reached());
@@ -181,6 +202,7 @@ mod tests {
             last_active: Utc::now(),
             turn_count: 0,
             max_turns: 20,
+            agent_gen: 0,
         };
         // 模拟时间流逝
         info.last_active = Utc::now() - chrono::Duration::minutes(5);
@@ -199,6 +221,7 @@ mod tests {
             last_active: Utc::now(),
             turn_count: 0,
             max_turns: 3,
+            agent_gen: 0,
         };
         assert!(!info.is_max_turns_reached());
         info.record_turn();
@@ -217,6 +240,7 @@ mod tests {
             last_active: Utc::now(),
             turn_count: 0,
             max_turns: 20,
+            agent_gen: 0,
         };
         let before = info.last_active;
         thread::sleep(StdDuration::from_millis(10));
@@ -230,7 +254,7 @@ mod tests {
         let mut mgr = SessionManager::new(30, 20);
         let key = "chat_123".to_string();
 
-        let (need_new, session_id) = mgr.get_or_create(&key);
+        let (need_new, session_id) = mgr.get_or_create(&key, 0);
         assert!(need_new);
         assert!(session_id.is_none());
     }
@@ -240,13 +264,13 @@ mod tests {
         let mut mgr = SessionManager::new(30, 20);
         let key = "chat_123".to_string();
 
-        let (need_new, _) = mgr.get_or_create(&key);
+        let (need_new, _) = mgr.get_or_create(&key, 0);
         assert!(need_new);
 
-        mgr.create_session(&key, "s1", "/tmp");
+        mgr.create_session(&key, "s1", "/tmp", 0);
         mgr.record_turn(&key);
 
-        let (need_new, session_id) = mgr.get_or_create(&key);
+        let (need_new, session_id) = mgr.get_or_create(&key, 0);
         assert!(!need_new);
         assert_eq!(session_id, Some("s1".to_string()));
     }
@@ -256,13 +280,48 @@ mod tests {
         let mut mgr = SessionManager::new(30, 3);
         let key = "chat_123".to_string();
 
-        mgr.create_session(&key, "s1", "/tmp");
+        mgr.create_session(&key, "s1", "/tmp", 0);
         mgr.record_turn(&key);
         mgr.record_turn(&key);
         mgr.record_turn(&key);
 
-        let (need_new, _) = mgr.get_or_create(&key);
+        let (need_new, _) = mgr.get_or_create(&key, 0);
         assert!(need_new, "达到最大轮次应触发轮转");
+    }
+
+    #[test]
+    fn test_session_manager_agent_generation_change_forces_new() {
+        let mut mgr = SessionManager::new(30, 20);
+        let key = "chat_123".to_string();
+
+        // 代数 0 时创建会话
+        mgr.create_session(&key, "s1", "/tmp", 0);
+        mgr.record_turn(&key);
+
+        // 同代数可复用
+        let (need_new, session_id) = mgr.get_or_create(&key, 0);
+        assert!(!need_new, "同代数应复用会话");
+        assert_eq!(session_id, Some("s1".to_string()));
+
+        // Agent 换代（代数 1）后旧会话失效，强制新会话
+        let (need_new, session_id) = mgr.get_or_create(&key, 1);
+        assert!(need_new, "换代后应强制新会话");
+        assert!(session_id.is_none());
+    }
+
+    #[test]
+    fn test_session_manager_generation_stored_per_session() {
+        let mut mgr = SessionManager::new(30, 20);
+        let key = "chat_123".to_string();
+
+        mgr.create_session(&key, "gen0", "/tmp", 0);
+        let info = mgr.get_session(&key).unwrap();
+        assert_eq!(info.agent_gen, 0);
+
+        // 新会话记录新代数
+        mgr.create_session(&key, "gen5", "/tmp", 5);
+        let info = mgr.get_session(&key).unwrap();
+        assert_eq!(info.agent_gen, 5);
     }
 
     #[test]
@@ -270,10 +329,10 @@ mod tests {
         let mut mgr = SessionManager::new(30, 20);
         let key = "chat_123".to_string();
 
-        mgr.create_session(&key, "s1", "/tmp");
+        mgr.create_session(&key, "s1", "/tmp", 0);
         mgr.remove_session(&key);
 
-        let (need_new, _) = mgr.get_or_create(&key);
+        let (need_new, _) = mgr.get_or_create(&key, 0);
         assert!(need_new, "删除后应创建新会话");
     }
 
@@ -281,8 +340,8 @@ mod tests {
     fn test_session_manager_list_sessions() {
         let mut mgr = SessionManager::new(30, 20);
 
-        mgr.create_session(&"chat_1".to_string(), "s1", "/tmp");
-        mgr.create_session(&"chat_2".to_string(), "s2", "/tmp");
+        mgr.create_session(&"chat_1".to_string(), "s1", "/tmp", 0);
+        mgr.create_session(&"chat_2".to_string(), "s2", "/tmp", 0);
 
         let list = mgr.list_sessions();
         assert_eq!(list.len(), 2);
@@ -294,14 +353,14 @@ mod tests {
         let key1 = "chat_1".to_string();
         let key2 = "chat_2".to_string();
 
-        mgr.create_session(&key1, "s1", "/tmp");
-        mgr.create_session(&key2, "s2", "/tmp");
+        mgr.create_session(&key1, "s1", "/tmp", 0);
+        mgr.create_session(&key2, "s2", "/tmp", 0);
 
-        let (need_new, sid) = mgr.get_or_create(&key1);
+        let (need_new, sid) = mgr.get_or_create(&key1, 0);
         assert!(!need_new);
         assert_eq!(sid, Some("s1".to_string()));
 
-        let (need_new, sid) = mgr.get_or_create(&key2);
+        let (need_new, sid) = mgr.get_or_create(&key2, 0);
         assert!(!need_new);
         assert_eq!(sid, Some("s2".to_string()));
     }
@@ -315,7 +374,7 @@ mod tests {
     #[test]
     fn test_get_session_returns_info() {
         let mut mgr = SessionManager::new(30, 20);
-        mgr.create_session(&"chat_1".to_string(), "s1", "/tmp");
+        mgr.create_session(&"chat_1".to_string(), "s1", "/tmp", 0);
         let info = mgr.get_session(&"chat_1".to_string()).unwrap();
         assert_eq!(info.claude_session_id, "s1");
         assert_eq!(info.turn_count, 0);

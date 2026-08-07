@@ -6,9 +6,10 @@ use tokio_util::sync::CancellationToken;
 use tracing;
 
 use crate::config::settings::GatewayConfig;
+use crate::gateway::agent_handle::{SharedAgent, snapshot};
 use crate::gateway::channel::MessageChannel;
 use crate::gateway::model::Message;
-use crate::gateway::provider::{AgentLogEvent, AgentProvider};
+use crate::gateway::provider::AgentLogEvent;
 use crate::gateway::session::{SessionKey, SessionManager};
 
 /// 内置网关命令
@@ -34,18 +35,17 @@ enum GatewayCommand {
 /// 6. 通过 channel.send() 发送回复
 ///
 /// 不依赖任何具体 Channel 或 Agent 类型。
-pub async fn run_chat_loop<C, A>(
+pub async fn run_chat_loop<C>(
     channel: &C,
-    agent: &A,
+    agent: &SharedAgent,
     config: &GatewayConfig,
 ) -> Result<(), String>
 where
     C: MessageChannel + ?Sized,
-    A: AgentProvider + ?Sized,
 {
     // 1. 健康检查
     channel.health_check().await?;
-    agent.check_available().await?;
+    snapshot(agent).agent.check_available().await?;
 
     // 2. 加载会话配置
     let idle_timeout = config.session_idle_timeout_mins;
@@ -58,7 +58,7 @@ where
 
     tracing::info!(
         channel = %channel.name(),
-        agent = %agent.name(),
+        agent = %snapshot(agent).name,
         idle_timeout_mins = idle_timeout,
         max_turns = max_turns,
         "网关已启动"
@@ -90,15 +90,17 @@ where
             continue;
         }
 
-        // 会话管理
-        let (need_new_session, existing_session_id) = session_mgr.get_or_create(&chat_id);
+        // 会话管理（取当前 Agent 快照：一条消息内 agent/name/generation 保持一致）
+        let snap = snapshot(agent);
+        let (need_new_session, existing_session_id) =
+            session_mgr.get_or_create(&chat_id, snap.generation);
 
         // 调用 Agent 处理
         let start = std::time::Instant::now();
         let result = if need_new_session {
-            agent.process(&message.content, None, &work_dir).await
+            snap.agent.process(&message.content, None, &work_dir).await
         } else {
-            agent
+            snap.agent
                 .process(&message.content, existing_session_id.as_deref(), &work_dir)
                 .await
         };
@@ -113,7 +115,7 @@ where
             crate::agent_log::record(&crate::agent_log::AgentLogRecord {
                 timestamp: crate::datetime::iso_timestamp_now(),
                 source: "gateway".to_string(),
-                agent: agent.name().to_string(),
+                agent: snap.name.clone(),
                 connector: Some(channel.name().to_string()),
                 chat_id: Some(chat_id.clone()),
                 sender_id: Some(message.sender_id.clone()),
@@ -139,7 +141,12 @@ where
                     agent_output.events.clone(),
                 );
                 if need_new_session {
-                    session_mgr.create_session(&chat_id, &new_session_id, &work_dir);
+                    session_mgr.create_session(
+                        &chat_id,
+                        &new_session_id,
+                        &work_dir,
+                        snap.generation,
+                    );
                 }
                 session_mgr.record_turn(&chat_id);
 
@@ -163,7 +170,7 @@ where
                     session_mgr.remove_session(&chat_id);
 
                     let retry_start = std::time::Instant::now();
-                    match agent.process(&message.content, None, &work_dir).await {
+                    match snap.agent.process(&message.content, None, &work_dir).await {
                         Ok((agent_output, new_session_id)) => {
                             record_call(
                                 "success",
@@ -173,7 +180,12 @@ where
                                 retry_start.elapsed(),
                                 agent_output.events.clone(),
                             );
-                            session_mgr.create_session(&chat_id, &new_session_id, &work_dir);
+                            session_mgr.create_session(
+                                &chat_id,
+                                &new_session_id,
+                                &work_dir,
+                                snap.generation,
+                            );
                             tracing::info!(
                                 chat_id = %chat_id,
                                 response = %agent_output.text,
@@ -224,7 +236,7 @@ where
 /// - agent.process() 带超时保护，防止单次调用阻塞整个网关
 pub async fn run_unified_gateway(
     channels: Vec<(String, Box<dyn MessageChannel>)>,
-    agent: &dyn AgentProvider,
+    agent: &SharedAgent,
     config: &GatewayConfig,
     cancel: CancellationToken,
 ) -> Result<(), String> {
@@ -246,7 +258,7 @@ pub async fn run_unified_gateway(
     let channel_names: Vec<&str> = channels.iter().map(|(n, _)| n.as_str()).collect();
     tracing::info!(
         channels = ?channel_names,
-        agent = %agent.name(),
+        agent = %snapshot(agent).name,
         idle_timeout_mins = idle_timeout,
         max_turns = max_turns,
         agent_timeout_secs = config.agent_timeout_secs,
@@ -358,15 +370,18 @@ pub async fn run_unified_gateway(
             continue;
         }
 
-        // 会话管理
-        let (need_new_session, existing_session_id) = session_mgr.get_or_create(&chat_id);
+        // 会话管理（取当前 Agent 快照：一条消息内 agent/name/generation 保持一致）
+        let snap = snapshot(agent);
+        let (need_new_session, existing_session_id) =
+            session_mgr.get_or_create(&chat_id, snap.generation);
 
         // 调用 Agent 处理（带超时）
         let start = std::time::Instant::now();
         let process_fut = if need_new_session {
-            agent.process(&message.content, None, &work_dir)
+            snap.agent.process(&message.content, None, &work_dir)
         } else {
-            agent.process(&message.content, existing_session_id.as_deref(), &work_dir)
+            snap.agent
+                .process(&message.content, existing_session_id.as_deref(), &work_dir)
         };
 
         // 记录一次 Agent 调用（每次 process 尝试都记一条）
@@ -379,7 +394,7 @@ pub async fn run_unified_gateway(
             crate::agent_log::record(&crate::agent_log::AgentLogRecord {
                 timestamp: crate::datetime::iso_timestamp_now(),
                 source: "gateway".to_string(),
-                agent: agent.name().to_string(),
+                agent: snap.name.clone(),
                 connector: Some(connector_name.clone()),
                 chat_id: Some(chat_id.clone()),
                 sender_id: Some(message.sender_id.clone()),
@@ -407,7 +422,12 @@ pub async fn run_unified_gateway(
                     agent_output.events.clone(),
                 );
                 if need_new_session {
-                    session_mgr.create_session(&chat_id, &new_session_id, &work_dir);
+                    session_mgr.create_session(
+                        &chat_id,
+                        &new_session_id,
+                        &work_dir,
+                        snap.generation,
+                    );
                 }
                 session_mgr.record_turn(&chat_id);
 
@@ -435,7 +455,7 @@ pub async fn run_unified_gateway(
                     session_mgr.remove_session(&chat_id);
 
                     let retry_start = std::time::Instant::now();
-                    let retry_fut = agent.process(&message.content, None, &work_dir);
+                    let retry_fut = snap.agent.process(&message.content, None, &work_dir);
                     let retry_result = tokio::time::timeout(timeout_duration, retry_fut).await;
 
                     match retry_result {
@@ -448,7 +468,12 @@ pub async fn run_unified_gateway(
                                 retry_start.elapsed(),
                                 agent_output.events.clone(),
                             );
-                            session_mgr.create_session(&chat_id, &new_session_id, &work_dir);
+                            session_mgr.create_session(
+                                &chat_id,
+                                &new_session_id,
+                                &work_dir,
+                                snap.generation,
+                            );
                             tracing::info!(
                                 chat_id = %chat_id,
                                 response = %agent_output.text,
@@ -757,7 +782,7 @@ pub fn expand_tilde(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gateway::provider::AgentOutput;
+    use crate::gateway::provider::{AgentOutput, AgentProvider};
     use std::collections::VecDeque;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -993,10 +1018,11 @@ mod tests {
             .into_iter()
             .map(|(n, ch)| (n.to_string(), Box::new(ch) as Box<dyn MessageChannel>))
             .collect();
-        let agent = Box::new(agent) as Box<dyn AgentProvider>;
+        let shared =
+            crate::gateway::agent_handle::into_shared(Box::new(agent) as Box<dyn AgentProvider>);
         // 隔离 HOME，避免测试写入真实 ~/.haimen/agent-logs
         crate::test_util::run_with_temp_home_async(move |_home| async move {
-            run_unified_gateway(channels, &*agent, &config, cancel).await
+            run_unified_gateway(channels, &shared, &config, cancel).await
         })
         .await
     }
@@ -1546,11 +1572,12 @@ mod tests {
 
         let channels: Vec<(String, Box<dyn MessageChannel>)> =
             vec![("ch".to_string(), Box::new(ch) as Box<dyn MessageChannel>)];
-        let agent = Box::new(agent) as Box<dyn AgentProvider>;
+        let shared =
+            crate::gateway::agent_handle::into_shared(Box::new(agent) as Box<dyn AgentProvider>);
 
         // 断言必须在临时 HOME 闭包内执行（TempDir 返回后即删除）
         crate::test_util::run_with_temp_home_async(move |home| async move {
-            let result = run_unified_gateway(channels, &*agent, &default_config(), cancel).await;
+            let result = run_unified_gateway(channels, &shared, &default_config(), cancel).await;
             assert!(result.is_err(), "stream end → Err");
 
             let records = read_agent_logs(&home);
@@ -1624,11 +1651,12 @@ mod tests {
 
         let channels: Vec<(String, Box<dyn MessageChannel>)> =
             vec![("ch".to_string(), Box::new(ch) as Box<dyn MessageChannel>)];
-        let agent = Box::new(agent) as Box<dyn AgentProvider>;
+        let shared =
+            crate::gateway::agent_handle::into_shared(Box::new(agent) as Box<dyn AgentProvider>);
 
         // 断言必须在临时 HOME 闭包内执行（TempDir 返回后即删除）
         crate::test_util::run_with_temp_home_async(move |home| async move {
-            let result = run_unified_gateway(channels, &*agent, &default_config(), cancel).await;
+            let result = run_unified_gateway(channels, &shared, &default_config(), cancel).await;
             assert!(result.is_err(), "stream end → Err");
 
             // msg1 成功 → 1 条 success；msg2 resume 失败 + 降级重试成功 → error + success

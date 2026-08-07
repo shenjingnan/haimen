@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- *(agent)* Web 端切换 Agent 实时生效，无需重启——IM 网关 / xiaozhi 语音 / GitHub Webhook 三路径共享同一 Agent 句柄，切换后下一条消息即用新 Agent；因会话语义为切换即重置，切换后进行中的会话自动开启新对话
+
 ## [0.11.2](https://github.com/shenjingnan/haimen/compare/v0.11.1...v0.11.2) - 2026-08-06
 
 ### Added

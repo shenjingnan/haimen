@@ -30,6 +30,7 @@ pub async fn start(
     xiaozhi_strategy: Option<Arc<dyn haimen_xiaozhi::ResponseStrategy>>,
     asr_config: Arc<RwLock<AsrConfig>>,
     tts_config: Arc<RwLock<TtsConfig>>,
+    shared_agent: crate::gateway::agent_handle::SharedAgent,
     cancel: CancellationToken,
 ) -> Result<(), String> {
     use haimen_xiaozhi;
@@ -91,7 +92,9 @@ pub async fn start(
         .route(
             "/api/v1/agent/logs",
             axum::routing::get(api::agent_logs::get_agent_logs),
-        );
+        )
+        // Agent 共享句柄注入 State：PUT 保存后重建 Agent 并换入，实现运行时热切换
+        .with_state(shared_agent);
 
     // 消息渠道（Connector）：飞书/钉钉配置读写 + 可用状态
     let connectors_routes = axum::Router::new()

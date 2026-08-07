@@ -1643,7 +1643,7 @@ app_key = "old-key"
     #[test]
     fn test_tts_wake_greeting_roundtrip() {
         // save → load 往返，新字段不应丢失
-        run_with_temp_home(|home| {
+        run_with_temp_home(|_home| {
             let mut providers = HashMap::new();
             let mut creds = HashMap::new();
             creds.insert("api_key".to_string(), "key".to_string());
