@@ -6,6 +6,7 @@ members = [
     "crates/haimen-claude-code",
     "crates/haimen-codex",
     "crates/haimen-openclaw",
+    "crates/haimen-hermes",
     ".",    # 根目录的主 crate
 ]
 
@@ -127,6 +128,7 @@ haimen-xiaozhi = { path = "crates/haimen-xiaozhi", version = "0.1.5" }
 haimen-claude-code = { path = "crates/haimen-claude-code", version = "0.1.0" }
 haimen-codex = { path = "crates/haimen-codex", version = "0.1.0" }
 haimen-openclaw = { path = "crates/haimen-openclaw", version = "0.1.0" }
+haimen-hermes = { path = "crates/haimen-hermes", version = "0.1.0" }
 univoice = { version = "0.1.6", features = ["opus-encoder"] }
 opus2 = { workspace = true }
 webbrowser = { workspace = true }

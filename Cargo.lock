@@ -933,6 +933,7 @@ dependencies = [
  "haimen-claude-code",
  "haimen-codex",
  "haimen-core",
+ "haimen-hermes",
  "haimen-lark",
  "haimen-openclaw",
  "haimen-xiaozhi",
@@ -996,6 +997,19 @@ dependencies = [
  "serde_json",
  "tokio",
  "which",
+]
+
+[[package]]
+name = "haimen-hermes"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "haimen-core",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tracing",
 ]
 
 [[package]]
