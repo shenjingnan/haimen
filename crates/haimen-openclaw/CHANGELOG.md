@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.0](https://github.com/shenjingnan/haimen/compare/haimen-claude-code-v0.1.0...haimen-claude-code-v0.2.0) - 2026-08-08
+## [0.2.0](https://github.com/shenjingnan/haimen/compare/haimen-openclaw-v0.1.0...haimen-openclaw-v0.2.0) - 2026-08-08
 
 ### Added
 
