@@ -31,17 +31,26 @@ pub const DEFAULT_SANDBOX: &str = "danger-full-access";
 /// - `item.completed` with `item_type: "reasoning"` — 推理过程（跳过）
 /// - `turn.completed` — turn 结束
 pub struct CodexAgent {
+    /// codex CLI 可执行文件路径（默认 "codex"，由 build_command 按 PATH 查找）
+    cli_path: String,
     /// codex 沙箱策略（`codex exec --sandbox <mode>`），合法值：
     /// `read-only` / `workspace-write` / `danger-full-access`
     sandbox: String,
 }
 
 impl CodexAgent {
-    /// 使用指定沙箱策略构造
-    pub fn new(sandbox: impl Into<String>) -> Self {
+    /// 使用指定 CLI 路径与沙箱策略构造
+    pub fn new(cli_path: impl Into<String>, sandbox: impl Into<String>) -> Self {
         Self {
+            cli_path: cli_path.into(),
             sandbox: sandbox.into(),
         }
+    }
+
+    /// 当前 CLI 路径（供测试断言使用）
+    #[cfg(test)]
+    pub(crate) fn cli_path(&self) -> &str {
+        &self.cli_path
     }
 
     /// 当前沙箱策略（供测试断言使用）
@@ -92,17 +101,21 @@ impl AgentProvider for CodexAgent {
         work_dir: &str,
     ) -> Result<(TextStream, String, AgentEventStream), String> {
         let (stream, sid) =
-            process_with_codex_stream(message, session_id, work_dir, &self.sandbox).await?;
+            process_with_codex_stream(message, session_id, work_dir, &self.cli_path, &self.sandbox)
+                .await?;
         // codex 的 reasoning/tool 轨迹捕获留作后续，事件流为空（sender 立即 drop）
         let (_tx, rx) = tokio::sync::mpsc::channel::<AgentLogEvent>(64);
         Ok((stream, sid, rx))
     }
 
     async fn check_available(&self) -> Result<(), String> {
-        if check_codex_available().await {
+        if check_codex_available(&self.cli_path).await {
             Ok(())
         } else {
-            Err("codex CLI 未安装。请执行: npm install -g @openai/codex".to_string())
+            Err(format!(
+                "codex CLI 不可用（路径: {}）。请检查 cli_path 配置或执行: npm install -g @openai/codex",
+                self.cli_path
+            ))
         }
     }
 }
@@ -112,6 +125,7 @@ async fn process_with_codex_stream(
     prompt: &str,
     resume_session_id: Option<&str>,
     work_dir: &str,
+    cli_path: &str,
     sandbox: &str,
 ) -> Result<(TextStream, String), String> {
     let args = build_codex_args(prompt, resume_session_id, sandbox);
@@ -119,7 +133,7 @@ async fn process_with_codex_stream(
     tracing::debug!(args = ?args, "启动 codex 子进程");
 
     // Windows 上 codex 是 npm 安装的 .cmd shim，需经 build_command 解析包装
-    let mut child = Command::from(haimen_core::process::build_command("codex", &args))
+    let mut child = Command::from(haimen_core::process::build_command(cli_path, &args))
         .current_dir(work_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -384,9 +398,9 @@ fn extract_assistant_message_text(json: &serde_json::Value) -> Option<String> {
 }
 
 /// 检查 codex CLI 是否可用
-async fn check_codex_available() -> bool {
+async fn check_codex_available(cli_path: &str) -> bool {
     Command::from(haimen_core::process::build_command(
-        "codex",
+        cli_path,
         &["--version".to_string()],
     ))
     .output()
@@ -479,8 +493,9 @@ mod tests {
 
     #[test]
     fn test_codex_agent_name() {
-        let agent = CodexAgent::new(DEFAULT_SANDBOX);
+        let agent = CodexAgent::new("codex", DEFAULT_SANDBOX);
         assert_eq!(agent.name(), "codex");
+        assert_eq!(agent.cli_path(), "codex");
         assert_eq!(agent.sandbox(), DEFAULT_SANDBOX);
     }
 

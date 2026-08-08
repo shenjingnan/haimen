@@ -25,14 +25,25 @@ const DEFAULT_SOURCE: &str = "tool";
 /// - **超时**：hermes 无 CLI 侧模型超时，haimen 侧等待子进程退出即模型生成
 ///   上限，用 timeout_secs（`[gateway] agent_timeout_secs`，默认 300）。
 pub struct HermesAgent {
+    /// hermes CLI 可执行文件路径（默认 "hermes"，由 build_command 按 PATH 查找）
+    cli_path: String,
     /// 模型调用超时秒数（haimen 侧等待子进程退出的上限）
     timeout_secs: u64,
 }
 
 impl HermesAgent {
-    /// 使用指定超时构造
-    pub fn new(timeout_secs: u64) -> Self {
-        Self { timeout_secs }
+    /// 使用指定 CLI 路径与超时构造
+    pub fn new(cli_path: impl Into<String>, timeout_secs: u64) -> Self {
+        Self {
+            cli_path: cli_path.into(),
+            timeout_secs,
+        }
+    }
+
+    /// 当前 CLI 路径（供测试断言使用）
+    #[cfg(test)]
+    pub(crate) fn cli_path(&self) -> &str {
+        &self.cli_path
     }
 
     /// 当前超时秒数（供测试断言使用）
@@ -81,8 +92,14 @@ impl AgentProvider for HermesAgent {
         session_id: Option<&str>,
         work_dir: &str,
     ) -> Result<(TextStream, String, AgentEventStream), String> {
-        let (text, sid) =
-            process_with_hermes(message, session_id, work_dir, self.timeout_secs).await?;
+        let (text, sid) = process_with_hermes(
+            message,
+            session_id,
+            work_dir,
+            &self.cli_path,
+            self.timeout_secs,
+        )
+        .await?;
         // hermes 不暴露 thinking/tool 事件，事件流为空（sender 立即 drop）
         let (_tx, rx) = mpsc::channel::<AgentLogEvent>(64);
         let stream: TextStream = Box::pin(futures_util::stream::once(async move { text }));
@@ -90,10 +107,13 @@ impl AgentProvider for HermesAgent {
     }
 
     async fn check_available(&self) -> Result<(), String> {
-        if check_hermes_available().await {
+        if check_hermes_available(&self.cli_path).await {
             Ok(())
         } else {
-            Err("hermes CLI 未安装或不可用。请安装 Hermes Agent".to_string())
+            Err(format!(
+                "hermes CLI 不可用（路径: {}）。请检查 cli_path 配置或安装 Hermes Agent",
+                self.cli_path
+            ))
         }
     }
 }
@@ -109,6 +129,7 @@ async fn process_with_hermes(
     prompt: &str,
     session_id: Option<&str>,
     work_dir: &str,
+    cli_path: &str,
     timeout_secs: u64,
 ) -> Result<(String, String), String> {
     // hermes `-q ""`（空字符串）为 falsy 会进入交互模式挂起，须在 spawn 前拦截
@@ -121,7 +142,7 @@ async fn process_with_hermes(
     tracing::debug!(args = ?args, "启动 hermes 子进程");
 
     // Windows 上 hermes 是 npm 安装的 shim，经 build_command 解析包装
-    let mut child = Command::from(haimen_core::process::build_command("hermes", &args))
+    let mut child = Command::from(haimen_core::process::build_command(cli_path, &args))
         .current_dir(work_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -314,9 +335,9 @@ fn assemble_hermes_result(
 }
 
 /// 检查 hermes CLI 是否可用
-async fn check_hermes_available() -> bool {
+async fn check_hermes_available(cli_path: &str) -> bool {
     Command::from(haimen_core::process::build_command(
-        "hermes",
+        cli_path,
         &["--version".to_string()],
     ))
     .output()
@@ -331,8 +352,9 @@ mod tests {
 
     #[test]
     fn test_hermes_agent_name() {
-        let agent = HermesAgent::new(300);
+        let agent = HermesAgent::new("hermes", 300);
         assert_eq!(agent.name(), "hermes");
+        assert_eq!(agent.cli_path(), "hermes");
         assert_eq!(agent.timeout_secs(), 300);
     }
 

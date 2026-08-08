@@ -192,7 +192,8 @@ pub async fn list_agent_providers() -> Json<serde_json::Value> {
 ///
 /// 验证指定 Agent 提供商是否可用。
 ///
-/// 请求体包含 `provider` 字段。统一通过注册表构造 Agent 并调用其
+/// 请求体包含 `provider` 字段；可选 `cli_path` 字段用于验证**草稿**路径
+/// （尚未保存到配置）。统一通过注册表构造 Agent 并调用其
 /// `check_available()`（如 `claude --version` / `codex --version`），
 /// 新增 Agent 无需改动此处。
 pub async fn verify_agent_credentials(
@@ -203,7 +204,22 @@ pub async fn verify_agent_credentials(
         .and_then(|v| v.as_str())
         .unwrap_or("claude-code");
 
-    let cfg = load_config();
+    let mut cfg = load_config();
+
+    // 可选草稿 cli_path：验证未保存的路径。注入克隆配置后由注册表构造，
+    // check_available 会用该路径做 --version 探活（不写盘、不改内存）。
+    if let Some(path) = body
+        .get("cli_path")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    {
+        cfg.gateway
+            .providers
+            .entry(provider.to_string())
+            .or_default()
+            .insert("cli_path".to_string(), path.trim().to_string());
+    }
+
     let agent = match crate::agents::registry::registry().build(provider, &cfg.gateway) {
         Ok(agent) => agent,
         Err(e) => {

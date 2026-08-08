@@ -117,36 +117,59 @@ fn resolve_openclaw_agent(config: &GatewayConfig) -> String {
         .unwrap_or_else(|| DEFAULT_AGENT_ID.to_string())
 }
 
+/// 从网关配置解析某 Agent 的 CLI 可执行文件路径
+///
+/// 优先读取 `[gateway.providers.<name>] cli_path`；空值 / 纯空白 / 未配置时
+/// 回退到默认裸命令名（如 "claude"），由 `build_command` 按 PATH 查找。
+/// 支持绝对路径与 Windows `.cmd` shim（`build_command` 内部处理）。
+fn resolve_cli_path(config: &GatewayConfig, provider: &str, default_binary: &str) -> String {
+    config
+        .providers
+        .get(provider)
+        .and_then(|p| p.get("cli_path"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default_binary.to_string())
+}
+
 /// 内置 Agent 注册（新增 Agent 只需在此加一行）
 fn builtin() -> AgentRegistry {
     let mut registry = AgentRegistry::new();
     registry
-        .register("claude-code", "Claude Code", |_config| {
-            Ok(Box::new(ClaudeAgent))
+        .register("claude-code", "Claude Code", |config| {
+            // cli_path 从 providers.claude-code.cli_path 读取，默认 "claude"（PATH 查找）
+            let cli_path = resolve_cli_path(config, "claude-code", "claude");
+            Ok(Box::new(ClaudeAgent::new(cli_path)))
         })
         .expect("内置 Agent claude-code 注册失败");
     registry
         .register("codex", "Codex CLI", |config| {
             // 沙箱策略从 providers.codex.sandbox 读取，默认放开沙箱：
             // Codex 默认 workspace-write 会阻止子进程访问 macOS 钥匙串等系统资源
+            let cli_path = resolve_cli_path(config, "codex", "codex");
             let sandbox = resolve_codex_sandbox(config);
-            Ok(Box::new(CodexAgent::new(sandbox)))
+            Ok(Box::new(CodexAgent::new(cli_path, sandbox)))
         })
         .expect("内置 Agent codex 注册失败");
     registry
         .register("openclaw", "OpenClaw", |config| {
             // agent id 从 providers.openclaw.agent 读取，默认 "main"（OpenClaw 保留 agent）；
             // --timeout 与网关 agent_timeout_secs 对齐
+            let cli_path = resolve_cli_path(config, "openclaw", "openclaw");
             let agent = resolve_openclaw_agent(config);
             let timeout = config.agent_timeout_secs;
-            Ok(Box::new(OpenClawAgent::new(agent, timeout)))
+            Ok(Box::new(OpenClawAgent::new(cli_path, agent, timeout)))
         })
         .expect("内置 Agent openclaw 注册失败");
     registry
         .register("hermes", "Hermes", |config| {
             // 极简：仅 timeout（haimen 侧等待子进程退出上限，hermes 无 CLI 侧超时）；
             // model/provider 透传留作后续扩展
-            Ok(Box::new(HermesAgent::new(config.agent_timeout_secs)))
+            let cli_path = resolve_cli_path(config, "hermes", "hermes");
+            Ok(Box::new(HermesAgent::new(
+                cli_path,
+                config.agent_timeout_secs,
+            )))
         })
         .expect("内置 Agent hermes 注册失败");
     registry
@@ -221,10 +244,12 @@ mod tests {
     #[test]
     fn test_duplicate_registration_rejected() {
         let mut reg = AgentRegistry::new();
-        reg.register("dup", "Dup", |_c| Ok(Box::new(ClaudeAgent)))
+        reg.register("dup", "Dup", |_c| Ok(Box::new(ClaudeAgent::new("claude"))))
             .expect("首次注册应成功");
         let err = reg
-            .register("dup", "Dup 2", |_c| Ok(Box::new(ClaudeAgent)))
+            .register("dup", "Dup 2", |_c| {
+                Ok(Box::new(ClaudeAgent::new("claude")))
+            })
             .expect_err("重复注册应返回 Err");
         assert_eq!(err, "Agent 重复注册: dup");
     }
@@ -236,7 +261,7 @@ mod tests {
         reg.register("cfg-agent", "Cfg", |config| {
             let wd = config.work_dir.clone().unwrap_or_default();
             if wd.is_empty() {
-                Ok(Box::new(ClaudeAgent))
+                Ok(Box::new(ClaudeAgent::new("claude")))
             } else {
                 Err("不应走到".to_string())
             }
@@ -306,5 +331,52 @@ mod tests {
         providers.insert("codex".to_string(), params);
         config.providers = providers;
         assert_eq!(resolve_openclaw_agent(&config), DEFAULT_AGENT_ID);
+    }
+
+    #[test]
+    fn test_resolve_cli_path_default() {
+        // 未配置时回退到默认裸命令名（PATH 查找）
+        let config = GatewayConfig::default();
+        assert_eq!(resolve_cli_path(&config, "codex", "codex"), "codex");
+        assert_eq!(resolve_cli_path(&config, "claude-code", "claude"), "claude");
+    }
+
+    #[test]
+    fn test_resolve_cli_path_custom() {
+        // 配置 [gateway.providers.codex] cli_path 后应被读取
+        let mut config = GatewayConfig::default();
+        let mut providers = HashMap::new();
+        let mut params = HashMap::new();
+        params.insert("cli_path".to_string(), "/opt/codex/bin/codex".to_string());
+        providers.insert("codex".to_string(), params);
+        config.providers = providers;
+        assert_eq!(
+            resolve_cli_path(&config, "codex", "codex"),
+            "/opt/codex/bin/codex"
+        );
+    }
+
+    #[test]
+    fn test_resolve_cli_path_empty_falls_back() {
+        // 显式空串/纯空白回退到默认裸命令名
+        let mut config = GatewayConfig::default();
+        let mut providers = HashMap::new();
+        let mut params = HashMap::new();
+        params.insert("cli_path".to_string(), "   ".to_string());
+        providers.insert("codex".to_string(), params);
+        config.providers = providers;
+        assert_eq!(resolve_cli_path(&config, "codex", "codex"), "codex");
+    }
+
+    #[test]
+    fn test_resolve_cli_path_ignores_other_providers() {
+        // 其他 provider 的 cli_path 配置不影响目标 provider
+        let mut config = GatewayConfig::default();
+        let mut providers = HashMap::new();
+        let mut params = HashMap::new();
+        params.insert("cli_path".to_string(), "/weird/path".to_string());
+        providers.insert("codex".to_string(), params);
+        config.providers = providers;
+        assert_eq!(resolve_cli_path(&config, "hermes", "hermes"), "hermes");
     }
 }

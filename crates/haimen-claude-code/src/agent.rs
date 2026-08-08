@@ -13,7 +13,25 @@ use tracing;
 ///
 /// 通过 `claude --print` 子进程调用 Claude Code 处理消息。
 /// 同时支持批处理（process）和流式处理（process_stream）。
-pub struct ClaudeAgent;
+pub struct ClaudeAgent {
+    /// claude CLI 可执行文件路径（默认 "claude"，由 build_command 按 PATH 查找）
+    cli_path: String,
+}
+
+impl ClaudeAgent {
+    /// 使用指定 CLI 路径构造（空串/裸命令名时由 `build_command` 按 PATH 解析）
+    pub fn new(cli_path: impl Into<String>) -> Self {
+        Self {
+            cli_path: cli_path.into(),
+        }
+    }
+
+    /// 当前 CLI 路径（供测试断言使用）
+    #[cfg(test)]
+    pub(crate) fn cli_path(&self) -> &str {
+        &self.cli_path
+    }
+}
 
 #[async_trait]
 impl AgentProvider for ClaudeAgent {
@@ -63,14 +81,17 @@ impl AgentProvider for ClaudeAgent {
         session_id: Option<&str>,
         work_dir: &str,
     ) -> Result<(TextStream, String, AgentEventStream), String> {
-        process_with_claude_stream(message, session_id, work_dir).await
+        process_with_claude_stream(message, session_id, work_dir, &self.cli_path).await
     }
 
     async fn check_available(&self) -> Result<(), String> {
-        if check_claude_available().await {
+        if check_claude_available(&self.cli_path).await {
             Ok(())
         } else {
-            Err("claude CLI 未安装。请执行: npm install -g @anthropic-ai/claude-code".to_string())
+            Err(format!(
+                "claude CLI 不可用（路径: {}）。请检查 cli_path 配置或执行: npm install -g @anthropic-ai/claude-code",
+                self.cli_path
+            ))
         }
     }
 }
@@ -100,6 +121,7 @@ async fn process_with_claude_stream(
     prompt: &str,
     resume_session_id: Option<&str>,
     work_dir: &str,
+    cli_path: &str,
 ) -> Result<(TextStream, String, AgentEventStream), String> {
     let mut args: Vec<String> = vec![
         "--print".to_string(),
@@ -117,7 +139,7 @@ async fn process_with_claude_stream(
     args.push(prompt.to_string());
 
     // Windows 上 claude 是 npm 安装的 .cmd shim，需经 build_command 解析包装
-    let mut child = Command::from(haimen_core::process::build_command("claude", &args))
+    let mut child = Command::from(haimen_core::process::build_command(cli_path, &args))
         .current_dir(work_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -418,9 +440,9 @@ fn extract_text_from_flat(json: &serde_json::Value) -> Option<String> {
 }
 
 /// 检查 claude CLI 是否可用
-async fn check_claude_available() -> bool {
+async fn check_claude_available(cli_path: &str) -> bool {
     Command::from(haimen_core::process::build_command(
-        "claude",
+        cli_path,
         &["--version".to_string()],
     ))
     .output()
