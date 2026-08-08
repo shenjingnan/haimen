@@ -920,7 +920,7 @@ dependencies = [
 
 [[package]]
 name = "haimen"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -962,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "haimen-claude-code"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -975,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "haimen-codex"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "haimen-hermes"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1028,7 +1028,7 @@ dependencies = [
 
 [[package]]
 name = "haimen-openclaw"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures-util",

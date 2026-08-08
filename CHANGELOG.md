@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## [0.12.1](https://github.com/shenjingnan/haimen/compare/v0.12.0...v0.12.1) - 2026-08-08
+
+### Added
+
+- *(agent)* 支持 Web 配置各 Agent CLI 安装路径 ([#170](https://github.com/shenjingnan/haimen/pull/170))
+
 ## [0.12.0](https://github.com/shenjingnan/haimen/compare/v0.11.2...v0.12.0) - 2026-08-07
 
 ### Added
